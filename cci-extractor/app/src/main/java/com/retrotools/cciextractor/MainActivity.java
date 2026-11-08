@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.database.Cursor;
+import android.content.ClipData;
 import android.graphics.Color;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -53,6 +54,8 @@ public class MainActivity extends Activity {
     private static final int PICK_NES_FOLDER = 306;
     private static final int PICK_NES_PNG = 307;
     private static final int SAVE_NES = 308;
+    private static final int PICK_HD_PNGS = 309;
+    private static final int PICK_HD_FOLDER = 310;
     private static final String DIR_MIME = DocumentsContract.Document.MIME_TYPE_DIR;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -62,12 +65,15 @@ public class MainActivity extends Activity {
     private NesCodec.Info nesInfo;
     private int nesPage = -1;
     private Uri nesPngUri;
+    private final List<Uri> hdPngUris = new ArrayList<>();
+    private int hdFactor = 2;
+    private boolean hdSmooth = false;
     private List<CciArchive.Entry> pending;
     private final List<String> displayed = new ArrayList<>();
     private String activePath = "";
     private boolean busy = false;
     private TextView headline, summary, location, detail;
-    private Button open, extractAll, extractHere, up, stop, pngToBtex, pngToNes;
+    private Button open, extractAll, extractHere, up, stop, pngToBtex, pngToNes, upscaleHd;
     private ListView list;
     private ArrayAdapter<String> adapter;
 
@@ -124,6 +130,8 @@ public class MainActivity extends Activity {
         root.addView(pngToBtex, new LinearLayout.LayoutParams(-1, dp(50)));
         pngToNes = button("PNG → NES (rebuild CHR-ROM graphics)");
         root.addView(pngToNes, new LinearLayout.LayoutParams(-1, dp(50)));
+        upscaleHd = button("3DS HD PNG upscale (2× / 4×)");
+        root.addView(upscaleHd, new LinearLayout.LayoutParams(-1, dp(50)));
         location = text("/", 14, Color.rgb(36, 49, 105));
         location.setBackgroundColor(Color.rgb(225, 231, 248));
         root.addView(location);
@@ -139,6 +147,7 @@ public class MainActivity extends Activity {
         open.setOnClickListener(v -> openCci());
         pngToBtex.setOnClickListener(v -> choosePng());
         pngToNes.setOnClickListener(v -> startNesImport());
+        upscaleHd.setOnClickListener(v -> chooseHdUpscale());
         extractAll.setOnClickListener(v -> {
             if (nesInfo != null) beginNesExport(-1);
             else beginExtract(archive == null ? null : archive.entries);
@@ -206,7 +215,26 @@ public class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
-        if (result != RESULT_OK || data == null || data.getData() == null) return;
+        if (result != RESULT_OK || data == null) return;
+        if (request == PICK_HD_PNGS) {
+            hdPngUris.clear();
+            ClipData clip = data.getClipData();
+            if (clip != null) {
+                for (int i = 0; i < clip.getItemCount(); i++) {
+                    Uri selected = clip.getItemAt(i).getUri();
+                    if (selected != null && !hdPngUris.contains(selected)) hdPngUris.add(selected);
+                }
+            } else if (data.getData() != null) {
+                hdPngUris.add(data.getData());
+            }
+            if (!hdPngUris.isEmpty()) {
+                Intent folderPicker = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                folderPicker.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                startActivityForResult(folderPicker, PICK_HD_FOLDER);
+            }
+            return;
+        }
+        if (data.getData() == null) return;
         Uri uri = data.getData();
         if (request == PICK_IMAGE) {
             try { getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION); }
@@ -224,14 +252,14 @@ public class MainActivity extends Activity {
                     try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
                          FileChannel channel = stream.getChannel()) {
                         if (NesCodec.isNes(channel)) {
-                            NesCodec.Info result = NesCodec.parse(channel);
+                            NesCodec.Info parsedNes = NesCodec.parse(channel);
                             runOnUiThread(() -> {
-                                nesInfo = result; archive = null;
+                                nesInfo = parsedNes; archive = null;
                                 busy = false;
-                                summary.setText(result.description());
-                                detail.setText(result.usesChrRam() ?
-                                        "Experimental: " + result.pageCount() + " PRG tile-scan pages. CHR-RAM graphics may be compressed; ROM rebuilding disabled." :
-                                        "Found " + result.pageCount() + " editable CHR-ROM pages. Tap a page or export all as PNG.");
+                                summary.setText(parsedNes.description());
+                                detail.setText(parsedNes.usesChrRam() ?
+                                        "Experimental: " + parsedNes.pageCount() + " PRG tile-scan pages. CHR-RAM graphics may be compressed; ROM rebuilding disabled." :
+                                        "Found " + parsedNes.pageCount() + " editable CHR-ROM pages. Tap a page or export all as PNG.");
                                 render();
                             });
                         } else {
@@ -279,6 +307,8 @@ public class MainActivity extends Activity {
             chooseNesOutput();
         } else if (request == SAVE_NES && nesPngUri != null && nesInfo != null) {
             rebuildNes(uri);
+        } else if (request == PICK_HD_FOLDER && !hdPngUris.isEmpty()) {
+            upscaleHdPngs(uri);
         }
     }
 
@@ -330,6 +360,7 @@ public class MainActivity extends Activity {
                 "/" + activePath + "   (" + displayed.size() + " items)");
         open.setEnabled(!busy);
         pngToBtex.setEnabled(!busy);
+        upscaleHd.setEnabled(!busy);
         pngToNes.setEnabled(!busy && nesInfo != null && !nesInfo.usesChrRam());
         extractAll.setText(nesInfo == null ? "Extract all" : "Export tile PNGs");
         extractAll.setEnabled(!busy && (archive != null || nesInfo != null));
@@ -763,6 +794,167 @@ public class MainActivity extends Activity {
                     new AlertDialog.Builder(this).setTitle("Could not create BTEX")
                             .setMessage(message(e) + "\n\nChoose a PNG and the original matching .btex file.")
                             .setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+
+    /**
+     * The CCI's BTEX PNG exports have file names such as TitleLogo.btex.png; these
+     * can be enlarged for editing but cannot be re-imported as higher-resolution BTEX.
+     * For actual HD replacements use Azahar's dumped "tex1_...png" images so the
+     * renderer can match each texture by its original hash.
+     */
+    private void chooseHdUpscale() {
+        if (busy) return;
+        String[] options = {"2× Sharp / pixel art", "2× Smooth", "4× Sharp / pixel art", "4× Smooth"};
+        new AlertDialog.Builder(this).setTitle("Upscale 3DS PNG textures")
+                .setMessage("Upscale exported PNGs or Azahar's dumped tex1_...png textures. " +
+                        "Only Azahar's hash-named texture dumps can be installed directly as HD custom textures. " +
+                        "Upscaled PNGs are NOT compatible with normal-size PNG → BTEX templates. " +
+                        "Scaling alone does not create new image detail.")
+                .setSingleChoiceItems(options, 0, (dialog, choice) -> {
+                    hdFactor = choice >= 2 ? 4 : 2;
+                    hdSmooth = (choice % 2) == 1;
+                    dialog.dismiss();
+                    Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                    intent.addCategory(Intent.CATEGORY_OPENABLE);
+                    intent.setType("image/png");
+                    intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    startActivityForResult(intent, PICK_HD_PNGS);
+                }).setNegativeButton("Cancel", null).show();
+    }
+
+    private boolean containsPackJson(Uri root) {
+        try {
+            Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(root,
+                    DocumentsContract.getTreeDocumentId(root));
+            try (Cursor c = getContentResolver().query(children,
+                    new String[]{DocumentsContract.Document.COLUMN_DISPLAY_NAME}, null, null, null)) {
+                if (c != null) while (c.moveToNext()) {
+                    if ("pack.json".equalsIgnoreCase(c.getString(0))) return true;
+                }
+            }
+        } catch (Exception ignored) { }
+        return false;
+    }
+
+    private void upscaleHdPngs(Uri folderTree) {
+        if (busy) return;
+        final List<Uri> inputs = new ArrayList<>(hdPngUris);
+        final int factor = hdFactor;
+        final boolean smooth = hdSmooth;
+        hdPngUris.clear();
+        busy = true;
+        cancelled.set(false);
+        render();
+        summary.setText("Upscaling " + inputs.size() + " PNG(s) " + factor + "×...");
+        worker.execute(() -> {
+            int complete = 0;
+            int errors = 0;
+            int hashed = 0;
+            String lastError = "";
+            try {
+                Uri folder = DocumentsContract.buildDocumentUriUsingTree(folderTree,
+                        DocumentsContract.getTreeDocumentId(folderTree));
+                for (Uri inputUri : inputs) {
+                    if (cancelled.get()) break;
+                    try {
+                        String filename = documentName(inputUri, "texture.png");
+                        if (!filename.toLowerCase(Locale.ROOT).endsWith(".png"))
+                            throw new IOException("Not a PNG file: " + filename);
+                        BitmapFactory.Options opts = new BitmapFactory.Options();
+                        opts.inJustDecodeBounds = true;
+                        try (InputStream source = getContentResolver().openInputStream(inputUri)) {
+                            if (source == null) throw new IOException("Cannot read " + filename);
+                            BitmapFactory.decodeStream(source, null, opts);
+                        }
+                        long targetW = (long) opts.outWidth * factor;
+                        long targetH = (long) opts.outHeight * factor;
+                        if (opts.outWidth <= 0 || opts.outHeight <= 0 ||
+                                targetW > 4096 || targetH > 4096 || targetW * targetH > 12000000L)
+                            throw new IOException(filename + " exceeds the safe 4096px / 12MP output limit");
+                        opts.inJustDecodeBounds = false;
+                        opts.inPreferredConfig = Bitmap.Config.ARGB_8888;
+                        Bitmap original;
+                        try (InputStream source = getContentResolver().openInputStream(inputUri)) {
+                            if (source == null) throw new IOException("Cannot reopen " + filename);
+                            original = BitmapFactory.decodeStream(source, null, opts);
+                        }
+                        if (original == null) throw new IOException("Unable to decode " + filename);
+                        Bitmap enlarged = null;
+                        try {
+                            enlarged = Bitmap.createScaledBitmap(original, (int) targetW,
+                                    (int) targetH, smooth);
+                            Uri result = DocumentsContract.createDocument(getContentResolver(), folder,
+                                    "image/png", filename);
+                            if (result == null) throw new IOException("Cannot create " + filename);
+                            try (OutputStream output = getContentResolver().openOutputStream(result, "w")) {
+                                if (output == null || !enlarged.compress(Bitmap.CompressFormat.PNG, 100, output))
+                                    throw new IOException("Cannot save " + filename);
+                            } catch (Exception writeError) {
+                                try { DocumentsContract.deleteDocument(getContentResolver(), result); }
+                                catch (Exception ignored) { }
+                                throw writeError;
+                            }
+                            complete++;
+                            if (filename.startsWith("tex1_")) hashed++;
+                            final int finished = complete;
+                            runOnUiThread(() -> detail.setText(finished + "/" + inputs.size() +
+                                    " upscaled PNGs; originals untouched."));
+                        } finally {
+                            if (enlarged != null && enlarged != original) enlarged.recycle();
+                            original.recycle();
+                        }
+                    } catch (Exception perFile) {
+                        errors++;
+                        lastError = message(perFile);
+                    }
+                }
+                if (hashed > 0 && !containsPackJson(folderTree)) {
+                    // Basic Azahar configuration. Texture file names must originate from the
+                    // emulator's texture dumper; BTEX filenames are not valid hash names.
+                    String pack = "{\n" +
+                            "  \"author\": \"Game Asset Extractor\",\n" +
+                            "  \"version\": \"1.0.0\",\n" +
+                            "  \"description\": \"Upscaled 3DS texture PNGs\",\n" +
+                            "  \"options\": {\n" +
+                            "    \"skip_mipmap\": false,\n" +
+                            "    \"flip_png_files\": true,\n" +
+                            "    \"use_new_hash\": true\n" +
+                            "  }\n" +
+                            "}\n";
+                    Uri json = DocumentsContract.createDocument(getContentResolver(), folder,
+                            "application/json", "pack.json");
+                    if (json != null) try (OutputStream out = getContentResolver().openOutputStream(json, "w")) {
+                        if (out != null) out.write(pack.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    }
+                }
+                final int done = complete, skipped = errors, hashNamed = hashed;
+                final String last = lastError;
+                final boolean interrupted = cancelled.get();
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    summary.setText("Upscaled " + done + " PNGs " + factor + "×" +
+                            (interrupted ? " (cancelled)" : ""));
+                    detail.setText(hashNamed > 0 ?
+                            "Azahar dump names preserved. Use the matching game's custom textures folder and enable Custom Textures." :
+                            "These are standalone enlarged PNGs. For an HD mod, use Azahar's hash-named texture dumps.");
+                    new AlertDialog.Builder(this).setTitle("HD PNG export complete")
+                            .setMessage("Saved " + done + " PNG(s) at " + factor + "× resolution (" +
+                                    (smooth ? "smooth" : "sharp") + "). " + skipped + " skipped." +
+                                    (skipped > 0 ? " Last error: " + last : "") +
+                                    "\n\nTo show HD textures in Azahar, use PNGs dumped by Azahar (tex1_... names) " +
+                                    "and enable Custom Textures. Normal BTEX replacements must remain at original dimensions.")
+                            .setPositiveButton("OK", null).show();
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("HD upscale failed"); detail.setText(message(e));
+                    new AlertDialog.Builder(this).setTitle("Upscale failed")
+                            .setMessage(message(e)).setPositiveButton("OK", null).show();
                 });
             }
         });
