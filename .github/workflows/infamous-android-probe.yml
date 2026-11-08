@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - experimental/infamous-arm64-probe
+      - feature/infamous-psn-real-ppu-boot
     paths:
       - 'android-port-lab/**'
       - '.github/workflows/infamous-android-probe.yml'
@@ -77,6 +78,15 @@ jobs:
             -o /tmp/ppu-elf-smoke
           /tmp/ppu-elf-smoke android-port-lab/generated/smoke.elf
           /tmp/ppu-elf-smoke android-port-lab/generated/smoke.elf --reject-mutated
+      - name: Compile and run bounded real PPU tracer against clean-room ELF
+        run: |
+          c++ -std=c++17 -Wall -Wextra -O2 -DREAL_PPU_PROBE_HOST \
+            android-port-lab/app/src/main/cpp/real_ppu_probe.cpp \
+            -o /tmp/real-ppu-probe
+          /tmp/real-ppu-probe android-port-lab/generated/smoke.elf | tee /tmp/real-ppu-probe.log
+          grep -q "REAL PS3 EBOOT STARTUP TRACE" /tmp/real-ppu-probe.log
+          # The trace is deliberately not a game boot and must never report one.
+          ! grep -q "Status: GAME BOOT SUCCESS" /tmp/real-ppu-probe.log
       - name: Cross-compile upstream PPU, LV2, SPU, RSX, input and audio for Android ARM64
         run: |
           python3 android-port-lab/tools/audit_runtime_android.py \
