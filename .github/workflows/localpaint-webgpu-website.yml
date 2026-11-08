@@ -1,0 +1,27 @@
+name: Validate LocalPaint WebGPU site
+on:
+  push:
+    branches: [feature/localpaint-webgpu-poc]
+  workflow_dispatch:
+jobs:
+  validate-and-package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate JavaScript and essential files
+        run: |
+          node --check docs/app.js
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("docs")
+          assert all((p/f).is_file() for f in ("index.html","app.js","styles.css"))
+          assert 'ort.webgpu.min.js' in (p/'index.html').read_text()
+          assert 'InferenceSession.create' in (p/'app.js').read_text()
+          print("Static site validated")
+          PY
+      - name: Upload browser website
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalPaint-WebGPU-site
+          path: docs/
+          if-no-files-found: error
