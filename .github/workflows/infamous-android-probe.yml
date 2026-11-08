@@ -31,6 +31,12 @@ jobs:
           "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
       - name: Checkout official game port source (no proprietary game files)
         run: git clone --depth 1 https://github.com/whompay/inFAMOUSreborn.git android-port-lab/upstream
+      - name: Fetch SDL2 headers for Android input and audio compatibility
+        run: |
+          mkdir -p android-port-lab/third_party
+          git clone --depth 1 --branch release-2.30.12 \
+            https://github.com/libsdl-org/SDL.git android-port-lab/third_party/SDL2-src
+          ln -s SDL2-src/include android-port-lab/third_party/SDL2
       - name: Apply Android compatibility fixes to upstream runtime clone
         run: python3 android-port-lab/tools/patch_android_upstream.py android-port-lab/upstream/ps3recomp
       - name: Generate clean-room PPC64 test ELF

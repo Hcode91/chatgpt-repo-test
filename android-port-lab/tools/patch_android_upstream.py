@@ -99,4 +99,47 @@ change("runtime/spu/spu_channels.c",
 #else
     if (s_fmode) _mm_setcsr(saved_csr);
 #endif''')
+# ARM64 SPU lane profiler uses a monotonic nanosecond time base instead
+# of x86 RDTSCP; it is only a diagnostic, not a virtual PS3 clock.
+change("runtime/spu/spu_laneprof.h",
+'''#if defined(_MSC_VER)
+#  include <intrin.h>
+#else
+#  include <x86intrin.h>
+#endif''',
+'''#if defined(__aarch64__)
+#  include <time.h>
+static inline unsigned long long spu_lp_arm64_ticks(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+#  define __rdtsc() spu_lp_arm64_ticks()
+#elif defined(_MSC_VER)
+#  include <intrin.h>
+#else
+#  include <x86intrin.h>
+#endif''')
+change("runtime/spu/spu_helpers.h",
+'''#include <xmmintrin.h>
+#define SPU__DP_BEGIN { unsigned _spu_dpc = _mm_getcsr(); _mm_setcsr(_spu_dpc & ~0xE040u);
+#define SPU__DP_END   _mm_setcsr(_spu_dpc); }''',
+'''#if defined(__aarch64__)
+#include <fenv.h>
+#define SPU__DP_BEGIN { int _spu_dpc = fegetround(); fesetround(FE_TONEAREST);
+#define SPU__DP_END   fesetround(_spu_dpc); }
+#else
+#include <xmmintrin.h>
+#define SPU__DP_BEGIN { unsigned _spu_dpc = _mm_getcsr(); _mm_setcsr(_spu_dpc & ~0xE040u);
+#define SPU__DP_END   _mm_setcsr(_spu_dpc); }
+#endif''')
+# The profiler's macro now supplies ARM64 ticks to spu_channels too.
+change("runtime/spu/spu_channels.c",
+'''#define __rdtsc() ps3_spu_arm64_ticks()
+#else
+#include <xmmintrin.h>
+#endif''',
+'''#else
+#include <xmmintrin.h>
+#endif''')
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")

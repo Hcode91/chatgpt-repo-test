@@ -43,7 +43,7 @@ SOURCES = {
     ],
 }
 DIRS = [
-    GEN, UP / "include", UP / "runtime", UP / "runtime/ppu",
+    GEN, ROOT / "third_party", UP / "include", UP / "runtime", UP / "runtime/ppu",
     UP / "runtime/platform", UP / "runtime/memory",
     UP / "runtime/spu", UP / "runtime/syscalls", UP / "libs/video",
     UP / "libs/input", UP / "libs/audio", UP / "libs/system",
