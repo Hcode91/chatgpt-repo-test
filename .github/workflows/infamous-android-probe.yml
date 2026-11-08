@@ -31,6 +31,8 @@ jobs:
           "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
       - name: Checkout official game port source (no proprietary game files)
         run: git clone --depth 1 https://github.com/whompay/inFAMOUSreborn.git android-port-lab/upstream
+      - name: Apply Android compatibility fixes to upstream runtime clone
+        run: python3 android-port-lab/tools/patch_android_upstream.py android-port-lab/upstream/ps3recomp
       - name: Generate clean-room PPC64 test ELF
         run: python3 android-port-lab/tools/generate_ppu_smoke.py --out android-port-lab/generated
       - name: Bundle the clean-room ELF with the Android application

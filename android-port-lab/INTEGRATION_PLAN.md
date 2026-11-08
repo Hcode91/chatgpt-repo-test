@@ -1,30 +1,29 @@
-# Android integration sprint (all workstreams in one pass)
+# Integrated Android ARM64 compatibility sprint
 
-Target: convert the currently working ARM64 recompilation/ELF proof into an
-actual Android game runtime, without implying that a game boots before it does.
+Our existing v0.4 clean-room PPU execution test is validated on hardware.
+This sprint assesses and repairs **real upstream** runtime code, without new
+APK/manual phone testing for each change.
 
-## Workstreams investigated in the same CI build
-1. PPU image loading, dispatch, imports, filesystem.
-2. LV2 syscalls and guest threading.
-3. SPU and synchronization.
-4. RSX/GCM command stream and renderer dependencies.
-5. Android input/audio capabilities and eventual game-file handling.
+GitHub Actions compiles 16 upstream source files spanning PPU, HLE, LV2,
+SPU, RSX and input/audio with Android NDK clang. The machine-readable report
+is uploaded as `infamous-android-runtime-audit`.
 
-The workflow compiles **real upstream source files** with the Android NDK and
-writes a machine-readable audit and human-readable blocker report. This is an
-integration audit, not a series of APK smoke tests. The existing v0.4 APK
-continues to compile but is not claimed to execute the upstream runtime.
+## First audit: 8/16 compile on Android
+The fails include x86-only timestamp intrinsics, SSE MXCSR use, Linux
+pthread_setaffinity_np unavailable on Android, and an optional SDL2 dependency.
 
-## Why not claim a playable APK yet?
+## Source compatibility patches
+`tools/patch_android_upstream.py` applies fail-fast, narrowly scoped changes
+to a disposable cloned upstream checkout. It enables ARM64 monotonic timing,
+uses Android's supported rounding-mode API (the floating-point FTZ/DAZ
+behaviour still needs work), removes unsupported affinity, and retains the
+normal upstream x86 paths. No fake native HLE implementation is substituted.
 
-inFAMOUSreborn's source does not include generated game-specific recompilation
-files or game data; those must be produced from a user's own compatible PS3
-copy. Windows D3D12 and Apple Metal backends cannot be run as-is on Android.
-A Vulkan RSX implementation, HLE/LV2 integration, and runtime port are major
-workstreams. For actual game boot these must all work together, not just pass
-hardware probes.
+## Real remaining steps
+Compile-checks are **not** a linkable PS3 runtime. Once all sources compile,
+they must be linked into an Android game executable with Android Vulkan RSX
+rendering, functioning syscalls/threads, a VFS, a reliable control/audio
+backend and the full upstream synthetic smoke ELF. Proprietary game code
+should only be generated locally from a user-owned supported disc.
 
-## Completion gate
-No new user APK needs testing for each compile fix. Request a device test
-only when the actual upstream loader + thread/runtime + initial graphics
-presentation form a runnable milestone.
+We will test APKs on phone after integration gates, not every single patch.
