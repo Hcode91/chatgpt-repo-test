@@ -27,7 +27,7 @@ static std::string gpu_probe() {
         if (vkEnumeratePhysicalDevices(instance, &one, &device) == VK_SUCCESS) {
             VkPhysicalDeviceProperties props{};
             vkGetPhysicalDeviceProperties(device, &props);
-            result += "\\nGPU: ";
+            result += "\nGPU: ";
             result += props.deviceName;
         }
     }
@@ -51,11 +51,11 @@ Java_com_hcode91_infamousprobe_MainActivity_nativeProbe(JNIEnv* env, jclass) {
         }
         munmap(mapping, size);
     }
-    std::string result = "Architecture: arm64-v8a\\n";
-    result += "Page size: " + std::to_string(page) + " bytes\\n";
-    result += "4 GiB guest VA reservation: " + std::string(reserved ? "PASS" : "FAIL") + "\\n";
-    result += "Page commit/read/write: " + std::string(writable ? "PASS" : "FAIL") + "\\n";
-    result += "ps3recomp runtime milestone module: LINKED\\n";
+    std::string result = "Architecture: arm64-v8a\n";
+    result += "Page size: " + std::to_string(page) + " bytes\n";
+    result += "4 GiB guest VA reservation: " + std::string(reserved ? "PASS" : "FAIL") + "\n";
+    result += "Page commit/read/write: " + std::string(writable ? "PASS" : "FAIL") + "\n";
+    result += "ps3recomp runtime milestone module: LINKED\n";
     result += gpu_probe();
     ps3_ms("android:runtime-probe-complete");
     return env->NewStringUTF(result.c_str());
