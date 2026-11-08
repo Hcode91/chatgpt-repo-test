@@ -1,0 +1,41 @@
+name: LocalPaint Android APK
+on:
+  push:
+    branches: [feature/localpaint-sd15-inpainting]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Extract LocalPaint source
+        run: |
+          mkdir -p localpaint
+          tar -xJf localpaint/source.tar.xz -C localpaint
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Android NDK and CMake
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
+      - name: Fetch stable diffusion engine
+        run: bash localpaint/scripts/fetch-engine.sh
+      - name: Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Compile debug APK
+        working-directory: localpaint
+        run: gradle --no-daemon :app:assembleDebug
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalPaint-debug-apk
+          path: localpaint/app/build/outputs/apk/debug/app-debug.apk
