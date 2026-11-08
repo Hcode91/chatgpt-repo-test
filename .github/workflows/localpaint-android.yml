@@ -16,6 +16,8 @@ jobs:
           tar -xJf localpaint/source.tar.xz -C localpaint
       - name: Apply reviewed Java compile fix
         run: patch -d localpaint -p1 --forward < localpaint/patches/fix-java-lambda.patch
+      - name: Apply checkpoint and inference progress UI
+        run: xz -dc localpaint/patches/progress.patch.xz | patch -d localpaint -p1 --forward
       - name: Java 17
         uses: actions/setup-java@v4
         with:
