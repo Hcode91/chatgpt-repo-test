@@ -59,4 +59,9 @@ add_subdirectory("${UP_SOURCE}" "${CMAKE_BINARY_DIR}/ps3recomp")
 target_include_directories(ps3recomp_runtime PRIVATE
     "${UCTX_ROOT}/include" "${UCTX_ROOT}/arch/aarch64/include")
 target_link_libraries(ps3recomp_runtime PUBLIC ps3recomp_ucontext)
+# The upstream boot-smoke executable intentionally omits the title's own host
+# runner. Supply only the runner-owned services and explicitly disabled
+# optional title-specific plugin hooks, never impersonate full gameplay.
+target_sources(ps3recomp_boot_smoke PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/smoke_host_services.cpp")
 message(STATUS "Android PS3 runtime integration targets are configured")
