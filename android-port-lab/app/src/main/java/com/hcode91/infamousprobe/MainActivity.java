@@ -21,6 +21,7 @@ public final class MainActivity extends Activity {
     private String startup;
     private int testRunCount = 0;
     private static native String nativeProbe();
+    private static native String nativePpuSmoke();
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -48,6 +49,18 @@ public final class MainActivity extends Activity {
         run.setText("Run native runtime tests");
         root.addView(run);
         run.setOnClickListener(v -> showProbe());
+
+        Button ppu = new Button(this);
+        ppu.setText("Run recompiled PPU instructions");
+        root.addView(ppu);
+        ppu.setOnClickListener(v -> {
+            output.setText("Executing recompiled PowerPC instructions...\\n");
+            try {
+                output.setText(nativePpuSmoke());
+            } catch (Throwable e) {
+                output.setText("PPU smoke test ERROR: " + e.getMessage());
+            }
+        });
 
         Button pick = new Button(this);
         pick.setText("Inspect my EBOOT.elf");
