@@ -165,4 +165,21 @@ static int g_pf_stick_on = 0;
 '''/* PAD_FILE portable state is declared above the XInput-only branch. */
 
 #ifdef _WIN32''')
+# Full upstream library build: SDL2 is provided as an in-tree Android target
+# by runtime-integration/CMakeLists.txt rather than a preinstalled host package.
+change("CMakeLists.txt",
+'''    find_package(SDL2 QUIET)
+    if(SDL2_FOUND)''',
+'''    if(TARGET SDL2::SDL2)
+        set(SDL2_FOUND TRUE)
+    else()
+        find_package(SDL2 QUIET)
+    endif()
+    if(SDL2_FOUND)''')
+# x86-specific compiler flag is invalid on Android ARM64. Retain it for x86.
+change("CMakeLists.txt",
+'''        -msse4.1
+''',
+'''        $<$<NOT:$<BOOL:${ANDROID}>>:-msse4.1>
+''')
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")

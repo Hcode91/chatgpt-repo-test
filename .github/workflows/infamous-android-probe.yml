@@ -86,6 +86,17 @@ jobs:
             android-port-lab/build/audit/audit.md
             android-port-lab/build/audit/audit.json
           if-no-files-found: warn
+      - name: Link upstream full Android runtime and PPU boot scaffold
+        id: integrated-runtime
+        continue-on-error: true
+        run: bash android-port-lab/tools/build_android_runtime.sh
+      - name: Upload full runtime build report and compiler errors
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: infamous-android-full-runtime-integration
+          path: android-port-lab/build/integrated-logs/
+          if-no-files-found: warn
       - name: Build ARM64 APK
         working-directory: android-port-lab
         run: gradle --no-daemon assembleDebug
