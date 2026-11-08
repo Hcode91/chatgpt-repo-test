@@ -35,9 +35,25 @@ jobs:
         run: |
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
           bash ps3-elf-extractor/tools/build_scetool_android.sh /tmp/scetool-src ps3-elf-extractor/app/src/main/jniLibs/arm64-v8a/libps3elf.so
+          # Ship the NDK C++ shared runtime needed by scetool on Android.
+          CXX_SO="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+          test -s "$CXX_SO"
+          cp "$CXX_SO" ps3-elf-extractor/app/src/main/jniLibs/arm64-v8a/libc++_shared.so
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -d ps3-elf-extractor/app/src/main/jniLibs/arm64-v8a/libps3elf.so | grep "libc++_shared.so"
       - name: Build Android APK
         working-directory: ps3-elf-extractor
         run: gradle --no-daemon --stacktrace assembleDebug
+      - name: Check packaged native dependencies
+        run: |
+          python3 - <<'PY'
+          from zipfile import ZipFile
+          from glob import glob
+          apk = glob("ps3-elf-extractor/app/build/outputs/apk/debug/*.apk")[0]
+          with ZipFile(apk) as z:
+              for name in ("lib/arm64-v8a/libps3elf.so", "lib/arm64-v8a/libc++_shared.so"):
+                  assert name in z.namelist(), "Missing native library: " + name
+                  print("PACKAGED:", name)
+          PY
       - name: Upload GPL source notice and source archive
         run: |
           cp /tmp/scetool-src/README ps3-elf-extractor/SCETOOL_UPSTREAM_README.txt
