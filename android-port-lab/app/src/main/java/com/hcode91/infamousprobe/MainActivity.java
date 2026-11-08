@@ -22,6 +22,7 @@ public final class MainActivity extends Activity {
     private int testRunCount = 0;
     private static native String nativeProbe();
     private static native String nativePpuSmoke();
+    private static native String nativeElfSmoke(byte[] image);
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -62,6 +63,27 @@ public final class MainActivity extends Activity {
             }
         });
 
+        Button elf = new Button(this);
+        elf.setText("Boot clean-room PS3 ELF");
+        root.addView(elf);
+        elf.setOnClickListener(v -> {
+            output.setText("Loading PS3-format ELF and resolving entry...\n");
+            try (InputStream in = getAssets().open("smoke.elf")) {
+                java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
+                byte[] part = new byte[4096];
+                int n;
+                while ((n = in.read(part)) != -1) {
+                    if (buffer.size() + n > 1024 * 1024) {
+                        throw new IOException("Bundled test ELF unexpectedly large");
+                    }
+                    buffer.write(part, 0, n);
+                }
+                output.setText(nativeElfSmoke(buffer.toByteArray()));
+            } catch (Throwable e) {
+                output.setText("ELF smoke test ERROR: " + e.getMessage());
+            }
+        });
+
         Button pick = new Button(this);
         pick.setText("Inspect my EBOOT.elf");
         root.addView(pick);
@@ -83,7 +105,7 @@ public final class MainActivity extends Activity {
         scroller.setFillViewport(true);
         scroller.addView(root);
         setContentView(scroller);
-        output.setText("Ready. Tap RUN NATIVE RUNTIME TESTS to check your device.\n");
+        output.setText("Ready. Try BOOT CLEAN-ROOM PS3 ELF for the new execution milestone.\n");
     }
 
     private void showProbe() {

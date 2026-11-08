@@ -27,6 +27,23 @@ void ps3_indirect_call(ppu_context*) { ++unexpected_calls; }
 uint64_t ppu_timebase_now() { ++unexpected_calls; return 0; }
 }
 PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*) = nullptr;
+extern "C" int ppu_smoke_execute_entry(uint64_t pc, uint64_t arg,
+                                        uint64_t* out_value, int* out_calls) {
+    unexpected_calls = 0;
+    ppu_context ctx{};
+    ctx.gpr[3] = arg;
+    unsigned matches = 0;
+    for (uint64_t i = 0; i < function_table_count; ++i) {
+        if (function_table[i].addr == pc && function_table[i].func) {
+            ++matches;
+            function_table[i].func(&ctx);
+        }
+    }
+    if (out_value) *out_value = ctx.gpr[3];
+    if (out_calls) *out_calls = unexpected_calls;
+    return matches == 1 ? 1 : 0;
+}
+
 
 static std::string execute_lifted_smoke() {
     unexpected_calls = 0;
