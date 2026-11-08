@@ -1,0 +1,43 @@
+name: inFAMOUS Android ARM64 probe APK
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - experimental/infamous-arm64-probe
+    paths:
+      - 'android-port-lab/**'
+      - '.github/workflows/infamous-android-probe.yml'
+permissions:
+  contents: read
+jobs:
+  android-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Install Android platform + NDK
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+      - name: Checkout official game port source (no proprietary game files)
+        run: git clone --depth 1 https://github.com/whompay/inFAMOUSreborn.git android-port-lab/upstream
+      - name: Build ARM64 APK
+        working-directory: android-port-lab
+        run: gradle --no-daemon assembleDebug
+      - name: Upload Android build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: infamous-android-arm64-probe
+          path: android-port-lab/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
