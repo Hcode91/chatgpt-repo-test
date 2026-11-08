@@ -18,9 +18,9 @@ for source in "${sources[@]}"; do
   test -f "$SRC/$source"
   object="$TMP/${source%.*}.o"
   if [[ "$source" == *.c ]]; then
-    "$CC" -O2 -fPIE -D_LARGEFILE64_SOURCE -I"$SRC" -c "$SRC/$source" -o "$object"
+    "$CC" -O2 -fPIE -D_LARGEFILE64_SOURCE -iquote "$SRC" -c "$SRC/$source" -o "$object"
   else
-    "$CXX" -O2 -fPIE -D_LARGEFILE64_SOURCE -I"$SRC" -c "$SRC/$source" -o "$object"
+    "$CXX" -O2 -fPIE -D_LARGEFILE64_SOURCE -iquote "$SRC" -c "$SRC/$source" -o "$object"
   fi
   objs+=("$object")
 done
