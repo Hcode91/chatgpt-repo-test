@@ -12,7 +12,7 @@ test -f "$SRC/main.cpp"
 mkdir -p "$(dirname "$DEST")"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-sources=(aes.c aes_omac.cpp bn.cpp ec.cpp ecdsa.cpp frontend.cpp getopt.cpp keys.cpp list.cpp main.cpp mt19937.cpp np.cpp rvk.cpp sce.cpp self.cpp sha1.c tables.cpp util.cpp spp.cpp)
+sources=(aes.c aes_omac.cpp bn.cpp ec.cpp ecdsa.cpp frontend.cpp getopt.c keys.cpp list.cpp main.cpp mt19937.cpp np.cpp rvk.cpp sce.cpp self.cpp sha1.c tables.cpp util.cpp spp.cpp)
 objs=()
 for source in "${sources[@]}"; do
   test -f "$SRC/$source"
