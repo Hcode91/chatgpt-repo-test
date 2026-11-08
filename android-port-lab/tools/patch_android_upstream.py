@@ -142,4 +142,27 @@ change("runtime/spu/spu_channels.c",
 '''#else
 #include <xmmintrin.h>
 #endif''')
+# The PAD_FILE controls are used in the shared GetData path, but upstream
+# declares them inside the Windows-only XInput branch. Lift just these data
+# declarations to portable scope; keep XInput-specific code under its guard.
+change("libs/input/cellPad.c",
+'''#if PAD_BACKEND_XINPUT
+
+/* Deadzone for analog sticks''',
+'''static unsigned char g_pf_stick[4] = {128, 128, 128, 128};
+volatile unsigned g_pad_file_held = 0;
+static int g_pf_stick_on = 0;
+
+#if PAD_BACKEND_XINPUT
+
+/* Deadzone for analog sticks''')
+change("libs/input/cellPad.c",
+'''static unsigned char g_pf_stick[4] = {128, 128, 128, 128};
+volatile unsigned g_pad_file_held = 0;   /* v219: PAD_FILE mask being held (rsx_ui_overlay.c dialogs/menu) */
+static int g_pf_stick_on = 0;
+
+#ifdef _WIN32''',
+'''/* PAD_FILE portable state is declared above the XInput-only branch. */
+
+#ifdef _WIN32''')
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
