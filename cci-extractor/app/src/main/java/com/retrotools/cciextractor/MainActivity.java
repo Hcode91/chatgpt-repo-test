@@ -50,18 +50,24 @@ public class MainActivity extends Activity {
     private static final int PICK_PNG = 303;
     private static final int PICK_BTEX_TEMPLATE = 304;
     private static final int SAVE_BTEX = 305;
+    private static final int PICK_NES_FOLDER = 306;
+    private static final int PICK_NES_PNG = 307;
+    private static final int SAVE_NES = 308;
     private static final String DIR_MIME = DocumentsContract.Document.MIME_TYPE_DIR;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
     private Uri imageUri;
     private Uri pngUri, templateUri;
     private CciArchive.Info archive;
+    private NesCodec.Info nesInfo;
+    private int nesPage = -1;
+    private Uri nesPngUri;
     private List<CciArchive.Entry> pending;
     private final List<String> displayed = new ArrayList<>();
     private String activePath = "";
     private boolean busy = false;
     private TextView headline, summary, location, detail;
-    private Button open, extractAll, extractHere, up, stop, pngToBtex;
+    private Button open, extractAll, extractHere, up, stop, pngToBtex, pngToNes;
     private ListView list;
     private ArrayAdapter<String> adapter;
 
@@ -91,17 +97,17 @@ public class MainActivity extends Activity {
         root.setBackgroundColor(Color.rgb(246, 248, 252));
         setContentView(root);
 
-        headline = text("CCI Extractor + Texture Tools", 22, Color.WHITE);
+        headline = text("Game Asset Extractor", 22, Color.WHITE);
         headline.setBackgroundColor(Color.rgb(35, 45, 91));
         headline.setPadding(dp(18), dp(16), dp(14), dp(16));
         root.addView(headline);
-        summary = text("Extract a decrypted CCI. BTEX textures automatically become editable PNGs.", 14, Color.DKGRAY);
+        summary = text("3DS CCI/BTEX and NES CHR tile editing, right on your phone.", 14, Color.DKGRAY);
         root.addView(summary);
         LinearLayout controls = new LinearLayout(this);
         controls.setOrientation(LinearLayout.HORIZONTAL);
         controls.setPadding(dp(6), 0, dp(6), 0);
         root.addView(controls);
-        open = button("Open CCI");
+        open = button("Open CCI / NES");
         extractAll = button("Extract all");
         controls.addView(open, new LinearLayout.LayoutParams(0, dp(54), 1));
         controls.addView(extractAll, new LinearLayout.LayoutParams(0, dp(54), 1));
@@ -115,7 +121,9 @@ public class MainActivity extends Activity {
         controls2.addView(extractHere, new LinearLayout.LayoutParams(0, dp(48), 1.6f));
         controls2.addView(stop, new LinearLayout.LayoutParams(0, dp(48), 0.85f));
         pngToBtex = button("PNG → BTEX (choose original BTEX template)");
-        root.addView(pngToBtex, new LinearLayout.LayoutParams(-1, dp(52)));
+        root.addView(pngToBtex, new LinearLayout.LayoutParams(-1, dp(50)));
+        pngToNes = button("PNG → NES (rebuild CHR-ROM graphics)");
+        root.addView(pngToNes, new LinearLayout.LayoutParams(-1, dp(50)));
         location = text("/", 14, Color.rgb(36, 49, 105));
         location.setBackgroundColor(Color.rgb(225, 231, 248));
         root.addView(location);
@@ -130,7 +138,11 @@ public class MainActivity extends Activity {
 
         open.setOnClickListener(v -> openCci());
         pngToBtex.setOnClickListener(v -> choosePng());
-        extractAll.setOnClickListener(v -> beginExtract(archive == null ? null : archive.entries));
+        pngToNes.setOnClickListener(v -> startNesImport());
+        extractAll.setOnClickListener(v -> {
+            if (nesInfo != null) beginNesExport(-1);
+            else beginExtract(archive == null ? null : archive.entries);
+        });
         extractHere.setOnClickListener(v -> beginExtract(entriesIn(activePath)));
         up.setOnClickListener(v -> {
             if (!activePath.isEmpty()) {
@@ -141,7 +153,20 @@ public class MainActivity extends Activity {
         });
         stop.setOnClickListener(v -> { cancelled.set(true); detail.setText("Cancelling after the current file..."); });
         list.setOnItemClickListener((parent, view, position, id) -> {
-            if (archive == null || busy || position < 0 || position >= displayed.size()) return;
+            if (busy || position < 0 || position >= displayed.size()) return;
+            if (nesInfo != null) {
+                final int page = position;
+                String label = nesInfo.usesChrRam() ? "Experimental PRG tile scan" : "CHR-ROM graphics";
+                new AlertDialog.Builder(this).setTitle(label + " page " + page)
+                        .setMessage(nesInfo.usesChrRam() ?
+                                "Preview the program's bytes as 2-bit NES tiles. These may be code or compressed graphics, not real sprites. Re-import is disabled to avoid corrupting this ROM." :
+                                "Export a 128×128 PNG using the four NES colour indexes, then re-import a modified PNG to rebuild a new .nes copy.")
+                        .setNegativeButton("Close", null)
+                        .setPositiveButton("Export PNG", (d,w) -> beginNesExport(page))
+                        .show();
+                return;
+            }
+            if (archive == null) return;
             String row = displayed.get(position);
             if (row.startsWith("📁 ")) {
                 String folder = row.substring(3);
@@ -188,6 +213,7 @@ public class MainActivity extends Activity {
             catch (SecurityException ignored) { }
             imageUri = uri;
             archive = null;
+            nesInfo = null;
             activePath = "";
             busy = true;
             render();
@@ -197,22 +223,36 @@ public class MainActivity extends Activity {
                     if (descriptor == null) throw new IOException("Cannot access this file");
                     try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
                          FileChannel channel = stream.getChannel()) {
-                        CciArchive.Info resultInfo = CciArchive.parse(channel);
-                        runOnUiThread(() -> {
-                            archive = resultInfo;
-                            busy = false;
-                            summary.setText("Found " + archive.entries.size() + " files across " +
-                                    archive.partitions + " NCCH partition(s).");
-                            detail.setText(resultInfo.notes.isEmpty() ?
-                                    "Tap a folder to browse or a file to extract." :
-                                    "Scan notes: " + String.join("; ", resultInfo.notes));
-                            render();
-                        });
+                        if (NesCodec.isNes(channel)) {
+                            NesCodec.Info result = NesCodec.parse(channel);
+                            runOnUiThread(() -> {
+                                nesInfo = result; archive = null;
+                                busy = false;
+                                summary.setText(result.description());
+                                detail.setText(result.usesChrRam() ?
+                                        "Experimental: " + result.pageCount() + " PRG tile-scan pages. CHR-RAM graphics may be compressed; ROM rebuilding disabled." :
+                                        "Found " + result.pageCount() + " editable CHR-ROM pages. Tap a page or export all as PNG.");
+                                render();
+                            });
+                        } else {
+                            CciArchive.Info resultInfo = CciArchive.parse(channel);
+                            runOnUiThread(() -> {
+                                archive = resultInfo;
+                                nesInfo = null;
+                                busy = false;
+                                summary.setText("Found " + archive.entries.size() + " files across " +
+                                        archive.partitions + " NCCH partition(s).");
+                                detail.setText(resultInfo.notes.isEmpty() ?
+                                        "Tap a folder to browse or a file to extract." :
+                                        "Scan notes: " + String.join("; ", resultInfo.notes));
+                                render();
+                            });
+                        }
                     }
                 } catch (Exception e) {
                     runOnUiThread(() -> {
-                        busy = false; archive = null;
-                        summary.setText("Could not open image");
+                        busy = false; archive = null; nesInfo = null;
+                        summary.setText("Could not open game file");
                         detail.setText(message(e));
                         render();
                         new AlertDialog.Builder(this).setTitle("CCI scan failed")
@@ -232,6 +272,13 @@ public class MainActivity extends Activity {
             chooseOutputBtex();
         } else if (request == SAVE_BTEX && pngUri != null && templateUri != null) {
             encodeSelectedPng(uri);
+        } else if (request == PICK_NES_FOLDER && nesInfo != null) {
+            exportNes(uri);
+        } else if (request == PICK_NES_PNG && nesInfo != null) {
+            nesPngUri = uri;
+            chooseNesOutput();
+        } else if (request == SAVE_NES && nesPngUri != null && nesInfo != null) {
+            rebuildNes(uri);
         }
     }
 
@@ -257,6 +304,11 @@ public class MainActivity extends Activity {
 
     private void render() {
         displayed.clear();
+        if (nesInfo != null) {
+            for (int i = 0; i < nesInfo.pageCount(); i++)
+                displayed.add(String.format(Locale.ROOT, "📄 %s page %02d",
+                        nesInfo.usesChrRam() ? "PRG candidate" : "CHR", i));
+        }
         if (archive != null) {
             String prefix = activePath.isEmpty() ? "" : activePath + "/";
             Set<String> directories = new TreeSet<>();
@@ -272,12 +324,17 @@ public class MainActivity extends Activity {
             for (String file : files) displayed.add("📄 " + file);
         }
         if (adapter != null) adapter.notifyDataSetChanged();
-        location.setText("/" + activePath + "   (" + displayed.size() + " items)");
+        location.setText(nesInfo != null ?
+                (nesInfo.usesChrRam() ? "/NES/PRG candidate scan" : "/NES/CHR graphics") +
+                        " (" + displayed.size() + " sheets)" :
+                "/" + activePath + "   (" + displayed.size() + " items)");
         open.setEnabled(!busy);
         pngToBtex.setEnabled(!busy);
-        extractAll.setEnabled(!busy && archive != null);
+        pngToNes.setEnabled(!busy && nesInfo != null && !nesInfo.usesChrRam());
+        extractAll.setText(nesInfo == null ? "Extract all" : "Export tile PNGs");
+        extractAll.setEnabled(!busy && (archive != null || nesInfo != null));
         extractHere.setEnabled(!busy && archive != null && !entriesIn(activePath).isEmpty());
-        up.setEnabled(!busy && !activePath.isEmpty());
+        up.setEnabled(!busy && archive != null && !activePath.isEmpty());
         stop.setEnabled(busy);
     }
 
@@ -393,6 +450,183 @@ public class MainActivity extends Activity {
                     new AlertDialog.Builder(this).setTitle("Extraction failed")
                             .setMessage(message(e) + "\n\nAlready extracted files remain in the chosen folder.")
                             .setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+    private void beginNesExport(int onlyPage) {
+        if (busy || nesInfo == null) return;
+        nesPage = onlyPage;
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        startActivityForResult(intent, PICK_NES_FOLDER);
+    }
+
+    private void exportNes(Uri tree) {
+        if (busy || nesInfo == null || imageUri == null) return;
+        NesCodec.Info info = nesInfo;
+        int selectedPage = nesPage;
+        busy = true; cancelled.set(false); render();
+        summary.setText("Exporting " + (info.usesChrRam() ? "experimental PRG scans" : "NES CHR graphics") + "...");
+        worker.execute(() -> {
+            int done = 0;
+            try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                if (descriptor == null) throw new IOException("Could not reopen NES ROM");
+                try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
+                     FileChannel channel = stream.getChannel()) {
+                    String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+                    Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree,
+                            DocumentsContract.getTreeDocumentId(tree));
+                    Uri folder = DocumentsContract.createDocument(getContentResolver(), parent,
+                            DIR_MIME, "NES_Tiles_" + stamp);
+                    if (folder == null) throw new IOException("Cannot create output folder");
+                    for (int i = 0; i < info.pageCount(); i++) {
+                        if (selectedPage >= 0 && i != selectedPage) continue;
+                        if (cancelled.get()) break;
+                        byte[] raw = NesCodec.readPage(channel, info, i);
+                        int[] pixels = NesCodec.decodeTiles(raw);
+                        Bitmap image = Bitmap.createBitmap(128, 128, Bitmap.Config.ARGB_8888);
+                        image.setPixels(pixels, 0, 128, 0, 0, 128, 128);
+                        String filename = String.format(Locale.ROOT, "%s_%02d.png",
+                                info.usesChrRam() ? "prg_candidate" : "chr_page", i);
+                        Uri output = DocumentsContract.createDocument(getContentResolver(), folder, "image/png", filename);
+                        if (output == null) throw new IOException("Cannot create " + filename);
+                        try (OutputStream dst = getContentResolver().openOutputStream(output, "w")) {
+                            if (dst == null || !image.compress(Bitmap.CompressFormat.PNG, 100, dst))
+                                throw new IOException("PNG writing failed: " + filename);
+                        } finally { image.recycle(); }
+                        done++;
+                        final int n = done;
+                        runOnUiThread(() -> detail.setText(n + " PNG tile sheet(s) written."));
+                    }
+                    Uri doc = DocumentsContract.createDocument(getContentResolver(), folder,
+                            "text/plain", "README.txt");
+                    if (doc != null) try (OutputStream dst = getContentResolver().openOutputStream(doc, "w")) {
+                        if (dst != null) {
+                            String explanation = "NES 2bpp tile sheets: 16x16 tiles, each tile 8x8 pixels.\n" +
+                                    "Use opaque #000000, #555555, #AAAAAA, #FFFFFF only.\n" +
+                                    "The game's actual palette colours are stored elsewhere.\n" +
+                                    "Mapper: " + info.mapper + "; PRG KiB: " + info.prgBytes/1024 +
+                                    "; CHR KiB: " + info.chrBytes/1024 + ".\n" +
+                                    (info.usesChrRam() ?
+                                        "WARNING: CHR-RAM title. PRG candidate PNGs reinterpret ROM code/data as tiles. They are NOT confirmed game artwork. PNG -> NES is disabled.\n" :
+                                        "Each chr_page_NN.png maps to page NN in the original CHR-ROM. Choose the same page in PNG -> NES.\n");
+                            dst.write(explanation.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                        }
+                    }
+                }
+                final int count = done;
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    summary.setText(count + " NES PNG tile sheet(s) exported" + (cancelled.get() ? " (cancelled)" : ""));
+                    detail.setText(info.usesChrRam() ? "Experimental raw PRG scans. These are not verified Caesars Palace graphics." :
+                            "Export complete. Use PNG → NES to patch a CHR-ROM page in a NEW ROM file.");
+                    new AlertDialog.Builder(this).setTitle("NES PNG export complete")
+                            .setMessage(count + " PNG file(s) saved. " + (info.usesChrRam() ?
+                                    "CHR-RAM mode: PRG scans are exploratory, and ROM rebuilding is disabled." :
+                                    "Edit with only the four grayscale colours, then use PNG → NES."))
+                            .setPositiveButton("OK",null).show();
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("NES export failed"); detail.setText(message(e));
+                    new AlertDialog.Builder(this).setTitle("NES export failed")
+                            .setMessage(message(e)).setPositiveButton("OK",null).show();
+                });
+            }
+        });
+    }
+
+    private void startNesImport() {
+        if (busy || nesInfo == null) return;
+        if (nesInfo.usesChrRam()) {
+            new AlertDialog.Builder(this).setTitle("CHR-RAM graphics")
+                    .setMessage("This NES game has no fixed CHR-ROM data. The PRG scans are only exploratory and could include executable code. " +
+                            "Repacking PNGs would corrupt the ROM unless its graphics loader and encoding are reverse engineered first.")
+                    .setPositiveButton("OK", null).show();
+            return;
+        }
+        int pages = nesInfo.pageCount();
+        String[] labels = new String[pages];
+        for (int i=0;i<pages;i++) labels[i] = String.format(Locale.ROOT,"CHR page %02d",i);
+        new AlertDialog.Builder(this).setTitle("Choose NES graphics page")
+                .setItems(labels, (dialog, which) -> {
+                    nesPage = which;
+                    nesPngUri = null;
+                    Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                    intent.addCategory(Intent.CATEGORY_OPENABLE);
+                    intent.setType("image/png");
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    startActivityForResult(intent, PICK_NES_PNG);
+                }).setNegativeButton("Cancel",null).show();
+    }
+
+    private void chooseNesOutput() {
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("application/octet-stream");
+        intent.putExtra(Intent.EXTRA_TITLE, "NES_Modified_Page_" + nesPage + ".nes");
+        intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        startActivityForResult(intent, SAVE_NES);
+    }
+
+    private void rebuildNes(Uri destination) {
+        if (busy || nesInfo == null || nesInfo.usesChrRam() || nesPage < 0) return;
+        NesCodec.Info sourceInfo = nesInfo;
+        Uri source = imageUri, png = nesPngUri;
+        int page = nesPage;
+        busy = true; cancelled.set(false); render();
+        summary.setText("Rebuilding a separate NES ROM...");
+        worker.execute(() -> {
+            try {
+                BitmapFactory.Options opts = new BitmapFactory.Options();
+                opts.inJustDecodeBounds = true;
+                try(InputStream in = getContentResolver().openInputStream(png)) {
+                    if (in == null) throw new IOException("Cannot read edited PNG");
+                    BitmapFactory.decodeStream(in, null, opts);
+                }
+                if (opts.outWidth != 128 || opts.outHeight != 128)
+                    throw new IOException("NES tile PNG must be exactly 128×128 pixels");
+                opts.inJustDecodeBounds = false;
+                opts.inPremultiplied = false;
+                Bitmap bitmap;
+                try (InputStream in = getContentResolver().openInputStream(png)) {
+                    if (in == null) throw new IOException("Cannot reopen edited PNG");
+                    bitmap = BitmapFactory.decodeStream(in, null, opts);
+                }
+                if (bitmap == null) throw new IOException("PNG decoding failed");
+                int[] pixels = new int[128*128];
+                try {bitmap.getPixels(pixels,0,128,0,0,128,128);} finally {bitmap.recycle();}
+                byte[] patched = NesCodec.encodeTiles(pixels,128,128);
+                if (cancelled.get()) throw new IOException("Cancelled");
+                try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(source,"r")) {
+                    if (descriptor == null) throw new IOException("Cannot read original NES ROM");
+                    try (FileInputStream input = new FileInputStream(descriptor.getFileDescriptor());
+                         FileChannel channel = input.getChannel()) {
+                        NesCodec.Info info = NesCodec.parse(channel);
+                        if (info.chrBytes != sourceInfo.chrBytes || info.mapper != sourceInfo.mapper ||
+                                info.prgBytes != sourceInfo.prgBytes)
+                            throw new IOException("The original ROM has changed; reopen it first");
+                        try (OutputStream output = getContentResolver().openOutputStream(destination,"w")) {
+                            if (output == null) throw new IOException("Cannot write new NES ROM");
+                            NesCodec.rebuild(channel, output, info, page, patched);
+                        }
+                    }
+                }
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("New NES ROM exported");
+                    detail.setText("CHR page " + page + " replaced; original NES ROM untouched.");
+                    new AlertDialog.Builder(this).setTitle("NES mod ready")
+                            .setMessage("Saved a NEW NES ROM with graphics page " + page + " replaced. The original ROM was not edited.")
+                            .setPositiveButton("OK",null).show();
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("PNG → NES failed"); detail.setText(message(e));
+                    new AlertDialog.Builder(this).setTitle("NES rebuild failed")
+                            .setMessage(message(e) + "\n\nA new ROM is only supported for games with CHR-ROM.")
+                            .setPositiveButton("OK",null).show();
                 });
             }
         });
@@ -547,7 +781,7 @@ public class MainActivity extends Activity {
     }
 
     @Override public void onBackPressed() {
-        if (!busy && !activePath.isEmpty()) {
+        if (!busy && archive != null && !activePath.isEmpty()) {
             int slash = activePath.lastIndexOf('/');
             activePath = slash < 0 ? "" : activePath.substring(0, slash);
             render();

@@ -1,6 +1,19 @@
-# CCI Extractor + Texture Tools (Android v0.2.0)
+# Game Asset Extractor (Android v0.3.0)
 
 A native Android app (API 26+) for extracting **decrypted Nintendo 3DS CCI/NCSD** images and converting STXC `.btex` textures to editable PNGs. No root, keys, firmware or network access required. Original CCI remains untouched.
+
+## NES support (new in 0.3)
+
+- Opens **iNES 1.0 `.nes` ROMs** (read-only input), detects mapper and CHR-ROM versus CHR-RAM.
+- **CHR-ROM:** choose **Export tile PNGs**. Each 4096-byte (256-tile) page becomes a 128×128 grayscale PNG of 16×16 NES tiles. The ROM's four 2-bit graphics indexes map to #000000, #555555, #AAAAAA and #FFFFFF. NES palette colours are separate from tile data.
+- **PNG → NES:** after editing an exported CHR page, select its page number and edited PNG. The app validates its dimensions/index colours and saves a **new** `.nes` ROM, replacing only the selected CHR page. Original ROM remains untouched.
+- **CHR-RAM:** since graphics may be compressed, generated at runtime or intertwined with program code, the app **only exports experimental PRG candidate tile sheets**. These are *not* confirmed assets and can look like noise. It intentionally disables PNG-to-ROM rebuilding for CHR-RAM games until game-specific graphics handling is implemented.
+- Verified header and PRG tile scans using the user's **Caesars Palace (USA)** NES (Mapper 2, 128 KiB PRG, CHR-RAM, 32 PRG candidate sheets). The ROM is **not included** in this source or APK.
+- Classic iNES 1.0 supported, NES 2.0 currently rejected explicitly. Other ROM formats not supported.
+
+**To edit CHR-ROM graphics:** Select .nes → Export tile PNGs → edit a sheet without resizing or changing the four grayscale colours → PNG → NES → choose the same page → save a new ROM.
+
+**For Caesars Palace:** Select .nes → Export tile PNGs to inspect 32 PRG candidate sheets. Do *not* patch these raw sheets back into the game, as they may represent executable code. A true mod needs specific graphics data location/decoding or CHR-RAM runtime capture.
 
 ## Features
 
@@ -37,6 +50,7 @@ A native Android app (API 26+) for extracting **decrypted Nintendo 3DS CCI/NCSD*
 JDK 17, Android Gradle Plugin 8.7.3, Gradle 8.9, Android SDK 35.
 
 ```sh
+bash tests/run-nes-smoke-test.sh          # NES CHR roundtrip & Mapper 2 CHR-RAM safety tests
 bash tests/run-texture-smoke-test.sh    # pure-Java synthetic 14-format test
 # Optional if you have a locally decrypted CCI:
 bash tests/run-smoke-test.sh /path/to/your/decrypted.cci
