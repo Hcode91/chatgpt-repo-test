@@ -31,6 +31,24 @@ jobs:
           "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
       - name: Checkout official game port source (no proprietary game files)
         run: git clone --depth 1 https://github.com/whompay/inFAMOUSreborn.git android-port-lab/upstream
+      - name: Generate clean-room PPC64 test ELF
+        run: python3 android-port-lab/tools/generate_ppu_smoke.py --out android-port-lab/generated
+      - name: Lift real PowerPC instruction bytes using upstream ps3recomp
+        run: |
+          python3 android-port-lab/upstream/ps3recomp/tools/ppu_lifter.py \\
+            android-port-lab/generated/smoke.elf \\
+            --output android-port-lab/generated \\
+            --functions android-port-lab/generated/functions.json \\
+            --jobs 1 --single-file
+      - name: Compile and execute lifted PPU smoke on Linux
+        run: |
+          c++ -std=c++20 -O0 -DPPU_SMOKE_HOST \\
+            -I android-port-lab/generated \\
+            -I "$JAVA_HOME/include" -I "$JAVA_HOME/include/linux" \\
+            -x c++ android-port-lab/generated/ppu_recomp.c \\
+            android-port-lab/app/src/main/cpp/ppu_smoke.cpp \\
+            -o /tmp/ppu-smoke
+          /tmp/ppu-smoke
       - name: Build ARM64 APK
         working-directory: android-port-lab
         run: gradle --no-daemon assembleDebug
