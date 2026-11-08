@@ -276,4 +276,16 @@ change("libs/spurs/cellFiber.c",
 #endif
 
 #if defined(__APPLE__)''')
+# The Windows-only W16PROF sampling state is referenced by the generic
+# taskwait entry, even when the sampler is disabled on Android.
+change("libs/spurs/cellSpurs.c",
+'''#else
+static inline void w16p_begin(int wid) { (void)wid; }
+static inline void w16p_end(void) {}
+#endif''',
+'''#else
+static volatile int s_w16p_mode = 0;
+static inline void w16p_begin(int wid) { (void)wid; }
+static inline void w16p_end(void) {}
+#endif''')
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
