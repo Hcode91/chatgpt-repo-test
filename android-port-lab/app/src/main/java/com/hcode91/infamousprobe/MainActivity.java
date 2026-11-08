@@ -55,7 +55,7 @@ public final class MainActivity extends Activity {
         ppu.setText("Run recompiled PPU instructions");
         root.addView(ppu);
         ppu.setOnClickListener(v -> {
-            output.setText("Executing recompiled PowerPC instructions...\\n");
+            output.setText("Executing recompiled PowerPC instructions...\n");
             try {
                 output.setText(nativePpuSmoke());
             } catch (Throwable e) {
@@ -84,6 +84,12 @@ public final class MainActivity extends Activity {
             }
         });
 
+
+        Button integrated = new Button(this);
+        integrated.setText("BOOT REAL PS3RECOMP RUNTIME (EXPERIMENTAL)");
+        root.addView(integrated);
+        integrated.setOnClickListener(v -> runIntegratedBoot());
+
         Button pick = new Button(this);
         pick.setText("Inspect my EBOOT.elf");
         root.addView(pick);
@@ -106,6 +112,95 @@ public final class MainActivity extends Activity {
         scroller.addView(root);
         setContentView(scroller);
         output.setText("Ready. Try BOOT CLEAN-ROOM PS3 ELF for the new execution milestone.\n");
+    }
+
+    /**
+     * Run the actual upstream Android ARM64 PS3 boot executable, in its own
+     * sandboxed child process. Only the synthetic upstream test ELF is used.
+     * Capture bounded stdout/stderr and kill a hung child after 25 seconds.
+     * Never run untrusted user-selected ELF files through this experiment.
+     */
+    private void runIntegratedBoot() {
+        output.setText("Starting full upstream PPU/LV2/HLE/RSX boot scaffold...\n"
+                + "Synthetic program only, NOT inFAMOUS.\n");
+        new Thread(() -> {
+            Process child = null;
+            try {
+                java.io.File test = new java.io.File(getFilesDir(), "upstream-smoke.elf");
+                try (InputStream src = getAssets().open("upstream-smoke.elf");
+                     java.io.FileOutputStream dst = new java.io.FileOutputStream(test, false)) {
+                    byte[] buf = new byte[8192];
+                    int n;
+                    long total = 0;
+                    while ((n = src.read(buf)) >= 0) {
+                        total += n;
+                        if (total > 4 * 1024 * 1024)
+                            throw new IOException("Upstream ELF exceeds 4 MB limit");
+                        dst.write(buf, 0, n);
+                    }
+                }
+                java.io.File runner = new java.io.File(
+                        getApplicationInfo().nativeLibraryDir, "libps3boot.so");
+                if (!runner.isFile() || !runner.canExecute())
+                    throw new IOException("Native boot executable not extracted: " + runner);
+                ProcessBuilder builder = new ProcessBuilder(
+                        runner.getAbsolutePath(), test.getAbsolutePath());
+                builder.directory(getFilesDir());
+                builder.redirectErrorStream(true);
+                builder.environment().put("LD_LIBRARY_PATH",
+                        getApplicationInfo().nativeLibraryDir);
+                child = builder.start();
+
+                final Process running = child;
+                final java.util.concurrent.atomic.AtomicBoolean timedOut =
+                        new java.util.concurrent.atomic.AtomicBoolean(false);
+                Thread watchdog = new Thread(() -> {
+                    try {
+                        if (!running.waitFor(25, java.util.concurrent.TimeUnit.SECONDS)) {
+                            timedOut.set(true);
+                            running.destroyForcibly();
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        running.destroyForcibly();
+                    }
+                });
+                watchdog.setDaemon(true);
+                watchdog.start();
+
+                java.io.ByteArrayOutputStream collected = new java.io.ByteArrayOutputStream();
+                try (InputStream stream = running.getInputStream()) {
+                    byte[] buffer = new byte[4096];
+                    int n;
+                    while ((n = stream.read(buffer)) != -1) {
+                        if (collected.size() < 65536)
+                            collected.write(buffer, 0, Math.min(n, 65536 - collected.size()));
+                    }
+                }
+                int exit = running.waitFor();
+                watchdog.join(1000);
+                String log = new String(collected.toByteArray(),
+                        java.nio.charset.StandardCharsets.UTF_8);
+                boolean reachedBoot = log.contains("boot:init_done")
+                        || log.contains("[boot] dispatching entry OPD");
+                String result = "UPSTREAM PS3RECOMP BOOT REPORT\n"
+                        + "ARM64 native child process: launched\n"
+                        + "Runtime initialization reached: " + reachedBoot + "\n"
+                        + "Process exit code: " + exit + "\n"
+                        + "Timed out: " + timedOut.get() + "\n"
+                        + "No inFAMOUS game data loaded.\n\n"
+                        + "OUTPUT (max 64 KB):\n" + log;
+                runOnUiThread(() -> output.setText(result));
+            } catch (Exception e) {
+                String problem = "UPSTREAM BOOT FAILED\n"
+                        + e.getClass().getSimpleName() + ": " + e.getMessage()
+                        + "\n\nThis is an execution/integration error, not a game result.";
+                runOnUiThread(() -> output.setText(problem));
+            } finally {
+                if (child != null && child.isAlive())
+                    child.destroyForcibly();
+            }
+        }, "ps3recomp-boot-worker").start();
     }
 
     private void showProbe() {

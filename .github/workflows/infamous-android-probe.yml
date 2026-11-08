@@ -95,6 +95,18 @@ jobs:
         id: integrated-runtime
         continue-on-error: true
         run: bash android-port-lab/tools/build_android_runtime.sh
+      - name: Package actual upstream Android ARM64 boot executable and test ELF
+        run: |
+          set -e
+          BIN="android-port-lab/build/integrated/ps3recomp/ps3recomp_boot_smoke"
+          ELF="android-port-lab/build/integrated/ps3recomp/smoke/smoke.elf"
+          test -s "$BIN"
+          test -s "$ELF"
+          readelf -h "$BIN" | grep -q 'AArch64'
+          mkdir -p android-port-lab/app/src/main/jniLibs/arm64-v8a
+          cp "$BIN" android-port-lab/app/src/main/jniLibs/arm64-v8a/libps3boot.so
+          cp "$ELF" android-port-lab/app/src/main/assets/upstream-smoke.elf
+          echo "PACKAGED_REAL_UPSTREAM_BOOT_EXECUTABLE=yes"
       - name: Upload full runtime build report and compiler errors
         if: always()
         uses: actions/upload-artifact@v4
