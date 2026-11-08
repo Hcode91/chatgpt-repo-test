@@ -9,6 +9,7 @@ endif()
 add_library(infamousprobe SHARED
     native_probe.cpp
     ppu_smoke.cpp
+    elf_boot.cpp
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../generated/ppu_recomp.c"
     "${UPSTREAM_ROOT}/runtime/milestone.c"
 )

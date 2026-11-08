@@ -33,6 +33,10 @@ jobs:
         run: git clone --depth 1 https://github.com/whompay/inFAMOUSreborn.git android-port-lab/upstream
       - name: Generate clean-room PPC64 test ELF
         run: python3 android-port-lab/tools/generate_ppu_smoke.py --out android-port-lab/generated
+      - name: Bundle the clean-room ELF with the Android application
+        run: |
+          mkdir -p android-port-lab/app/src/main/assets
+          cp android-port-lab/generated/smoke.elf android-port-lab/app/src/main/assets/smoke.elf
       - name: Lift real PowerPC instruction bytes using upstream ps3recomp
         run: |
           python3 android-port-lab/upstream/ps3recomp/tools/ppu_lifter.py \
@@ -49,6 +53,17 @@ jobs:
             android-port-lab/app/src/main/cpp/ppu_smoke.cpp \
             -o /tmp/ppu-smoke
           /tmp/ppu-smoke
+      - name: Compile and execute ELF loading smoke on Linux
+        run: |
+          c++ -std=c++20 -O0 -DPPU_ELF_HOST \
+            -I android-port-lab/generated \
+            -I "$JAVA_HOME/include" -I "$JAVA_HOME/include/linux" \
+            -x c++ android-port-lab/generated/ppu_recomp.c \
+            android-port-lab/app/src/main/cpp/ppu_smoke.cpp \
+            android-port-lab/app/src/main/cpp/elf_boot.cpp \
+            -o /tmp/ppu-elf-smoke
+          /tmp/ppu-elf-smoke android-port-lab/generated/smoke.elf
+          /tmp/ppu-elf-smoke android-port-lab/generated/smoke.elf --reject-mutated
       - name: Build ARM64 APK
         working-directory: android-port-lab
         run: gradle --no-daemon assembleDebug
