@@ -288,4 +288,57 @@ static volatile int s_w16p_mode = 0;
 static inline void w16p_begin(int wid) { (void)wid; }
 static inline void w16p_end(void) {}
 #endif''')
+# Real synthetic PS3 guest geometry. The PPU program issues NV4097 draw
+# commands into the same FIFO used by the successful v0.5 boot test.
+# The headless RSX software backend rasterizes an actual triangle. Bitmap
+# capture is opt-in via the upstream NULLSW_DUMP environment setting.
+change("runtime/ppu/tests/smoke/smoke_recomp.c",
+'''#define SMOKE_IO_SIZE       0x00200000u''',
+'''#define SMOKE_IO_SIZE       0x00200000u
+#define SMOKE_VTX_OFFSET    0x00010000u''')
+change("runtime/ppu/tests/smoke/smoke_recomp.c",
+'''/* ---------------------------------------------------------------------------
+ * Firmware import stubs.''',
+'''/* Three geometries/colors are emitted by lifted synthetic PS3 guest code.
+ * Each vertex holds float4 position followed by float4 color at stride 32.
+ * Memory and FIFO writes go through the real guest vm_write32 path.
+ */
+static void smoke_draw_rsx_triangle(unsigned frame)
+{
+    static const float xy[3][4] = {
+        { -0.70f, -0.65f, 0.0f, 1.0f },
+        {  0.70f, -0.65f, 0.0f, 1.0f },
+        {  0.00f,  0.75f, 0.0f, 1.0f },
+    };
+    static const float colors[3][4] = {
+        { 1.0f, 0.86f, 0.16f, 1.0f },
+        { 0.16f, 0.92f, 0.95f, 1.0f },
+        { 0.98f, 0.25f, 0.65f, 1.0f },
+    };
+    for (unsigned i = 0; i < 3; ++i) {
+        for (unsigned k = 0; k < 8; ++k) {
+            const float value = k < 4 ? xy[i][k] : colors[frame % 3][k - 4];
+            uint32_t bits;
+            memcpy(&bits, &value, sizeof bits);
+            vm_write32(SMOKE_IO_ADDR + SMOKE_VTX_OFFSET + i * 32u + k * 4u, bits);
+        }
+    }
+    const uint32_t format = 2u | (4u << 4) | (32u << 8);
+    smoke_emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0u, 0x80000000u | SMOKE_VTX_OFFSET);
+    smoke_emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0u, format);
+    smoke_emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 12u, 0x80000000u | (SMOKE_VTX_OFFSET + 16u));
+    smoke_emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 12u, format);
+    smoke_emit(NV4097_SET_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+    smoke_emit(NV4097_DRAW_ARRAYS, (2u << 24));
+    smoke_emit(NV4097_SET_BEGIN_END, 0u);
+}
+
+/* ---------------------------------------------------------------------------
+ * Firmware import stubs.''')
+change("runtime/ppu/tests/smoke/smoke_recomp.c",
+'''        smoke_emit(NV4097_CLEAR_SURFACE,         0xF0u);
+        vm_write32(ctrl + 0, g_fifo_len);''',
+'''        smoke_emit(NV4097_CLEAR_SURFACE,         0xF0u);
+        smoke_draw_rsx_triangle((unsigned)frame);
+        vm_write32(ctrl + 0, g_fifo_len);''')
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
