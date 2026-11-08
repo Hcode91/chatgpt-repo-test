@@ -17,12 +17,14 @@ import java.util.Locale;
 
 public final class MainActivity extends Activity {
     private static final int PICK_EXECUTABLE = 101;
+    private static final int PICK_REAL_PPU = 102;
     private TextView output;
     private String startup;
     private int testRunCount = 0;
     private static native String nativeProbe();
     private static native String nativePpuSmoke();
     private static native String nativeElfSmoke(byte[] image);
+    private static native String nativeRealPpuProbe(byte[] image);
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -109,6 +111,16 @@ public final class MainActivity extends Activity {
             choose.setType("*/*");
             choose.addCategory(Intent.CATEGORY_OPENABLE);
             startActivityForResult(choose, PICK_EXECUTABLE);
+        });
+
+        Button realPpu = new Button(this);
+        realPpu.setText("TRACE REAL inFAMOUS EBOOT STARTUP (EXPERIMENTAL)");
+        root.addView(realPpu);
+        realPpu.setOnClickListener(v -> {
+            Intent choose = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            choose.setType("*/*");
+            choose.addCategory(Intent.CATEGORY_OPENABLE);
+            startActivityForResult(choose, PICK_REAL_PPU);
         });
 
         output = new TextView(this);
@@ -230,6 +242,10 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == PICK_REAL_PPU && resultCode == RESULT_OK && data != null && data.getData() != null) {
+            runRealPpuTrace(data.getData());
+            return;
+        }
         if (requestCode != PICK_EXECUTABLE || resultCode != RESULT_OK || data == null) return;
         Uri uri = data.getData();
         if (uri == null) return;
@@ -259,6 +275,31 @@ public final class MainActivity extends Activity {
         } catch (IOException e) {
             output.setText(startup + "\n\nFile error: " + e.getMessage());
         }
+    }
+
+    private void runRealPpuTrace(Uri uri) {
+        output.setText("Reading your ELF and tracing real guest startup instructions...\n"
+                + "No game data is transmitted or bundled in the APK.\n");
+        new Thread(() -> {
+            String outcome;
+            try (InputStream in = getContentResolver().openInputStream(uri)) {
+                if (in == null) throw new IOException("Cannot open selected ELF");
+                java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+                byte[] block = new byte[8192];
+                int n;
+                while ((n = in.read(block)) != -1) {
+                    if (bytes.size() + n > 32 * 1024 * 1024)
+                        throw new IOException("ELF exceeds the 32 MiB probe limit");
+                    bytes.write(block, 0, n);
+                }
+                outcome = nativeRealPpuProbe(bytes.toByteArray());
+            } catch (Throwable error) {
+                outcome = "Real EBOOT startup trace FAILED\n" + error.getClass().getSimpleName()
+                        + ": " + error.getMessage();
+            }
+            String finalOutcome = outcome;
+            runOnUiThread(() -> output.setText(finalOutcome));
+        }, "real-eboot-startup-trace").start();
     }
 
     static {
