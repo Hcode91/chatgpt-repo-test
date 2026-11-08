@@ -1,0 +1,11 @@
+--- a/app/src/main/java/com/localpaint/app/MainActivity.java
++++ b/app/src/main/java/com/localpaint/app/MainActivity.java
+@@ -283,7 +283,7 @@
+                     generated = null;
+                     outputPreview.setImageDrawable(null);
+                     saveButton.setEnabled(false);
+-                    setStatus("Photo ready (" + width + "×" + height + "). Paint the region to change.");
++                    setStatus("Photo ready (" + resized.getWidth() + "×" + resized.getHeight() + "). Paint the region to change.");
+                 });
+             } catch (Throwable e) {
+                 runOnUiThread(() -> setStatus("Image import failed: " + shortError(e)));
