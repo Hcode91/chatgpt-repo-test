@@ -1,4 +1,4 @@
-# Game Asset Extractor (Android v0.4.0)
+# Game Asset Extractor (Android v0.4.1)
 
 A native Android app (API 26+) for extracting **decrypted Nintendo 3DS CCI/NCSD** images and converting STXC `.btex` textures to editable PNGs. No root, keys, firmware or network access required. Original CCI remains untouched.
 
@@ -24,6 +24,27 @@ A native Android app (API 26+) for extracting **decrypted Nintendo 3DS CCI/NCSD*
 - **Important:** PNGs exported from `.btex` files use BTEX filenames rather than Azahar's hash names. They can be upscaled for viewing, but cannot automatically be recognized as in-game HD replacements without being matched to Azahar texture dumps. Existing PNG → BTEX conversion still requires the original exact dimensions.
 - Start with 2× on mobile; 4× has much higher VRAM cost. Raising Azahar's **Internal Resolution** separately can improve 3D rendering without modifying textures.
 
+## Title ID folder preservation (new in 0.4.1)
+
+3DS extraction now reads the **game Title ID directly from the CCI/NCCH header**, not the filename. A typical extraction has this structure:
+
+```text
+CCI_Extract_YYYYMMDD_HHMMSS/
+  0004000000112D00/
+    romfs/
+      system/
+        TitleLogo.btex
+        TitleLogo.png
+    exefs/
+  other_partitions/
+    partition_1/
+      ...
+```
+
+The main game's `partition_0/romfs/` is automatically exported as `<TITLE_ID>/romfs/`, including when you extract one file or one folder. Copy just the **Title ID folder** into Azahar's `load/mods/` destination. Other NCSD partitions remain in `other_partitions` to avoid mixing optional/manual content into the main game's mods. If the title ID is unreadable, the app **does not guess** a folder name and retains the original partition path instead.
+
+**Important:** This is a RomFS mod-ready *directory layout*, not a full working mod containing only changed files. Prefer copying only the textures you edited when making a final mod to reduce needless overrides.
+
 ## Features
 
 - Open `.cci`/`.3ds` images via Android's file picker and browse RomFS/ExeFS partitions.
@@ -38,7 +59,7 @@ A native Android app (API 26+) for extracting **decrypted Nintendo 3DS CCI/NCSD*
 
 1. Launch the app and open your **decrypted** CCI.
 2. Tap **Extract all**, or browse to `partition_0/romfs/system/` and select `TitleLogo.btex`.
-3. Choose a folder. The output includes both `TitleLogo.btex` and `TitleLogo.png`.
+3. Choose a folder. The output includes `CCI_Extract_.../<TITLE_ID>/romfs/...` with both `TitleLogo.btex` and `TitleLogo.png`.
 4. Open the PNG in an image editor on your phone. Keep image dimensions unchanged.
 5. Tap **PNG → BTEX**. Choose your edited PNG, then the matching original BTEX extracted in step 3.
 6. Choose a new output path for the modified `.btex`.
@@ -59,6 +80,7 @@ A native Android app (API 26+) for extracting **decrypted Nintendo 3DS CCI/NCSD*
 JDK 17, Android Gradle Plugin 8.7.3, Gradle 8.9, Android SDK 35.
 
 ```sh
+bash tests/run-export-path-test.sh       # 3DS Title ID export folder regression tests
 bash tests/run-nes-smoke-test.sh          # NES CHR roundtrip & Mapper 2 CHR-RAM safety tests
 bash tests/run-texture-smoke-test.sh    # pure-Java synthetic 14-format test
 # Optional if you have a locally decrypted CCI:

@@ -269,10 +269,13 @@ public class MainActivity extends Activity {
                                 nesInfo = null;
                                 busy = false;
                                 summary.setText("Found " + archive.entries.size() + " files across " +
-                                        archive.partitions + " NCCH partition(s).");
-                                detail.setText(resultInfo.notes.isEmpty() ?
-                                        "Tap a folder to browse or a file to extract." :
-                                        "Scan notes: " + String.join("; ", resultInfo.notes));
+                                        archive.partitions + " NCCH partition(s)." +
+                                        (resultInfo.titleId != null ? " Title ID: " + resultInfo.titleId : ""));
+                                detail.setText((resultInfo.titleId == null
+                                        ? "The game has no readable Title ID; partition folders will be preserved."
+                                        : "Extracted RomFS goes under " + resultInfo.titleId + "/romfs/.") +
+                                        (resultInfo.notes.isEmpty() ? "" :
+                                        " Scan notes: " + String.join("; ", resultInfo.notes)));
                                 render();
                             });
                         }
@@ -394,9 +397,13 @@ public class MainActivity extends Activity {
                     byte[] buffer = new byte[131072];
                     for (CciArchive.Entry e : selection) {
                         if (cancelled.get()) break;
-                        int index = e.path.lastIndexOf('/');
-                        String path = e.path.substring(0, index);
-                        String filename = e.path.substring(index + 1);
+                        // Store a main-game file under <TITLE_ID>/romfs or <TITLE_ID>/exefs,
+                        // not partition_0/romfs, so the title-ID folder can be copied to
+                        // Azahar's load/mods directory without reconstructing its layout.
+                        String exportPath = CciArchive.exportPath(e.path, archive.titleId);
+                        int index = exportPath.lastIndexOf('/');
+                        String path = exportPath.substring(0, index);
+                        String filename = exportPath.substring(index + 1);
                         Uri dir = ensureFolder(path, folders);
                         // Preserve the original BTEX file, which the PNG -> BTEX feature uses as a template.
                         Uri target = DocumentsContract.createDocument(getContentResolver(), dir,
@@ -462,14 +469,21 @@ public class MainActivity extends Activity {
                     busy = false;
                     summary.setText((interrupted ? "Stopped: " : "Finished: ") + complete +
                             " files (" + human(bytes) + ") · " + pngs + " textures → PNG");
-                    detail.setText("Original BTEX templates are retained beside each PNG." +
+                    detail.setText("Original BTEX templates are retained beside each PNG. " +
+                            (archive.titleId == null ? "No Title ID in header, so original partition paths were kept."
+                                : "For Azahar mods, copy the " + archive.titleId +
+                                    " folder from this extraction into your mods directory.") +
                             (skipped > 0 ? " " + skipped + " textures could not be converted." : ""));
                     render();
                     new AlertDialog.Builder(this).setTitle(interrupted ? "Extraction cancelled" : "Extraction complete")
                             .setMessage(complete + " original file(s) extracted. " + pngs +
                                     " BTEX texture(s) converted to PNG." + (skipped > 0 ?
                                     " " + skipped + " texture(s) could not be converted; originals preserved." : "") +
-                                    "\n\nOriginal CCI was not modified.")
+                                    "\n\n" + (archive.titleId == null ?
+                                        "Title ID was unavailable, so original partition names were preserved." :
+                                        "Exported game path: " + archive.titleId + "/romfs/ (inside CCI_Extract_...)." +
+                                        "\nCopy the Title ID folder to Azahar's mods folder.") +
+                                    "\nOriginal CCI was not modified.")
                             .setPositiveButton("OK", null).show();
                 });
             } catch (Exception e) {

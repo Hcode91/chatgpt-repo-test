@@ -11,9 +11,13 @@ public final class SmokeTest {
       CciArchive.Info info = CciArchive.parse(c);
       System.out.println("Partitions: " + info.partitions);
       System.out.println("Files: " + info.entries.size());
+      System.out.println("Title ID: " + info.titleId);
+      if (info.titleId == null || !info.titleId.matches("[0-9A-F]{16}"))
+        throw new AssertionError("Expected valid 16-digit Title ID");
       System.out.println("Notes: " + info.notes);
       for (CciArchive.Entry e : info.entries) if (e.path.endsWith("/TitleLogo.btex")) {
         System.out.println("Found title logo: " + e.path + " offset=" + e.offset + " size=" + e.size);
+        System.out.println("Exported as: " + CciArchive.exportPath(e.path, info.titleId));
         byte[] magic = new byte[4];
         c.read(java.nio.ByteBuffer.wrap(magic),e.offset);
         System.out.println("Starts: " + Arrays.toString(magic));
