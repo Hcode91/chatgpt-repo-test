@@ -19,6 +19,7 @@ public final class MainActivity extends Activity {
     private static final int PICK_EXECUTABLE = 101;
     private TextView output;
     private String startup;
+    private int testRunCount = 0;
     private static native String nativeProbe();
 
     @Override public void onCreate(Bundle state) {
@@ -69,16 +70,21 @@ public final class MainActivity extends Activity {
         scroller.setFillViewport(true);
         scroller.addView(root);
         setContentView(scroller);
-        showProbe();
+        output.setText("Ready. Tap RUN NATIVE RUNTIME TESTS to check your device.\n");
     }
 
     private void showProbe() {
+        testRunCount++;
+        String completedAt = new java.text.SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+                .format(new java.util.Date());
         try {
             startup = nativeProbe();
         } catch (Throwable e) {
             startup = "Native library ERROR: " + e.getClass().getSimpleName() + ": " + e.getMessage();
         }
-        output.setText(startup + "\n\nNext: port the real PPU boot scaffold and RSX renderer. This app does not execute inFAMOUS.\n");
+        output.setText("TEST RUN #" + testRunCount + " FINISHED AT " + completedAt
+                + "\n\n" + startup
+                + "\n\nNext: port the real PPU boot scaffold and RSX renderer. This app does not execute inFAMOUS.\n");
     }
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
