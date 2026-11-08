@@ -1,0 +1,11 @@
+.gradle/
+.idea/
+local.properties
+build/
+app/build/
+*.iml
+*.apk
+*.cci
+*.3ds
+*.cxi
+*.cia
