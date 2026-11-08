@@ -19,8 +19,11 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - name: Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Verify Android SDK on runner
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          command -v sdkmanager
+          sdkmanager --version
       - name: Android NDK and CMake
         run: |
           yes | sdkmanager --licenses >/dev/null || true
