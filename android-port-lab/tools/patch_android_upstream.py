@@ -182,4 +182,79 @@ change("CMakeLists.txt",
 ''',
 '''        $<$<NOT:$<BOOL:${ANDROID}>>:-msse4.1>
 ''')
+# Full runtime build blockers found by the Android CMake integration.
+change("libs/system/cellSysutil.c",
+'''__declspec(selectany) void (*g_sysutil_lang_hook)(int) = NULL;''',
+'''#if defined(__ANDROID__)
+__attribute__((weak)) void (*g_sysutil_lang_hook)(int) = NULL;
+#else
+__declspec(selectany) void (*g_sysutil_lang_hook)(int) = NULL;
+#endif''')
+
+change("runtime/spu/spurs_policy.c",
+'''struct timespec ts; timespec_get(&ts, TIME_UTC);   /* C11; precise on UCRT and glibc */''',
+'''struct timespec ts;
+#if defined(__ANDROID__)
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#else
+    timespec_get(&ts, TIME_UTC);
+#endif''')
+
+change("runtime/spu/spu_interp.c",
+'''#include <xmmintrin.h>
+#include "spu_interp.h"''',
+'''#if defined(__aarch64__)
+#include <fenv.h>
+#include <time.h>
+#define SPU_INTERP_NO_VEC 1
+static inline unsigned long long spu_interp_arm64_ticks(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+#define __rdtsc() spu_interp_arm64_ticks()
+#else
+#include <xmmintrin.h>
+#endif
+#include "spu_interp.h"''')
+change("runtime/spu/spu_interp.c",
+'''#define SPU_DP(expr) do { unsigned _c = _mm_getcsr(); _mm_setcsr(_c & ~0xE040u); DST = (expr); _mm_setcsr(_c); } while (0)''',
+'''#if defined(__aarch64__)
+#define SPU_DP(expr) do { int _c = fegetround(); fesetround(FE_TONEAREST); DST = (expr); fesetround(_c); } while (0)
+#else
+#define SPU_DP(expr) do { unsigned _c = _mm_getcsr(); _mm_setcsr(_c & ~0xE040u); DST = (expr); _mm_setcsr(_c); } while (0)
+#endif''')
+change("runtime/spu/spu_interp.c",
+'''#if defined(_MSC_VER) && !defined(__clang__)
+    return __rdtsc();
+#else
+    return __builtin_ia32_rdtsc();
+#endif''',
+'''#if defined(__aarch64__)
+    return spu_interp_arm64_ticks();
+#elif defined(_MSC_VER) && !defined(__clang__)
+    return __rdtsc();
+#else
+    return __builtin_ia32_rdtsc();
+#endif''')
+change("libs/spurs/cellSpurs.c",
+'''#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif''',
+'''#if defined(__aarch64__)
+#include <time.h>
+static inline unsigned long long spurs_arm64_ticks(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+#define __rdtsc() spurs_arm64_ticks()
+#define _mm_pause() __asm__ __volatile__("yield")
+#elif defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif''')
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
