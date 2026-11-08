@@ -32,9 +32,8 @@ jobs:
           git -C /tmp/scetool-src checkout --detach d78d8986c9ab831f084516f21ecdf87080ac7b78
           test "$(git -C /tmp/scetool-src rev-parse HEAD)" = d78d8986c9ab831f084516f21ecdf87080ac7b78
       - name: Cross-compile ARM64 ELF decryption executable
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
         run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
           bash ps3-elf-extractor/tools/build_scetool_android.sh /tmp/scetool-src ps3-elf-extractor/app/src/main/jniLibs/arm64-v8a/libps3elf.so
       - name: Build Android APK
         working-directory: ps3-elf-extractor
