@@ -10,6 +10,8 @@ Standalone Android ARM64 proof-of-concept for decrypting **personally supplied P
 - Users supply their **own scetool-format `keys` file** (including a compatible SELF keyset and NPDRM entries); the 16-byte RAP alone is not enough. Keys are not embedded, uploaded, or committed.
 - Output is private in the Android app sandbox until the user saves it through Android's document provider. No INTERNET permission.
 
+**Important:** The packaged `scetool-source-gplv2.tar.gz` contains source code, not the PS3 `keys` keyset. The keyset must be a separate plaintext scetool-compatible file. v0.2 adds `libc++_shared.so` to address the Android executable loader error observed on-device.
+
 ## Workflow
 
 1. Install the APK artifact from the `PS3 ELF Extractor Android APK` GitHub Action.
