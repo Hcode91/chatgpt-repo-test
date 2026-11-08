@@ -9,8 +9,8 @@ android {
         applicationId 'com.hcode91.infamousprobe'
         minSdk 26
         targetSdk 28
-        versionCode 6
-        versionName '0.6-vulkan-present'
+        versionCode 7
+        versionName '0.7-guest-rsx-triangles'
         ndk { abiFilters 'arm64-v8a' }
         externalNativeBuild {
             cmake { cppFlags '-std=c++17 -Wall -Wextra' }

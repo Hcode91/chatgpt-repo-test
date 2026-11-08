@@ -90,6 +90,12 @@ public final class MainActivity extends Activity {
         root.addView(integrated);
         integrated.setOnClickListener(v -> runIntegratedBoot());
 
+        Button rsxGraphics = new Button(this);
+        rsxGraphics.setText("DRAW PS3 RSX TRIANGLES (GUEST CODE)");
+        root.addView(rsxGraphics);
+        rsxGraphics.setOnClickListener(v ->
+            startActivity(new Intent(this, RsxActivity.class)));
+
         Button graphics = new Button(this);
         graphics.setText("TEST VULKAN GRAPHICS ON SCREEN");
         root.addView(graphics);
@@ -116,7 +122,7 @@ public final class MainActivity extends Activity {
         scroller.setFillViewport(true);
         scroller.addView(root);
         setContentView(scroller);
-        output.setText("Ready. Try BOOT CLEAN-ROOM PS3 ELF for the new execution milestone.\n");
+        output.setText("Ready. Try DRAW PS3 RSX TRIANGLES for genuine guest-generated graphics.\n");
     }
 
     /**
