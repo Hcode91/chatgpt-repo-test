@@ -1,6 +1,7 @@
 // Vulkan Android SurfaceView real display/presentation proof.
 // Renders GPU-cleared moving color frames, not emulated RSX geometry.
 // Lifecycle avoids stale surface usage: Java requests cancellation before destroy.
+#define VK_USE_PLATFORM_ANDROID_KHR 1
 #include <jni.h>
 #include <android/native_window_jni.h>
 #include <vulkan/vulkan.h>
@@ -11,6 +12,7 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <cmath>
 
 namespace {
 std::atomic<bool> cancel_requested{false};
@@ -210,6 +212,7 @@ Java_com_hcode91_infamousprobe_VulkanActivity_renderVulkan(JNIEnv* env, jclass, 
             pi.swapchainCount = 1; pi.pSwapchains = &swapchain; pi.pImageIndices = &imageIndex;
             VkResult present = vkQueuePresentKHR(queue, &pi);
             if (present != VK_SUCCESS && present != VK_SUBOPTIMAL_KHR) { result = err("present", present); break; }
+            TRY_VK("queue idle", vkQueueWaitIdle(queue));
             TRY_VK("queue fence", vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
             TRY_VK("reset fence", vkResetFences(device, 1, &fence));
             ++frameCount;
