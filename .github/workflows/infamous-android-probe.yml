@@ -64,6 +64,20 @@ jobs:
             -o /tmp/ppu-elf-smoke
           /tmp/ppu-elf-smoke android-port-lab/generated/smoke.elf
           /tmp/ppu-elf-smoke android-port-lab/generated/smoke.elf --reject-mutated
+      - name: Cross-compile upstream PPU, LV2, SPU, RSX, input and audio for Android ARM64
+        run: |
+          python3 android-port-lab/tools/audit_runtime_android.py \
+            --ndk "$ANDROID_HOME/ndk/27.2.12479018" \
+            --out android-port-lab/build/audit
+      - name: Upload Android runtime compatibility audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: infamous-android-runtime-audit
+          path: |
+            android-port-lab/build/audit/audit.md
+            android-port-lab/build/audit/audit.json
+          if-no-files-found: warn
       - name: Build ARM64 APK
         working-directory: android-port-lab
         run: gradle --no-daemon assembleDebug
