@@ -35,18 +35,18 @@ jobs:
         run: python3 android-port-lab/tools/generate_ppu_smoke.py --out android-port-lab/generated
       - name: Lift real PowerPC instruction bytes using upstream ps3recomp
         run: |
-          python3 android-port-lab/upstream/ps3recomp/tools/ppu_lifter.py \\
-            android-port-lab/generated/smoke.elf \\
-            --output android-port-lab/generated \\
-            --functions android-port-lab/generated/functions.json \\
+          python3 android-port-lab/upstream/ps3recomp/tools/ppu_lifter.py \
+            android-port-lab/generated/smoke.elf \
+            --output android-port-lab/generated \
+            --functions android-port-lab/generated/functions.json \
             --jobs 1 --single-file
       - name: Compile and execute lifted PPU smoke on Linux
         run: |
-          c++ -std=c++20 -O0 -DPPU_SMOKE_HOST \\
-            -I android-port-lab/generated \\
-            -I "$JAVA_HOME/include" -I "$JAVA_HOME/include/linux" \\
-            -x c++ android-port-lab/generated/ppu_recomp.c \\
-            android-port-lab/app/src/main/cpp/ppu_smoke.cpp \\
+          c++ -std=c++20 -O0 -DPPU_SMOKE_HOST \
+            -I android-port-lab/generated \
+            -I "$JAVA_HOME/include" -I "$JAVA_HOME/include/linux" \
+            -x c++ android-port-lab/generated/ppu_recomp.c \
+            android-port-lab/app/src/main/cpp/ppu_smoke.cpp \
             -o /tmp/ppu-smoke
           /tmp/ppu-smoke
       - name: Build ARM64 APK
