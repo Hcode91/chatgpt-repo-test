@@ -1,6 +1,7 @@
-# CCI Extractor for Android
-This branch contains the CCI Extractor Android project packaged as a tar.xz to avoid impacting existing root project files.
+# CCI Extractor Android
 
-The Android source archive is at `.build/cci-app-src.tar.xz`. The GitHub Actions workflow unpacks it and builds an installable debug APK.
+The full editable Android source is in [`cci-extractor/`](cci-extractor/).
 
-The parser was verified locally against the decrypted Yumi's Odd Odyssey CCI (961 files, TitleLogo.btex verified).
+[GitHub Actions](../../actions/workflows/cci-extractor.yml) builds an APK from the `feature/cci-extractor-android` branch.
+
+The older `.build` tarball is obsolete.
