@@ -31,6 +31,15 @@ jobs:
           git clone https://github.com/naehrwert/scetool.git /tmp/scetool-src
           git -C /tmp/scetool-src checkout --detach d78d8986c9ab831f084516f21ecdf87080ac7b78
           test "$(git -C /tmp/scetool-src rev-parse HEAD)" = d78d8986c9ab831f084516f21ecdf87080ac7b78
+      - name: Fetch pinned GPLv2 RPCS3 key vault source
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/RPCS3/rpcs3.git /tmp/rpcs3-keyvault
+          git -C /tmp/rpcs3-keyvault checkout --detach 47599599a4cea37f350eb0936d7c5e4de6f7bf57 -- rpcs3/Crypto/key_vault.cpp rpcs3/Crypto/key_vault.h
+          python3 ps3-elf-extractor/tools/generate_rpcs3_keyset.py \
+            --cpp /tmp/rpcs3-keyvault/rpcs3/Crypto/key_vault.cpp \
+            --header /tmp/rpcs3-keyvault/rpcs3/Crypto/key_vault.h \
+            --out ps3-elf-extractor/app/src/main/assets/scetool-keys.ini
+          test -s ps3-elf-extractor/app/src/main/assets/scetool-keys.ini
       - name: Cross-compile ARM64 ELF decryption executable
         run: |
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
@@ -50,7 +59,7 @@ jobs:
           from glob import glob
           apk = glob("ps3-elf-extractor/app/build/outputs/apk/debug/*.apk")[0]
           with ZipFile(apk) as z:
-              for name in ("lib/arm64-v8a/libps3elf.so", "lib/arm64-v8a/libc++_shared.so"):
+              for name in ("lib/arm64-v8a/libps3elf.so", "lib/arm64-v8a/libc++_shared.so", "assets/scetool-keys.ini"):
                   assert name in z.namelist(), "Missing native library: " + name
                   print("PACKAGED:", name)
           PY
