@@ -37,6 +37,11 @@ jobs:
           git clone --depth 1 --branch release-2.30.12 \
             https://github.com/libsdl-org/SDL.git android-port-lab/third_party/SDL2-src
           ln -s SDL2-src/include android-port-lab/third_party/SDL2
+      - name: Checkout ARM64 libucontext for Android cellFiber
+        run: |
+          git clone --depth 1 https://github.com/kaniini/libucontext.git android-port-lab/third_party/libucontext
+          git -C android-port-lab/third_party/libucontext fetch --depth 1 origin 49e671dd52ff6791295d8161ad3b6da7dc5f6f9d
+          git -C android-port-lab/third_party/libucontext checkout --detach 49e671dd52ff6791295d8161ad3b6da7dc5f6f9d
       - name: Apply Android compatibility fixes to upstream runtime clone
         run: python3 android-port-lab/tools/patch_android_upstream.py android-port-lab/upstream/ps3recomp
       - name: Generate clean-room PPC64 test ELF

@@ -257,4 +257,23 @@ static inline unsigned long long spurs_arm64_ticks(void) {
 #else
 #include <x86intrin.h>
 #endif''')
+# Android Bionic declares ucontext_t for signal handlers but omits the
+# POSIX user-space coroutine functions. Use the separately linked,
+# architecture-specific libucontext ABI just for cellFiber.
+change("libs/spurs/cellFiber.c",
+'''#include <ucontext.h>
+
+#if defined(__APPLE__)''',
+'''#if defined(__ANDROID__)
+#include <libucontext/libucontext.h>
+#define ucontext_t libucontext_ucontext_t
+#define getcontext libucontext_getcontext
+#define makecontext libucontext_makecontext
+#define setcontext libucontext_setcontext
+#define swapcontext libucontext_swapcontext
+#else
+#include <ucontext.h>
+#endif
+
+#if defined(__APPLE__)''')
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
