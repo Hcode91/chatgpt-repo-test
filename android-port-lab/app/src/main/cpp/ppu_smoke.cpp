@@ -44,15 +44,15 @@ static std::string execute_lifted_smoke() {
     bool ok = found == 1 && result == 71 && unexpected_calls == 0;
     char details[512];
     snprintf(details, sizeof details,
-        "Real PowerPC64 instruction lift on Android\\n"
-        "Original guest instructions: addi; mulli; addi; blr\\n"
-        "Host CPU: arm64-v8a\\n"
-        "Input guest register r3: 5\\n"
-        "Expected r3: 71\\n"
-        "Actual r3: %llu\\n"
-        "Lifted entries matched: %u\\n"
-        "Unexpected HLE/memory calls: %d\\n"
-        "Result: %s\\n"
+        "Real PowerPC64 instruction lift on Android\n"
+        "Original guest instructions: addi; mulli; addi; blr\n"
+        "Host CPU: arm64-v8a\n"
+        "Input guest register r3: 5\n"
+        "Expected r3: 71\n"
+        "Actual r3: %llu\n"
+        "Lifted entries matched: %u\n"
+        "Unexpected HLE/memory calls: %d\n"
+        "Result: %s\n"
         "NOTE: This is a clean-room single-function smoke test, "
         "NOT a full PS3 ELF boot and NOT inFAMOUS gameplay.",
         (unsigned long long)result, found, unexpected_calls, ok ? "PASS" : "FAIL");
