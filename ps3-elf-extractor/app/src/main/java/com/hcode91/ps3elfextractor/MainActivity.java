@@ -115,8 +115,18 @@ public final class MainActivity extends Activity {
         }
         int idx = request == PICK_EBOOT ? 0 : request == PICK_RAP ? 1 : request == PICK_KEYS ? 2 : -1;
         if (idx < 0) return;
+        String picked = displayName(data.getData());
+        if (idx == 2 && isArchiveName(picked)) {
+            selected[2] = null;
+            selectedNames[2] = "Not selected";
+            keysStatus.setText("Keys: Not selected (archive rejected)");
+            message("The selected file is an archive, not a decryption keyset.\n"
+                    + "scetool-source-gplv2.tar.gz contains source code only.\n"
+                    + "Select a plain-text scetool-format keys file instead.");
+            return;
+        }
         selected[idx] = data.getData();
-        selectedNames[idx] = displayName(data.getData());
+        selectedNames[idx] = picked;
         try { getContentResolver().takePersistableUriPermission(
                 data.getData(), Intent.FLAG_GRANT_READ_URI_PERMISSION); }
         catch (SecurityException ignored) { }
@@ -136,6 +146,14 @@ public final class MainActivity extends Activity {
             }
         } catch (Exception ignored) { }
         return "selected_file";
+    }
+
+    private static boolean isArchiveName(String name) {
+        String lower = name.toLowerCase(Locale.ROOT);
+        return lower.endsWith(".tar.gz") || lower.endsWith(".tgz") ||
+               lower.endsWith(".tar") || lower.endsWith(".zip") ||
+               lower.endsWith(".gz") || lower.endsWith(".7z") ||
+               lower.endsWith(".rar");
     }
 
     private void message(String txt) { report.setText(txt); }
@@ -188,9 +206,14 @@ public final class MainActivity extends Activity {
                     throw new IOException("PS3 RAP must be exactly 16 bytes, got " + rap.length());
                 copy(selected[2], keys, 1024L * 1024);
                 if (keys.length() < 30) throw new IOException("Missing or empty scetool keyset");
-                String keyPrefix = new String(readHeader(keys, 4096), StandardCharsets.ISO_8859_1);
+                byte[] keyBytes = readHeader(keys, 4096);
+                if (keyBytes.length >= 2 && (keyBytes[0] & 255) == 0x1f && (keyBytes[1] & 255) == 0x8b)
+                    throw new IOException("Selected keys file is a gzip archive, not a plain-text keyset.");
+                if (keyBytes.length >= 2 && keyBytes[0] == 'P' && keyBytes[1] == 'K')
+                    throw new IOException("Selected keys file is a ZIP archive, not a plain-text keyset.");
+                String keyPrefix = new String(keyBytes, StandardCharsets.ISO_8859_1);
                 if (!keyPrefix.contains("[") || !keyPrefix.contains("]"))
-                    throw new IOException("Keyset must be in scetool's text INI-style keys format");
+                    throw new IOException("Keyset must be in scetool's plain-text INI format (e.g. [keyname]); source archives are not keys.");
                 File binary = new File(getApplicationInfo().nativeLibraryDir, "libps3elf.so");
                 if (!binary.canExecute()) throw new IOException("Native scetool executable missing: " + binary);
                 ProcessBuilder pb = new ProcessBuilder(binary.getAbsolutePath(),
