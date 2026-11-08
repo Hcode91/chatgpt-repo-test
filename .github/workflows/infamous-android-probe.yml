@@ -105,6 +105,11 @@ jobs:
           readelf -h "$BIN" | grep -q 'AArch64'
           mkdir -p android-port-lab/app/src/main/jniLibs/arm64-v8a
           cp "$BIN" android-port-lab/app/src/main/jniLibs/arm64-v8a/libps3boot.so
+          # The actual NDK boot executable needs libc++_shared.so at runtime.
+          CXX_SO="$(find "$ANDROID_HOME/ndk/27.2.12479018" -type f -name libc++_shared.so | grep -E '/(aarch64-linux-android|arm64-v8a)/' | head -n 1)"
+          test -n "$CXX_SO"
+          test -s "$CXX_SO"
+          cp "$CXX_SO" android-port-lab/app/src/main/jniLibs/arm64-v8a/libc++_shared.so
           cp "$ELF" android-port-lab/app/src/main/assets/upstream-smoke.elf
           echo "PACKAGED_REAL_UPSTREAM_BOOT_EXECUTABLE=yes"
       - name: Upload full runtime build report and compiler errors
