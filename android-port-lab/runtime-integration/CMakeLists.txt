@@ -33,5 +33,30 @@ if(NOT TARGET SDL2::SDL2)
     endif()
 endif()
 
+# Bionic omits the POSIX getcontext/makecontext/swapcontext APIs.
+# libucontext provides an ARM64 implementation with an ISC-style license.
+# This uses a project-scoped copy, not the system's ucontext_t ABI.
+set(UCTX_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libucontext")
+if(NOT EXISTS "${UCTX_ROOT}/arch/aarch64/getcontext.S")
+    message(FATAL_ERROR "Missing libucontext checkout")
+endif()
+enable_language(ASM)
+add_library(ps3recomp_ucontext STATIC
+    "${UCTX_ROOT}/arch/aarch64/getcontext.S"
+    "${UCTX_ROOT}/arch/aarch64/setcontext.S"
+    "${UCTX_ROOT}/arch/aarch64/swapcontext.S"
+    "${UCTX_ROOT}/arch/aarch64/makecontext.c"
+    "${UCTX_ROOT}/arch/aarch64/trampoline.c")
+target_include_directories(ps3recomp_ucontext PRIVATE
+    "${UCTX_ROOT}/arch/aarch64"
+    "${UCTX_ROOT}/arch/common"
+    "${UCTX_ROOT}/arch/aarch64/include"
+    "${UCTX_ROOT}/include")
+target_compile_definitions(ps3recomp_ucontext PRIVATE FREESTANDING=1)
+set_target_properties(ps3recomp_ucontext PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_subdirectory("${UP_SOURCE}" "${CMAKE_BINARY_DIR}/ps3recomp")
+target_include_directories(ps3recomp_runtime PRIVATE
+    "${UCTX_ROOT}/include" "${UCTX_ROOT}/arch/aarch64/include")
+target_link_libraries(ps3recomp_runtime PUBLIC ps3recomp_ucontext)
 message(STATUS "Android PS3 runtime integration targets are configured")
