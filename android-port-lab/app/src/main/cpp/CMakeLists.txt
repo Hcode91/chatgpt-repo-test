@@ -10,6 +10,7 @@ add_library(infamousprobe SHARED
     native_probe.cpp
     ppu_smoke.cpp
     elf_boot.cpp
+    vulkan_present.cpp
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../generated/ppu_recomp.c"
     "${UPSTREAM_ROOT}/runtime/milestone.c"
 )
@@ -20,4 +21,4 @@ target_include_directories(infamousprobe PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../generated")
 find_library(ANDROID_LOG_LIB log REQUIRED)
 find_library(VULKAN_LIB vulkan REQUIRED)
-target_link_libraries(infamousprobe PRIVATE ${ANDROID_LOG_LIB} ${VULKAN_LIB})
+target_link_libraries(infamousprobe PRIVATE ${ANDROID_LOG_LIB} ${VULKAN_LIB} android)

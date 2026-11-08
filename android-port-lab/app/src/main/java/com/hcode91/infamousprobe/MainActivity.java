@@ -90,6 +90,11 @@ public final class MainActivity extends Activity {
         root.addView(integrated);
         integrated.setOnClickListener(v -> runIntegratedBoot());
 
+        Button graphics = new Button(this);
+        graphics.setText("TEST VULKAN GRAPHICS ON SCREEN");
+        root.addView(graphics);
+        graphics.setOnClickListener(v -> startActivity(new Intent(this, VulkanActivity.class)));
+
         Button pick = new Button(this);
         pick.setText("Inspect my EBOOT.elf");
         root.addView(pick);
