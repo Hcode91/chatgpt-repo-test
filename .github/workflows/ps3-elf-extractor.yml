@@ -34,7 +34,7 @@ jobs:
       - name: Fetch pinned GPLv2 RPCS3 key vault source
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/RPCS3/rpcs3.git /tmp/rpcs3-keyvault
-          git -C /tmp/rpcs3-keyvault checkout --detach 47599599a4cea37f350eb0936d7c5e4de6f7bf57 -- rpcs3/Crypto/key_vault.cpp rpcs3/Crypto/key_vault.h
+          git -C /tmp/rpcs3-keyvault checkout 47599599a4cea37f350eb0936d7c5e4de6f7bf57 -- rpcs3/Crypto/key_vault.cpp rpcs3/Crypto/key_vault.h
           python3 ps3-elf-extractor/tools/generate_rpcs3_keyset.py \
             --cpp /tmp/rpcs3-keyvault/rpcs3/Crypto/key_vault.cpp \
             --header /tmp/rpcs3-keyvault/rpcs3/Crypto/key_vault.h \
