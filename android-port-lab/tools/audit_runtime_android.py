@@ -41,9 +41,14 @@ SOURCES = {
         "libs/input/cellPad.c",
         "libs/audio/cellAudio.c",
     ],
+    "infamous_game_host": [
+        "game/main.cpp",
+        "game/stubs.cpp",
+        "game/trainer.cpp",
+    ],
 }
 DIRS = [
-    GEN, ROOT / "third_party", UP / "include", UP / "runtime", UP / "runtime/ppu",
+    GEN, ROOT / "upstream" / "infamous-recomp", ROOT / "third_party", UP / "include", UP / "runtime", UP / "runtime/ppu",
     UP / "runtime/platform", UP / "runtime/memory",
     UP / "runtime/spu", UP / "runtime/syscalls", UP / "libs/video",
     UP / "libs/input", UP / "libs/audio", UP / "libs/system",
@@ -84,7 +89,9 @@ def main():
                    "-fno-strict-aliasing", "-D_GNU_SOURCE", "-pthread",
                    "-std=c++20" if is_cpp else "-std=c17"]
             cmd.extend("-I" + str(d) for d in DIRS)
-            cmd += [str(UP / name), "-o", str(obj)]
+            source = (ROOT / "upstream" / "infamous-recomp" / name[5:]
+                      if name.startswith("game/") else UP / name)
+            cmd += [str(source), "-o", str(obj)]
             t0 = time.monotonic()
             proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=180)
             output = (proc.stdout + proc.stderr).strip().splitlines()

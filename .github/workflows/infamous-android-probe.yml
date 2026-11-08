@@ -82,6 +82,11 @@ jobs:
           python3 android-port-lab/tools/audit_runtime_android.py \
             --ndk "$ANDROID_HOME/ndk/27.2.12479018" \
             --out android-port-lab/build/audit
+      - name: Verify game-data admission fails closed without BCES00220 files
+        run: |
+          if python3 android-port-lab/tools/check_infamous_dump.py               android-port-lab/generated/smoke.elf; then
+            echo "ERROR: synthetic demo was wrongly accepted as inFAMOUS"; exit 1
+          fi
       - name: Upload Android runtime compatibility audit
         if: always()
         uses: actions/upload-artifact@v4
