@@ -28,11 +28,11 @@ import java.util.regex.Pattern;
 import java.util.concurrent.TimeUnit;
 
 public final class MainActivity extends Activity {
-    private static final int PICK_EBOOT = 11, PICK_RAP = 12, PICK_KEYS = 13, SAVE_ELF = 14;
+    private static final int PICK_EBOOT = 11, PICK_RAP = 12, SAVE_ELF = 14;
     private static final long MAX_EBOOT = 384L * 1024 * 1024;
-    private final Uri[] selected = new Uri[3];
-    private final String[] selectedNames = new String[]{"Not selected", "Not selected", "Not selected"};
-    private TextView report, ebootStatus, rapStatus, keysStatus;
+    private final Uri[] selected = new Uri[2];
+    private final String[] selectedNames = new String[]{"Not selected", "Not selected"};
+    private TextView report, ebootStatus, rapStatus;
     private Button extract, save;
     private File verifiedElf;
     private volatile boolean busy;
@@ -53,20 +53,19 @@ public final class MainActivity extends Activity {
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         title.setTextColor(Color.WHITE);
         root.addView(title);
-        addText(root, "Local, ARM64, scetool-based. Files stay on your phone.", 14, 0xffaebdd6);
+        addText(root, "Local, ARM64, scetool-based with built-in RPCS3 keysets. Files stay on your phone.", 14, 0xffaebdd6);
 
         ebootStatus = addText(root, "EBOOT: Not selected", 14, 0xffd6e4f9);
         button(root, "1. Select EBOOT.BIN", () -> choose(PICK_EBOOT));
         rapStatus = addText(root, "RAP: Not selected", 14, 0xffd6e4f9);
         button(root, "2. Select matching .rap licence", () -> choose(PICK_RAP));
-        keysStatus = addText(root, "Keys: Not selected", 14, 0xffd6e4f9);
-        button(root, "3. Select your scetool keyset file", () -> choose(PICK_KEYS));
+        addText(root, "Keysets: Built in (from RPCS3 GPL source). No manual keys file needed.", 14, 0xff9ce6ba);
 
         extract = button(root, "Decrypt and verify ELF", this::extract);
         save = button(root, "Save verified EBOOT.elf", this::save);
         save.setEnabled(false);
 
-        report = addText(root, "Ready. Select all three inputs. A RAP alone does not contain the PS3 SELF keyset.", 14, 0xffa9f1c9);
+        report = addText(root, "Ready. Select EBOOT.BIN and matching 16-byte RAP. Built-in PS3 keysets load automatically.", 14, 0xffa9f1c9);
         report.setTypeface(Typeface.MONOSPACE);
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
@@ -113,26 +112,15 @@ public final class MainActivity extends Activity {
             } catch (Exception e) { message("Save failed: " + e.getMessage()); }
             return;
         }
-        int idx = request == PICK_EBOOT ? 0 : request == PICK_RAP ? 1 : request == PICK_KEYS ? 2 : -1;
+        int idx = request == PICK_EBOOT ? 0 : request == PICK_RAP ? 1 : -1;
         if (idx < 0) return;
-        String picked = displayName(data.getData());
-        if (idx == 2 && isArchiveName(picked)) {
-            selected[2] = null;
-            selectedNames[2] = "Not selected";
-            keysStatus.setText("Keys: Not selected (archive rejected)");
-            message("The selected file is an archive, not a decryption keyset.\n"
-                    + "scetool-source-gplv2.tar.gz contains source code only.\n"
-                    + "Select a plain-text scetool-format keys file instead.");
-            return;
-        }
         selected[idx] = data.getData();
-        selectedNames[idx] = picked;
+        selectedNames[idx] = displayName(data.getData());
         try { getContentResolver().takePersistableUriPermission(
                 data.getData(), Intent.FLAG_GRANT_READ_URI_PERMISSION); }
         catch (SecurityException ignored) { }
         ebootStatus.setText("EBOOT: " + selectedNames[0]);
         rapStatus.setText("RAP: " + selectedNames[1]);
-        keysStatus.setText("Keys: " + selectedNames[2]);
         verifiedElf = null;
         save.setEnabled(false);
         message("Selected: " + selectedNames[idx]);
@@ -148,20 +136,12 @@ public final class MainActivity extends Activity {
         return "selected_file";
     }
 
-    private static boolean isArchiveName(String name) {
-        String lower = name.toLowerCase(Locale.ROOT);
-        return lower.endsWith(".tar.gz") || lower.endsWith(".tgz") ||
-               lower.endsWith(".tar") || lower.endsWith(".zip") ||
-               lower.endsWith(".gz") || lower.endsWith(".7z") ||
-               lower.endsWith(".rar");
-    }
-
     private void message(String txt) { report.setText(txt); }
 
     private void extract() {
         if (busy) return;
-        if (selected[0] == null || selected[1] == null || selected[2] == null) {
-            message("Please select EBOOT.BIN, matching .rap and your own scetool keys file.");
+        if (selected[0] == null || selected[1] == null) {
+            message("Please select EBOOT.BIN and its matching .rap licence.");
             return;
         }
         busy = true;
@@ -204,16 +184,12 @@ public final class MainActivity extends Activity {
                 copy(selected[1], rap, 32);
                 if (rap.length() != 16)
                     throw new IOException("PS3 RAP must be exactly 16 bytes, got " + rap.length());
-                copy(selected[2], keys, 1024L * 1024);
-                if (keys.length() < 30) throw new IOException("Missing or empty scetool keyset");
-                byte[] keyBytes = readHeader(keys, 4096);
-                if (keyBytes.length >= 2 && (keyBytes[0] & 255) == 0x1f && (keyBytes[1] & 255) == 0x8b)
-                    throw new IOException("Selected keys file is a gzip archive, not a plain-text keyset.");
-                if (keyBytes.length >= 2 && keyBytes[0] == 'P' && keyBytes[1] == 'K')
-                    throw new IOException("Selected keys file is a ZIP archive, not a plain-text keyset.");
-                String keyPrefix = new String(keyBytes, StandardCharsets.ISO_8859_1);
-                if (!keyPrefix.contains("[") || !keyPrefix.contains("]"))
-                    throw new IOException("Keyset must be in scetool's plain-text INI format (e.g. [keyname]); source archives are not keys.");
+                // Copy pinned, GPL-compatible RPCS3-derived keyset from the APK into private storage.
+                try (InputStream internal = getAssets().open("scetool-keys.ini");
+                     FileOutputStream dst = new FileOutputStream(keys, false)) {
+                    transfer(internal, dst, 1024L * 1024);
+                }
+                if (keys.length() < 200) throw new IOException("Built-in RPCS3 keyset asset missing or truncated");
                 File binary = new File(getApplicationInfo().nativeLibraryDir, "libps3elf.so");
                 if (!binary.canExecute()) throw new IOException("Native scetool executable missing: " + binary);
                 ProcessBuilder pb = new ProcessBuilder(binary.getAbsolutePath(),
@@ -262,7 +238,7 @@ public final class MainActivity extends Activity {
                         + "This does not by itself establish game compatibility.";
             } catch (Exception e) {
                 outcome = "Extraction not completed.\n" + e.getMessage() +
-                    "\n\nYour files remain on this device. Confirm that your keys file includes appropriate NPDRM and SELF keysets.";
+                    "\n\nYour files remain on this device. Built-in RPCS3 keysets are used automatically.";
             }
             File finalResult = result;
             String finalOutcome = outcome;
