@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate an independently distributable ELF64/PowerPC test executable.
 
-Contains exactly four genuine PPC64 machine instructions:
-    addi r3,r3,7; mulli r3,r3,6; addi r3,r3,-1; blr
+Contains seven clean-room PPC64 machine instructions:
+    addi r3,r3,7; mulli r3,r3,6; addi r3,r3,-1;\n    li r4,64; li r10,2; srw r9,r4,r10; blr
 This tests recompiling real PPU instruction bytes for Android ARM64.
 No Sony program code or assets appear in this project.
 """
@@ -17,6 +17,9 @@ WORDS = [
     (14 << 26) | (3 << 21) | (3 << 16) | 7,        # addi r3,r3,7
     (7 << 26) | (3 << 21) | (3 << 16) | 6,         # mulli r3,r3,6
     (14 << 26) | (3 << 21) | (3 << 16) | 0xffff,   # addi r3,r3,-1
+    (14 << 26) | (4 << 21) | 64,                   # li r4,64
+    (14 << 26) | (10 << 21) | 2,                   # li r10,2
+    0x7C895430,                                   # srw r9,r4,r10 -> 16
     0x4E800020,                                  # blr
 ]
 
