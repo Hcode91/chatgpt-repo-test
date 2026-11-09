@@ -13,6 +13,10 @@
       android:requestLegacyExternalStorage="true">
     <activity android:name=".EuBootActivity" android:exported="false"
         android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"/>
+    <activity android:name=".GameActivity" android:exported="false"
+        android:screenOrientation="sensorLandscape"
+        android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen"
+        android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode"/>
     <activity android:name=".RsxActivity" android:exported="false"/>
     <activity android:name=".VulkanActivity" android:exported="false" android:screenOrientation="unspecified"/>
     <activity android:name=".MainActivity" android:exported="true">
