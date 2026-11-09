@@ -1,6 +1,20 @@
-# Game Asset Extractor (Android v0.4.1)
+# Game Asset Extractor (Android v0.5.0)
 
 A native Android app (API 26+) for extracting **decrypted Nintendo 3DS CCI/NCSD** images and converting STXC `.btex` textures to editable PNGs. No root, keys, firmware or network access required. Original CCI remains untouched.
+
+## New: Nintendo DS, SNES and Mega Drive (v0.5)
+
+**Nintendo DS (`.nds`):** Read-only NitroFS folder browser and file extractor. Files remain in `NDS_Extract_.../nitrofs/...` with original names and directory structure. When an `.ncgr` (RGCN/RAHC) file has a **same-basename `.nclr` (RLCN/TTLP)** palette, supported tiled 4bpp/8bpp 2D graphics are automatically exported to companion PNG previews. The source NCGR/NCLR files remain untouched. This is a limited decoder: no NSBTX, custom compression, NARC recursion, arbitrary palettes or 2D tilemaps yet. PNG-to-NCGR import/DS ROM rebuilding are **not** included in this release.
+
+**SNES (`.sfc`/`.smc`):** Probe LoROM/HiROM headers and the optional 512-byte copier header, then scan raw ROM pages as 2bpp, 3bpp, 4bpp, or 8bpp 8×8 tiles. Choose bit depth, export selected/all pages to indexed grayscale PNGs. PNG → SNES can replace one *known* raw page in a separate ROM copy, with exact grayscale/dimension validation. No automatic decompression, sprite detection, palette mapping or checksum repair. A raw page may contain executable code or compressed data; blindly importing it can break the new ROM.
+
+**Sega Mega Drive / Genesis (`.md`/`.gen`/linear `.bin`):** Verify the SEGA ROM header, scan standard 4bpp packed 8×8 tile pages, export indexed PNG sheets and re-import one *known* page into a **new** ROM copy. `.smd` interleaved files are not supported; convert them to linear ROMs first. Original palettes/compression are not decoded and ROM checksums are not automatically updated.
+
+All consoles use Android's storage picker; original game dumps are **never overwritten**. NES and 3DS features remain in place.
+
+### 3DS Title ID extraction folder (v0.4.1 preserved)
+
+The primary NCCH's program ID is used as the export directory. For Yumi's Odd Odyssey, the folder is `CCI_Extract_.../0004000000112D00/romfs/...`. Other partitions are kept separately. The Title ID is read from the header, never the filename.
 
 ## NES support (new in 0.3)
 
@@ -24,27 +38,6 @@ A native Android app (API 26+) for extracting **decrypted Nintendo 3DS CCI/NCSD*
 - **Important:** PNGs exported from `.btex` files use BTEX filenames rather than Azahar's hash names. They can be upscaled for viewing, but cannot automatically be recognized as in-game HD replacements without being matched to Azahar texture dumps. Existing PNG → BTEX conversion still requires the original exact dimensions.
 - Start with 2× on mobile; 4× has much higher VRAM cost. Raising Azahar's **Internal Resolution** separately can improve 3D rendering without modifying textures.
 
-## Title ID folder preservation (new in 0.4.1)
-
-3DS extraction now reads the **game Title ID directly from the CCI/NCCH header**, not the filename. A typical extraction has this structure:
-
-```text
-CCI_Extract_YYYYMMDD_HHMMSS/
-  0004000000112D00/
-    romfs/
-      system/
-        TitleLogo.btex
-        TitleLogo.png
-    exefs/
-  other_partitions/
-    partition_1/
-      ...
-```
-
-The main game's `partition_0/romfs/` is automatically exported as `<TITLE_ID>/romfs/`, including when you extract one file or one folder. Copy just the **Title ID folder** into Azahar's `load/mods/` destination. Other NCSD partitions remain in `other_partitions` to avoid mixing optional/manual content into the main game's mods. If the title ID is unreadable, the app **does not guess** a folder name and retains the original partition path instead.
-
-**Important:** This is a RomFS mod-ready *directory layout*, not a full working mod containing only changed files. Prefer copying only the textures you edited when making a final mod to reduce needless overrides.
-
 ## Features
 
 - Open `.cci`/`.3ds` images via Android's file picker and browse RomFS/ExeFS partitions.
@@ -59,7 +52,7 @@ The main game's `partition_0/romfs/` is automatically exported as `<TITLE_ID>/ro
 
 1. Launch the app and open your **decrypted** CCI.
 2. Tap **Extract all**, or browse to `partition_0/romfs/system/` and select `TitleLogo.btex`.
-3. Choose a folder. The output includes `CCI_Extract_.../<TITLE_ID>/romfs/...` with both `TitleLogo.btex` and `TitleLogo.png`.
+3. Choose a folder. The output includes both `TitleLogo.btex` and `TitleLogo.png`.
 4. Open the PNG in an image editor on your phone. Keep image dimensions unchanged.
 5. Tap **PNG → BTEX**. Choose your edited PNG, then the matching original BTEX extracted in step 3.
 6. Choose a new output path for the modified `.btex`.
@@ -80,7 +73,10 @@ The main game's `partition_0/romfs/` is automatically exported as `<TITLE_ID>/ro
 JDK 17, Android Gradle Plugin 8.7.3, Gradle 8.9, Android SDK 35.
 
 ```sh
-bash tests/run-export-path-test.sh       # 3DS Title ID export folder regression tests
+bash tests/run-export-path-test.sh         # 3DS Title ID mod folder regression
+bash tests/run-nds-smoke-test.sh           # Nintendo DS NitroFS file-tree tests
+bash tests/run-nds-graphics-test.sh        # NDS 2D NCGR/NCLR preview tests
+bash tests/run-retro-smoke-test.sh         # SNES and Mega Drive tile format roundtrips
 bash tests/run-nes-smoke-test.sh          # NES CHR roundtrip & Mapper 2 CHR-RAM safety tests
 bash tests/run-texture-smoke-test.sh    # pure-Java synthetic 14-format test
 # Optional if you have a locally decrypted CCI:
@@ -88,7 +84,7 @@ bash tests/run-smoke-test.sh /path/to/your/decrypted.cci
 gradle --no-daemon :app:assembleDebug
 ```
 
-The GitHub Actions workflow on the project branch produces an installable debug APK as the `game-asset-extractor-v0.4-debug-apk` artifact.
+The GitHub Actions workflow on the project branch produces an installable debug APK as the `game-asset-extractor-v0.5-debug-apk` artifact.
 
 ## Technical format references
 
