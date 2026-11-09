@@ -347,6 +347,30 @@ void crcmp(CPU& c,unsigned field,uint64_t a,uint64_t b,bool uns=false) {
 }
 bool crbit(const CPU& c,unsigned i) {return ((c.cr>>(31-(i&31)))&1)!=0;}
 
+// Move from/to the PowerPC condition register (CR). The European
+// inFAMOUS executable uses mfcr r12 at guest PC 0x4541D0 (0x7D800026).
+// CR is an entire 32-bit register: do not sign extend the copy or
+// synthesize flags. mtcrf updates only fields selected by the 8-bit FXM mask.
+bool ppu_cr_transfer(uint32_t ins,CPU& c) {
+  if((ins>>26)!=31) return false;
+  const unsigned xo=(ins>>1)&1023;
+  const unsigned rs=(ins>>21)&31;
+  if(xo==19) { // mfcr rD
+    c.r[rs]=uint64_t(c.cr);
+    return true;
+  }
+  if(xo==144) { // mtcrf FXM,rS (including mtcr alias with FXM=0xff)
+    const unsigned fxm=(ins>>12)&0xff;
+    uint32_t mask=0;
+    for(unsigned f=0;f<8;f++)
+      if(fxm & (0x80u>>f))
+        mask |= uint32_t(0xfu) << (28u-4u*f);
+    c.cr=(c.cr & ~mask) | (uint32_t(c.r[rs]) & mask);
+    return true;
+  }
+  return false;
+}
+
 // Division X-form operations. Read sources before writing the result:
 // actual BCES00220 startup uses divdu r27,r27,r3 (0x7F7B1B92).
 // Reject undefined zero-divisor and signed-overflow cases rather than
@@ -541,6 +565,9 @@ std::string run(const uint8_t* file,size_t n) {
       unsigned xo=(ins>>1)&1023;
       unsigned spr=(rb<<5)|ra;
       switch(xo){
+      case 19: // mfcr: destination is the RT/RS field; CR itself is unchanged.
+      case 144: // mtcrf: selected CR fields are copied from RS.
+        ok=ppu_cr_transfer(ins,c);break;
       case 339:if(spr==8)c.r[rt]=c.lr;else if(spr==9)c.r[rt]=c.ctr;else if(spr==1)c.r[rt]=c.xer;else ok=false;break;
       case 467:if(spr==8)c.lr=c.r[rt];else if(spr==9)c.ctr=c.r[rt];else if(spr==1)c.xer=c.r[rt];else ok=false;break;
       // PowerPC X-form single-register logical operations.
@@ -851,6 +878,49 @@ int test_thread_get_id() {
   std::puts("PPU_THREAD_ID_REGRESSION_PASS: 64-bit BE guest store and return");
   return 0;
 }
+int test_condition_register_transfer() {
+  realppu::CPU c;
+  const uint32_t mfcr=0x7D800026u; // exact BCES00220 mfcr r12, XO=19
+  if((mfcr>>26)!=31 || ((mfcr>>21)&31)!=12 || ((mfcr>>1)&1023)!=19) {
+    std::fputs("inFAMOUS mfcr opcode decode does not match the report\n",stderr);
+    return 1;
+  }
+  c.cr=0xF1234567u;
+  c.r[12]=~uint64_t(0);
+  c.r[13]=0xabcdef;
+  if(!realppu::ppu_cr_transfer(mfcr,c) ||
+     c.r[12]!=0xF1234567ULL || c.cr!=0xF1234567u ||
+     c.r[13]!=0xabcdef) {
+    std::fputs("mfcr did not zero-extend the complete CR into r12\n",stderr);
+    return 1;
+  }
+  c.cr=0x12345678u;
+  c.r[12]=0xAABBCCDDu;
+  // Synthetic legal mtcrf FXM=0x80,r12: replace CR0 only.
+  const uint32_t partial=(31u<<26)|(12u<<21)|(0x80u<<12)|(144u<<1);
+  if(!realppu::ppu_cr_transfer(partial,c) || c.cr!=0xA2345678u) {
+    std::fputs("mtcrf FXM 0x80 changed incorrect CR fields\n",stderr);
+    return 1;
+  }
+  const uint32_t full=(31u<<26)|(12u<<21)|(0xFFu<<12)|(144u<<1);
+  if(!realppu::ppu_cr_transfer(full,c) || c.cr!=0xAABBCCDDu) {
+    std::fputs("mtcr FXM=0xff failed to copy all CR fields\n",stderr);
+    return 1;
+  }
+  c.cr=0x87654321u;
+  c.r[12]=0;
+  const uint32_t low=(31u<<26)|(12u<<21)|(1u<<12)|(144u<<1);
+  if(!realppu::ppu_cr_transfer(low,c) || c.cr!=0x87654320u) {
+    std::fputs("mtcrf FXM 0x01 failed to update CR7 only\n",stderr);
+    return 1;
+  }
+  if(realppu::ppu_cr_transfer(0u,c) || c.cr!=0x87654320u) {
+    std::fputs("invalid CR transfer encoding must be rejected\n",stderr);
+    return 1;
+  }
+  std::puts("PPC_CR_TRANSFER_PASS: exact BCES00220 mfcr and mtcrf field masks");
+  return 0;
+}
 int main(int argc,char** argv){
   if (argc==2 && std::string(argv[1])=="--test-time-hle")
     return test_time_hle();
@@ -860,6 +930,8 @@ int main(int argc,char** argv){
     return test_division_ops();
   if(argc==2 && std::string(argv[1])=="--test-thread-id")
     return test_thread_get_id();
+  if(argc==2 && std::string(argv[1])=="--test-cr-transfer")
+    return test_condition_register_transfer();
   if(argc!=2)return 2;
   std::ifstream in(argv[1],std::ios::binary);
   if(!in)return 2;
