@@ -81,6 +81,9 @@ if(INFAMOUS_PRIVATE_RECOMP)
     if(NOT PRIVATE_PPU_SOURCES)
         message(FATAL_ERROR "Private lift has no generated source")
     endif()
+    # ps3recomp emits C++ (extern "C", inline templates) even when named .c.
+    # Without this, Android NDK clang compiles the generated code as plain C.
+    set_source_files_properties(${PRIVATE_PPU_SOURCES} PROPERTIES LANGUAGE CXX)
     if(EXISTS "${INFAMOUS_PRIVATE_RECOMP}/ppu_hle_nids.cpp")
         set(PRIVATE_HLE_NID_TABLE "${INFAMOUS_PRIVATE_RECOMP}/ppu_hle_nids.cpp")
     else()
