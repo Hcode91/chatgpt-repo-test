@@ -364,4 +364,55 @@ change("runtime/spu/spu_xfk.h",
 """#define spu_fnms_k(a, b, c, m) spu__fst(_mm_fnmadd_ps(SPU__XFKC(m, 0, spu__fld(a)), SPU__XFKC(m, 1, spu__fld(b)), SPU__XFKC(m, 2, spu__fld(c))))
 #endif /* x86 */
 #endif""")
+# Android controller input (runtime-integration/eu_android_bridge.c). Weak
+# reference: targets without the bridge (smoke tests) link and behave as before.
+change("libs/input/cellPad.c",
+'''#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */''',
+'''#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
+#if defined(__ANDROID__)
+extern int eu_bridge_pad(unsigned* buttons, unsigned char axes[6]) __attribute__((weak));
+#endif''')
+change("libs/input/cellPad.c",
+'''    for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++)
+        if (s_host_state[_i].buttons) PAD_LATCH_OR(_i, s_host_state[_i].buttons);
+}''',
+'''#if defined(__ANDROID__)
+    /* Android app controller (touch controls or a real gamepad) owns port 0. */
+    if (eu_bridge_pad) {
+        unsigned b = 0; unsigned char ax[6];
+        if (eu_bridge_pad(&b, ax)) {
+            PadHostState* h = &s_host_state[0];
+            h->connected = 1; h->buttons = (u16)b;
+            h->analog_lx = ax[0]; h->analog_ly = ax[1]; h->analog_rx = ax[2]; h->analog_ry = ax[3];
+            h->trigger_l2 = ax[4]; h->trigger_r2 = ax[5];
+            h->press_right = (b & CELL_PAD_CTRL_RIGHT) ? 255 : 0;  h->press_left  = (b & CELL_PAD_CTRL_LEFT) ? 255 : 0;
+            h->press_up    = (b & CELL_PAD_CTRL_UP) ? 255 : 0;     h->press_down  = (b & CELL_PAD_CTRL_DOWN) ? 255 : 0;
+            h->press_triangle = (b & CELL_PAD_CTRL_TRIANGLE) ? 255 : 0; h->press_circle = (b & CELL_PAD_CTRL_CIRCLE) ? 255 : 0;
+            h->press_cross    = (b & CELL_PAD_CTRL_CROSS) ? 255 : 0;    h->press_square = (b & CELL_PAD_CTRL_SQUARE) ? 255 : 0;
+            h->press_l1 = (b & CELL_PAD_CTRL_L1) ? 255 : 0;        h->press_r1 = (b & CELL_PAD_CTRL_R1) ? 255 : 0;
+        }
+    }
+#endif
+    for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++)
+        if (s_host_state[_i].buttons) PAD_LATCH_OR(_i, s_host_state[_i].buttons);
+}''')
+# Android screen: publish each presented software-RSX frame.
+change("libs/video/rsx_null_backend.c",
+'''#include "rsx_vertex_fetch.h"
+#include "rsx_texture_layout.h"
+#include <stdlib.h>''',
+'''#include "rsx_vertex_fetch.h"
+#include "rsx_texture_layout.h"
+#include <stdlib.h>
+#if defined(__ANDROID__)
+extern void eu_bridge_frame(const unsigned int* fb, unsigned w, unsigned h) __attribute__((weak));
+#endif''')
+change("libs/video/rsx_null_backend.c",
+'''        s_soft.fb[(s_soft.height / 2) * s_soft.width + s_soft.width / 2];
+    s_soft.presented++;''',
+'''        s_soft.fb[(s_soft.height / 2) * s_soft.width + s_soft.width / 2];
+    s_soft.presented++;
+#if defined(__ANDROID__)
+    if (eu_bridge_frame) eu_bridge_frame(s_soft.fb, s_soft.width, s_soft.height);
+#endif''')
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")

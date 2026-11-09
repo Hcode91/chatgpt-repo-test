@@ -77,14 +77,15 @@ public final class EuBootActivity extends Activity {
             "Game ELF loaded into guest memory",
             "Game filesystem root set (VFS)",
             "Recompiled PPU functions, HLE and syscalls registered; guest entry dispatched",
-            "RSX backend initialised (headless null backend: draws nothing)",
+            "RSX backend initialised (CPU software preview, not a GPU renderer)",
             "Game created guest threads",
             "Game opened a file from its data folder",
-            "Guest submitted a display flip (headless: not shown)",
-            "First frame visible on screen",
+            "Guest submitted a display flip",
+            "First guest frame sent to the Android screen (software preview)",
+            "Android controller connected to the game (port 0)",
     };
     private static final int M_PROC = 0, M_MAIN = 1, M_MEM = 2, M_ELF = 3, M_VFS = 4,
-            M_ENTRY = 5, M_RSX = 6, M_THREADS = 7, M_FILES = 8, M_FLIP = 9, M_VISIBLE = 10;
+            M_ENTRY = 5, M_RSX = 6, M_THREADS = 7, M_FILES = 8, M_FLIP = 9, M_SCREEN = 10, M_PAD = 11;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final Object lock = new Object();
@@ -99,7 +100,7 @@ public final class EuBootActivity extends Activity {
     private SharedPreferences prefs;
     private TextView buildInfo, elfStatus, dataStatus, milestones, logView, runState;
     private EditText pathEdit;
-    private CheckBox verbose, upstreamEnv;
+    private CheckBox verbose, upstreamEnv, lean, lowCpu, openScreen;
     private Button bootButton, stopButton;
     private volatile Process child;
     private File logFile;
@@ -175,6 +176,20 @@ public final class EuBootActivity extends Activity {
         upstreamEnv.setTextColor(Color.WHITE);
         upstreamEnv.setChecked(true);
         root.addView(upstreamEnv);
+        lean = new CheckBox(this);
+        lean.setText("Phone CPU scheduling (upstream lean mode, recommended)");
+        lean.setTextColor(Color.WHITE);
+        lean.setChecked(true);
+        root.addView(lean);
+        lowCpu = new CheckBox(this);
+        lowCpu.setText("Low-CPU preset (upstream LOW_CPU: lower animation/draw detail)");
+        lowCpu.setTextColor(Color.WHITE);
+        root.addView(lowCpu);
+        openScreen = new CheckBox(this);
+        openScreen.setText("Open the game screen when booting");
+        openScreen.setTextColor(Color.WHITE);
+        openScreen.setChecked(true);
+        root.addView(openScreen);
         bootButton = button("BOOT inFAMOUS");
         bootButton.setOnClickListener(v -> startBoot());
         root.addView(bootButton);
@@ -185,6 +200,9 @@ public final class EuBootActivity extends Activity {
             if (p != null) p.destroyForcibly();
         });
         root.addView(stopButton);
+        Button screen = button("Show game screen + controls");
+        screen.setOnClickListener(v -> startActivity(new Intent(this, GameActivity.class)));
+        root.addView(screen);
         runState = text("", 15, Color.rgb(255, 214, 120), true);
         root.addView(runState);
 
@@ -554,6 +572,22 @@ public final class EuBootActivity extends Activity {
         env.put("GCM_FLIPCOUNT", "1");          // prints "[flip] N at T ms" for each guest flip
         env.put("PS3_VERBOSE", verbose.isChecked() ? "1" : "0");
         env.put("LD_LIBRARY_PATH", getApplicationInfo().nativeLibraryDir);
+        // Upstream enables lean SPU scheduling automatically only on Windows PCs
+        // with < 17 CPU threads; off Windows its auto mode is always off.
+        if (lean.isChecked()) env.put("V241A_LEAN", "1");
+        if (lowCpu.isChecked()) env.put("LOW_CPU", "1");
+        // inFamous' immediate-mode movie quad carries its UVs in attribute 1
+        // (upstream rsx_null_backend.c note) -- for the software preview.
+        env.put("NULLSW_UVATTR", "1");
+        header.append("# lean=").append(lean.isChecked()).append(" low_cpu=")
+                .append(lowCpu.isChecked()).append('\n');
+        try {
+            EuBridge.current = EuBridge.create(new File(workDir(), "bridge.bin"));
+            env.put("PS3_ANDROID_BRIDGE", EuBridge.current.file.getAbsolutePath());
+        } catch (IOException e) {
+            EuBridge.current = null;
+            header.append("# screen/controller bridge unavailable: ").append(e.getMessage()).append('\n');
+        }
         env.put("HOME", workDir().getAbsolutePath());
         env.put("TMPDIR", getCacheDir().getAbsolutePath());
         if (vfs != null) {
@@ -594,6 +628,7 @@ public final class EuBootActivity extends Activity {
         final String hdr = header.toString();
         new Thread(() -> pump(p, hdr), "eu-boot-log").start();
         ui.postDelayed(ticker, 300);
+        if (openScreen.isChecked()) startActivity(new Intent(this, GameActivity.class));
     }
 
     private int applyUpstreamEnv(Map<String, String> env) {
@@ -726,6 +761,13 @@ public final class EuBootActivity extends Activity {
                 filesOk++;
                 mark(M_FILES, 1, filesOk + " file(s) opened; latest: " + l);
             }
+        } else if (l.startsWith("[EU bridge] first frame published")) {
+            mark(M_SCREEN, 1, l);
+        } else if (l.startsWith("[EU bridge] Android controller connected")) {
+            mark(M_PAD, 1, l);
+        } else if (l.startsWith("[EU bridge] cannot open") || l.startsWith("[EU bridge] bad header")
+                || l.startsWith("[EU bridge] mmap failed") || l.contains("[EU bridge] ") && l.contains("too small")) {
+            mark(M_SCREEN, -1, l);
         } else if (l.startsWith("[flip] ")) {
             flips++;
             mark(M_FLIP, 1, flips + " flip(s); latest: " + l);
@@ -751,11 +793,8 @@ public final class EuBootActivity extends Activity {
             StringBuilder sb = new StringBuilder();
             for (int i = 0; i < M_NAMES.length; i++) {
                 String mark = state[i] == 1 ? "✔" : state[i] < 0 ? "✖" : "·";
-                if (i == M_VISIBLE) mark = "✖";
                 sb.append(mark).append(' ').append(M_NAMES[i]).append('\n');
-                String ev = i == M_VISIBLE
-                        ? "not possible in this build: no Android RSX renderer yet"
-                        : evidence[i];
+                String ev = evidence[i];
                 if (ev != null) sb.append("     ").append(ev).append('\n');
             }
             sb.append("\nCounters: guest threads ").append(threads)

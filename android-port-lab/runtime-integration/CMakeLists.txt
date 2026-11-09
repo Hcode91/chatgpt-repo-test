@@ -207,6 +207,8 @@ if(INFAMOUS_EU_UPSTREAM_TITLE)
         # Android-owned host services needed by the actual title runner.
         # Weak fallbacks do NOT implement real RSX, overlay or SPU backends.
         "${CMAKE_CURRENT_SOURCE_DIR}/eu_android_host_bridge.c"
+        # Shared-memory screen + controller channel to the Android app.
+        "${CMAKE_CURRENT_SOURCE_DIR}/eu_android_bridge.c"
         "${EU_TITLE_DIR}/main.cpp"
         "${EU_TITLE_DIR}/stubs.cpp"
         "${EU_TITLE_DIR}/trainer.cpp"
