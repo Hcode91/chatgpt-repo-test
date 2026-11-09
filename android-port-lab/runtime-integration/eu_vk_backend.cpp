@@ -58,7 +58,24 @@ extern "C" unsigned g_eu_eng_drop[16] __attribute__((weak));
  * the engine drawing, the rsx_state path still runs on every FIFO word; give it
  * an all-NULL backend rather than none, so no path dereferences a NULL backend
  * (build 15 crashed in rsx_process_method reading offset 0x78 = draw_arrays). */
-static rsx_backend g_noop_vtable{};   /* every callback NULL */
+/* Every callback is a real do-nothing function, not NULL: build 19 crashed
+ * jumping to address 0 from rsx_process_method (an immediate-mode quad draw
+ * calling a callback it had not checked). */
+namespace noop {
+int  init(void*, u32, u32) { return 0; }
+void v(void*) {}
+void present(void*, u32) {}
+void st(void*, const rsx_state*) {}
+void clear(void*, u32, u32, float, u8) {}
+void draw(void*, u32, u32, u32) {}
+void tex(void*, u32, const rsx_texture_state*) {}
+}
+static rsx_backend g_noop_vtable = {
+    nullptr,          /* userdata */
+    noop::init, noop::v, noop::v, noop::v, noop::present,
+    noop::st, noop::st, noop::st, noop::st, noop::st, noop::st, noop::st, noop::st,
+    noop::clear, noop::draw, noop::draw, noop::tex,
+};
 extern "C" void eu_bridge_frame_rgba(const uint8_t* rgba, unsigned w, unsigned h,
                                      unsigned pitch) __attribute__((weak));
 

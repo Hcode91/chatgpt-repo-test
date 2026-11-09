@@ -197,8 +197,102 @@ void eu_bridge_frame(const uint32_t* fb, unsigned w, unsigned h)
 #include <ucontext.h>
 #include <unwind.h>
 
+/* ---- own symbol table: the runner's .symtab (kept in the APK) names the
+ * internal functions dladdr cannot see. Loaded once before main(), so the
+ * crash handler only reads memory. */
+#include <elf.h>
+typedef struct { uintptr_t addr, size; uint32_t name; } eu_fsym;
+static eu_fsym* s_syms;
+static size_t s_nsyms;
+static char* s_strtab;
+static uintptr_t s_self_base;
+static uintptr_t s_self_end;   /* end of the highest function, relative */
+
+static int eu_fsym_cmp(const void* a, const void* b)
+{
+    const eu_fsym* x = (const eu_fsym*)a;
+    const eu_fsym* y = (const eu_fsym*)b;
+    return x->addr < y->addr ? -1 : x->addr > y->addr;
+}
+
+static void eu_load_symtab(void)
+{
+    Dl_info di;
+    if (!dladdr((void*)&eu_load_symtab, &di) || !di.dli_fname) return;
+    s_self_base = (uintptr_t)di.dli_fbase;
+    FILE* f = fopen(di.dli_fname, "rb");
+    if (!f) return;
+    Elf64_Ehdr eh;
+    Elf64_Shdr* sh = NULL;
+    if (fread(&eh, sizeof eh, 1, f) != 1 || memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
+        eh.e_ident[EI_CLASS] != ELFCLASS64 || eh.e_shentsize != sizeof(Elf64_Shdr) || !eh.e_shnum)
+        goto out;
+    sh = (Elf64_Shdr*)calloc(eh.e_shnum, sizeof *sh);
+    if (!sh || fseeko(f, (off_t)eh.e_shoff, SEEK_SET) != 0 || fread(sh, sizeof *sh, eh.e_shnum, f) != eh.e_shnum)
+        goto out;
+    for (unsigned i = 0; i < eh.e_shnum; i++) {
+        if (sh[i].sh_type != SHT_SYMTAB || sh[i].sh_link >= eh.e_shnum) continue;
+        const Elf64_Shdr* st = &sh[sh[i].sh_link];
+        const size_t n = sh[i].sh_size / sizeof(Elf64_Sym);
+        Elf64_Sym* syms = (Elf64_Sym*)malloc(sh[i].sh_size);
+        s_strtab = (char*)malloc(st->sh_size + 1);
+        s_syms = (eu_fsym*)malloc(n * sizeof(eu_fsym));
+        if (!syms || !s_strtab || !s_syms) { free(syms); goto out; }
+        if (fseeko(f, (off_t)sh[i].sh_offset, SEEK_SET) != 0 || fread(syms, 1, sh[i].sh_size, f) != sh[i].sh_size ||
+            fseeko(f, (off_t)st->sh_offset, SEEK_SET) != 0 || fread(s_strtab, 1, st->sh_size, f) != st->sh_size) {
+            free(syms);
+            goto out;
+        }
+        s_strtab[st->sh_size] = 0;
+        for (size_t k = 0; k < n; k++) {
+            if (ELF64_ST_TYPE(syms[k].st_info) != STT_FUNC || !syms[k].st_value) continue;
+            if (syms[k].st_name >= st->sh_size) continue;
+            s_syms[s_nsyms].addr = syms[k].st_value;
+            s_syms[s_nsyms].size = syms[k].st_size;
+            s_syms[s_nsyms].name = syms[k].st_name;
+            if (syms[k].st_value + syms[k].st_size > s_self_end) s_self_end = syms[k].st_value + syms[k].st_size;
+            s_nsyms++;
+        }
+        free(syms);
+        qsort(s_syms, s_nsyms, sizeof(eu_fsym), eu_fsym_cmp);
+        break;
+    }
+out:
+    free(sh);
+    fclose(f);
+    fprintf(stderr, "[EU bridge] symbol table: %zu functions%s\n", s_nsyms,
+            s_nsyms ? "" : " (stripped -- crash/hot-spot names limited to exported symbols)");
+}
+
+/* Name of the function containing pc in this binary, or NULL. */
+static const char* eu_own_symbol(uintptr_t pc, uintptr_t* off)
+{
+    if (!s_nsyms || pc < s_self_base) return NULL;
+    const uintptr_t rel = pc - s_self_base;
+    if (rel >= s_self_end) return NULL;   /* another module (libc, vdso, ...) */
+    size_t lo = 0, hi = s_nsyms;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (s_syms[mid].addr <= rel) lo = mid + 1; else hi = mid;
+    }
+    if (!lo) return NULL;
+    const eu_fsym* s = &s_syms[lo - 1];
+    if (s->size && rel >= s->addr + s->size) return NULL;
+    *off = rel - s->addr;
+    return s_strtab + s->name;
+}
+
 static void eu_sym(const char* tag, uintptr_t pc)
 {
+    {
+        uintptr_t off = 0;
+        const char* own = eu_own_symbol(pc, &off);
+        if (own) {
+            fprintf(stderr, "[crash] %s 0x%016lx %s+0x%lx (libps3eu.so+0x%lx)\n", tag, (unsigned long)pc, own,
+                    (unsigned long)off, (unsigned long)(pc - s_self_base));
+            return;
+        }
+    }
     Dl_info di;
     memset(&di, 0, sizeof di);
     if (pc && dladdr((void*)pc, &di) && di.dli_fname) {
@@ -315,7 +409,10 @@ static void eu_profile_thread(int tid, const char* label)
         const void* key = (const void*)pc;
         const char* name = "?";
         uintptr_t off = pc;
-        if (dladdr((void*)pc, &di)) {
+        uintptr_t own_off = 0;
+        const char* own = eu_own_symbol(pc, &own_off);
+        if (own) { key = (const void*)(pc - own_off); name = own; off = 0; }
+        else if (dladdr((void*)pc, &di)) {
             if (di.dli_sname) { key = di.dli_saddr; name = di.dli_sname; off = 0; }
             else if (di.dli_fbase) { key = (const void*)(pc & ~(uintptr_t)0xFFF); off = pc - (uintptr_t)di.dli_fbase; }
         }
@@ -421,6 +518,7 @@ static void* eu_cpu_thread(void* arg)
 __attribute__((constructor)) static void eu_diagnostics_init(void)
 {
     if (!getenv("PS3_ANDROID_BRIDGE")) return;
+    eu_load_symtab();
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = eu_crash;
