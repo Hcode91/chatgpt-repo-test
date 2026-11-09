@@ -17,6 +17,7 @@ import java.util.Locale;
 
 public final class MainActivity extends Activity {
     private static final int PICK_EXECUTABLE = 101;
+    private static final int PICK_EU_BOOT = 104;
     private TextView output;
     private String startup;
     private int testRunCount = 0;
@@ -89,6 +90,23 @@ public final class MainActivity extends Activity {
         integrated.setText("BOOT REAL PS3RECOMP RUNTIME (EXPERIMENTAL)");
         root.addView(integrated);
         integrated.setOnClickListener(v -> runIntegratedBoot());
+
+        // This button is enabled only if a PRIVATE build included the BCES00220
+        // game-specific native executable, generated from the owner's own ELF.
+        java.io.File privateRunner = new java.io.File(
+                getApplicationInfo().nativeLibraryDir, "libps3eu.so");
+        Button realGame = new Button(this);
+        realGame.setText(privateRunner.isFile()
+                ? "BOOT MY EUROPEAN inFAMOUS (REAL GAME ATTEMPT)"
+                : "European game boot unavailable (private PPU lift required)");
+        root.addView(realGame);
+        realGame.setEnabled(privateRunner.isFile());
+        realGame.setOnClickListener(v -> {
+            Intent choose = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            choose.setType("*/*");
+            choose.addCategory(Intent.CATEGORY_OPENABLE);
+            startActivityForResult(choose, PICK_EU_BOOT);
+        });
 
         Button rsxGraphics = new Button(this);
         rsxGraphics.setText("DRAW PS3 RSX TRIANGLES (GUEST CODE)");
@@ -214,6 +232,99 @@ public final class MainActivity extends Activity {
         }, "ps3recomp-boot-worker").start();
     }
 
+    /**
+     * Genuine BCES00220 boot attempt. This path requires PRIVATE locally
+     * recompiled title code to be packaged as libps3eu.so; public CI does not
+     * include or execute the proprietary game. No synthetic guest is passed
+     * to the game runner.
+     */
+    private void launchPrivateEuropeanGame(Uri source) {
+        java.io.File runner = new java.io.File(getApplicationInfo().nativeLibraryDir, "libps3eu.so");
+        if (!runner.isFile()) {
+            output.setText("EU GAME BOOT NOT AVAILABLE: This APK contains no private "
+                    + "game-code lift. Use the local private BCES00220 build pipeline.");
+            return;
+        }
+        output.setText("Checking BCES00220 ELF fingerprint and launching real PPU boot...\\n");
+        new Thread(() -> {
+            Process child = null;
+            try {
+                java.io.File game = new java.io.File(getFilesDir(), "EBOOT.elf");
+                java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+                long bytes = 0;
+                try (InputStream in = getContentResolver().openInputStream(source);
+                     java.io.FileOutputStream out = new java.io.FileOutputStream(game, false)) {
+                    if (in == null) throw new IOException("Cannot read private ELF");
+                    byte[] b = new byte[65536];
+                    for (int n; (n = in.read(b)) != -1;) {
+                        bytes += n;
+                        if (bytes > 32L * 1024 * 1024)
+                            throw new IOException("Private EBOOT.elf exceeds 32 MiB admission bound");
+                        digest.update(b, 0, n);
+                        out.write(b, 0, n);
+                    }
+                }
+                StringBuilder hash = new StringBuilder();
+                for (byte b : digest.digest())
+                    hash.append(String.format(Locale.US, "%02x", b & 255));
+                final String wanted = "095d851432f3b55179cd725b46838ffedb3e5eb9f73889e52b6f11f3d3f494fd";
+                if (!wanted.equals(hash.toString()))
+                    throw new IOException("BCES00220 EBOOT.elf SHA-256 mismatch: " + hash);
+                if (!runner.canExecute())
+                    throw new IOException("Game boot binary is not executable");
+                ProcessBuilder pb = new ProcessBuilder(runner.getAbsolutePath(), game.getAbsolutePath());
+                pb.redirectErrorStream(true);
+                pb.directory(getFilesDir());
+                pb.environment().put("LD_LIBRARY_PATH", getApplicationInfo().nativeLibraryDir);
+                // Debug-oriented boot: PS3 runtime logs every milestone.
+                pb.environment().put("PS3_VERBOSE", "1");
+                child = pb.start();
+                final Process active = child;
+                final java.util.concurrent.atomic.AtomicBoolean timedOut =
+                        new java.util.concurrent.atomic.AtomicBoolean(false);
+                Thread watchdog = new Thread(() -> {
+                    try {
+                        if (!active.waitFor(45, java.util.concurrent.TimeUnit.SECONDS)) {
+                            timedOut.set(true);
+                            active.destroyForcibly();
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        active.destroyForcibly();
+                    }
+                });
+                watchdog.setDaemon(true);
+                watchdog.start();
+                java.io.ByteArrayOutputStream logs = new java.io.ByteArrayOutputStream();
+                try (InputStream log = child.getInputStream()) {
+                    byte[] chunk = new byte[4096];
+                    int n;
+                    while ((n = log.read(chunk)) != -1)
+                        if (logs.size() < 128 * 1024)
+                            logs.write(chunk, 0, Math.min(n, 128 * 1024 - logs.size()));
+                }
+                int exit = child.waitFor();
+                watchdog.join(1500);
+                String report = "REAL BCES00220 inFAMOUS BOOT ATTEMPT\\n"
+                        + "Verified exact European ELF: yes\\n"
+                        + "Private recompiled PPU runner: launched\\n"
+                        + "Guest image size: " + bytes + "\\n"
+                        + "Exit code: " + exit + "\\n"
+                        + "Timeout: " + timedOut.get() + "\\n"
+                        + "Startup logs (max 128 KiB):\\n"
+                        + logs.toString("UTF-8")
+                        + "\\nThis does not prove gameplay or graphics are functional.";
+                runOnUiThread(() -> output.setText(report));
+            } catch (Throwable err) {
+                String failure = "REAL EUROPEAN GAME BOOT COULD NOT COMPLETE\\n"
+                        + err.getClass().getSimpleName() + ": " + err.getMessage();
+                runOnUiThread(() -> output.setText(failure));
+            } finally {
+                if (child != null && child.isAlive()) child.destroyForcibly();
+            }
+        }, "infamous-eu-private-boot").start();
+    }
+
     private void showProbe() {
         testRunCount++;
         String completedAt = new java.text.SimpleDateFormat("HH:mm:ss", Locale.getDefault())
@@ -230,6 +341,11 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == PICK_EU_BOOT && resultCode == RESULT_OK && data != null
+                && data.getData() != null) {
+            launchPrivateEuropeanGame(data.getData());
+            return;
+        }
         if (requestCode != PICK_EXECUTABLE || resultCode != RESULT_OK || data == null) return;
         Uri uri = data.getData();
         if (uri == null) return;
