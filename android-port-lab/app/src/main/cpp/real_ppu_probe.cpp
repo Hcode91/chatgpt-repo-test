@@ -836,7 +836,8 @@ int test_thread_get_id() {
     return 1;
   }
   // Avoid silent writes to null, unaligned, or unmapped pointers.
-  for(uint64_t addr : {0ull,0x2effaf1ull,realppu::LIMIT-4}) {
+  const uint64_t invalidPointers[] = {0ull,0x2effaf1ull,realppu::LIMIT-4};
+  for(uint64_t addr : invalidPointers) {
     c.r[3]=addr;
     c.pc=imp.stub;
     stop.clear();
