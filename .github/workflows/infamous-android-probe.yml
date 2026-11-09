@@ -93,6 +93,8 @@ jobs:
           grep -q "LV2_TIME_SERVICES_PASS" /tmp/eu-lv2-time.log
           /tmp/infamous-eu-ppu-engine --test-division | tee /tmp/eu-division.log
           grep -q "PPC_DIVISION_REGRESSION_PASS" /tmp/eu-division.log
+          /tmp/infamous-eu-ppu-engine --test-thread-id | tee /tmp/eu-thread-id.log
+          grep -q "PPU_THREAD_ID_REGRESSION_PASS" /tmp/eu-thread-id.log
           ! grep -q "Status: GAME BOOT SUCCESS" /tmp/infamous-eu-engine.log
       - name: Cross-compile upstream PPU, LV2, SPU, RSX, input and audio for Android ARM64
         run: |
