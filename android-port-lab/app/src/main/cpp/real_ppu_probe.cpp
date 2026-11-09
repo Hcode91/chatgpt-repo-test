@@ -2,6 +2,8 @@
 // An intentionally bounded subset interpreter, NOT a PS3 emulator or a game boot.
 // The guest's ELF is loaded by the user on Android. No game assets enter public CI.
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -98,6 +100,7 @@ const char* known_import_name(const Import& i) {
   if (i.module != "sysPrxForUser") return "unknown import";
   switch (i.nid) {
     case 0x744680a2u: return "sys_initialize_tls";
+    case 0x8461e528u: return "sys_time_get_system_time";
     case 0x2f85c0efu: return "sys_lwmutex_create";
     case 0x1573dc3fu: return "sys_lwmutex_lock";
     case 0xaeb78725u: return "sys_lwmutex_trylock";
@@ -141,6 +144,20 @@ bool import_hle(const Import& imp,CPU& c,Memory& m,std::string& event,std::strin
     // A branch-with-link to the import stub saved the return address in LR.
     // Firmware returns to LR; do not execute the unresolved trampoline bytes.
     c.pc=c.lr;
+    return true;
+  }
+  if (imp.module=="sysPrxForUser" && imp.nid==0x8461e528u) {
+    // sys_time_get_system_time() has no arguments, returns u64 microseconds.
+    // RPCS3: get_guest_system_time() uses a monotonic host clock; an absolute
+    // wall-clock epoch or a constant zero would be incorrect here.
+    // Clock is a process-wide monotonic source, not simulated instruction count.
+    const auto now=std::chrono::steady_clock::now().time_since_epoch();
+    const uint64_t micros=uint64_t(
+      std::chrono::duration_cast<std::chrono::microseconds>(now).count());
+    c.r[3]=micros;
+    c.pc=c.lr; // return from the import stub, preserving LR and caller TOC
+    event="[HLE] sys_time_get_system_time NID 0x8461E528: "
+          "monotonic clock="+std::to_string(micros)+" usec";
     return true;
   }
   if (imp.module=="sysPrxForUser") {
@@ -545,7 +562,37 @@ Java_com_hcode91_infamousprobe_MainActivity_nativeRealPpuProbe(JNIEnv* env,jclas
 #ifdef REAL_PPU_PROBE_HOST
 #include <fstream>
 #include <iterator>
+int test_time_hle() {
+  // Self-contained genuine-HLE regression without any private PS3 game data.
+  // Check the PowerPC ABI: 64-bit microsecond result in r3, LR -> PC return,
+  // no guest memory mutation, and clock progress between successive calls.
+  realppu::Memory memory;
+  realppu::CPU cpu;
+  cpu.lr=0x10230;
+  cpu.pc=0x55d96c;
+  cpu.r[3]=0x10000;
+  realppu::Import clockImport{0x55d96c, 0x8461e528u, "sysPrxForUser"};
+  std::string event, stop;
+  if (!realppu::import_hle(clockImport,cpu,memory,event,stop)) {
+    std::fprintf(stderr,"time HLE failed: %s\n",stop.c_str()); return 1;
+  }
+  const uint64_t first=cpu.r[3];
+  if (first==0 || cpu.pc!=cpu.lr || event.find("monotonic clock")==std::string::npos) {
+    std::fputs("time HLE returned invalid r3, PC, or event\n", stderr); return 1;
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(3));
+  cpu.pc=clockImport.stub;
+  if (!realppu::import_hle(clockImport,cpu,memory,event,stop) ||
+      cpu.r[3] <= first || cpu.pc != cpu.lr) {
+    std::fputs("time HLE did not advance and return through LR\n",stderr); return 1;
+  }
+  std::printf("TIME_HLE_REGRESSION_PASS: timer advanced %llu usec\n",
+    (unsigned long long)(cpu.r[3]-first));
+  return 0;
+}
 int main(int argc,char** argv){
+  if (argc==2 && std::string(argv[1])=="--test-time-hle")
+    return test_time_hle();
   if(argc!=2)return 2;
   std::ifstream in(argv[1],std::ios::binary);
   if(!in)return 2;
