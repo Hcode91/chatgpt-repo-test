@@ -497,4 +497,76 @@ change("libs/video/rsx_draw_engine.c",
 change("libs/video/rsx_draw_engine.c",
 '    if (!pipeline_is_fixed) g.guest_draws++;',
 '    EU_DROP(10);\n    if (!pipeline_is_fixed) g.guest_draws++;')
+# Immediate-mode draws in the register-file engine. inFamous draws its Bink
+# movie quad (and other 2D) with SET_VERTEX_DATA* between BEGIN_END pairs,
+# which the rsx_state path collects into imm_verts but rsx_dispatch never sees
+# as a packet -- the engine dropped every such draw as "no packets". The FIFO
+# walker feeds the engine BEFORE rsx_process_method, so at the engine's END the
+# rsx_state still holds this draw's immediate vertices; expose them read-only.
+change("libs/video/cellGcmSys.c",
+"void cellGcm_rsx_process_fifo(void)\n",
+"""#if defined(__ANDROID__)
+static rsx_state* s_eu_gcm_state;
+u32 eu_gcm_imm_count(void) { return s_eu_gcm_state ? s_eu_gcm_state->imm_count : 0u; }
+const float* eu_gcm_imm_attr(u32 v, u32 attr)
+{
+    if (!s_eu_gcm_state || v >= RSX_IMM_MAX_VERTS || attr >= RSX_MAX_VERTEX_ATTRIBS) return NULL;
+    return s_eu_gcm_state->imm_verts[v][attr];
+}
+#endif
+void cellGcm_rsx_process_fifo(void)
+""")
+change("libs/video/cellGcmSys.c",
+"    static rsx_state s_state;\n    static int  s_inited = 0;\n",
+"    static rsx_state s_state;\n    static int  s_inited = 0;\n#if defined(__ANDROID__)\n    s_eu_gcm_state = &s_state;\n#endif\n")
+change("libs/video/rsx_draw_engine.c",
+"static void sink_end(void* user, const rsx_dispatch* r)\n{\n    EU_DROP(0);",
+"""#if defined(__ANDROID__)
+extern u32 eu_gcm_imm_count(void) __attribute__((weak));
+extern const float* eu_gcm_imm_attr(u32 v, u32 attr) __attribute__((weak));
+/* Build the draw's vertices straight from the immediate-mode values, one
+ * float4 per layout slot (the same shape rsx_vertex_fetch_one writes). */
+static int eu_fill_immediate(const rsx_vertex_layout_plan* layout)
+{
+    const u32 n = eu_gcm_imm_count ? eu_gcm_imm_count() : 0u;
+    if (!n || !layout->stride) return 0;
+    dc.n_refs = dc.n_source_refs = n;
+    dc.refs_remapped = 0;
+    dc.n_cuts = 0;
+    dc.layout = *layout;
+    if (!dc_reserve_verts((u64)n * layout->stride)) return 0;
+    for (u32 i = 0; i < n; i++) {
+        u8* dst = dc.verts + (u64)i * layout->stride;
+        for (u32 sl = 0; sl < layout->count; sl++) {
+            const float* src = eu_gcm_imm_attr(i, layout->attrs[sl]);
+            static const float zero4[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            memcpy(dst + sl * 16u, src ? src : zero4, 16u);
+        }
+    }
+    dc.n_verts = n;
+    dc.fetch_ok = 1;
+    return 1;
+}
+#endif
+static void sink_end(void* user, const rsx_dispatch* r)
+{
+    EU_DROP(0);""")
+change("libs/video/rsx_draw_engine.c",
+"    if (!dc.n_packets) { EU_DROP(1); return; }",
+"""    int eu_imm = 0;
+    if (!dc.n_packets) {
+#if defined(__ANDROID__)
+        eu_imm = eu_gcm_imm_count && eu_gcm_imm_count() > 0;
+#endif
+        if (!eu_imm) { EU_DROP(1); return; }
+        EU_DROP(12);   /* immediate-mode draw */
+    }""")
+change("libs/video/rsx_draw_engine.c",
+"    dc_fetch(&layout, rebuild);\n    if (!dc.n_verts || !dc.fetch_ok) { EU_DROP(3); return; }",
+"""#if defined(__ANDROID__)
+    if (eu_imm) { if (!eu_fill_immediate(&layout)) { EU_DROP(3); return; } }
+    else
+#endif
+    dc_fetch(&layout, rebuild);
+    if (!dc.n_verts || !dc.fetch_ok) { EU_DROP(3); return; }""")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")

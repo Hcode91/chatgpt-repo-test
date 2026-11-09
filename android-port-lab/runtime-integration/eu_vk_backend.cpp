@@ -54,6 +54,11 @@
 #include "rsx_texture_layout.h"
 
 extern "C" unsigned g_eu_eng_drop[16] __attribute__((weak));
+/* rsx_commands.c's vtable (rsx_commands.h, reached through the engine header). With
+ * the engine drawing, the rsx_state path still runs on every FIFO word; give it
+ * an all-NULL backend rather than none, so no path dereferences a NULL backend
+ * (build 15 crashed in rsx_process_method reading offset 0x78 = draw_arrays). */
+static rsx_backend g_noop_vtable{};   /* every callback NULL */
 extern "C" void eu_bridge_frame_rgba(const uint8_t* rgba, unsigned w, unsigned h,
                                      unsigned pitch) __attribute__((weak));
 
@@ -1771,8 +1776,8 @@ void be_present(void*, u32 surface)
         for (int i = 0; i < 16; i++) { d[i] = g_eu_eng_drop[i]; g_eu_eng_drop[i] = 0; }
         fprintf(stderr, "[RSX vulkan] engine draws (5s): %u calls, %u drawn | dropped: no packets %u, "
                 "topology %u, vertex fetch %u, rebuild %u, zero count %u, no colour target %u, "
-                "no pipeline %u, index reserve %u, FP constants %u\n",
-                d[0], d[10], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9]);
+                "no pipeline %u, index reserve %u, FP constants %u | immediate-mode %u\n",
+                d[0], d[10], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[12]);
     }
     static u32 presents;
     if (++presents == 1 || presents % 600 == 0)
@@ -2075,6 +2080,7 @@ extern "C" int eu_vk_rsx_init(u32 width, u32 height)
         g_active = false;
         return -1;
     }
+    rsx_set_backend(&g_noop_vtable);
     fprintf(stderr, "[RSX vulkan] GPU renderer active on %s (Vulkan %u.%u, BC textures %s, depth format %d)\n",
             g_props.deviceName, VK_API_VERSION_MAJOR(g_props.apiVersion), VK_API_VERSION_MINOR(g_props.apiVersion),
             g_bc_ok ? "native" : "CPU-decoded", (int)g_depth_fmt);

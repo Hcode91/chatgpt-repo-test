@@ -275,6 +275,68 @@ static uint64_t eu_ticks(const char* stat_line)
     return ut + stt;
 }
 
+/* ---- hot-spot sampling: interrupt one busy thread with a real-time signal
+ * and record where it was. */
+#include <sys/syscall.h>
+#define EU_PROF_SIG (SIGRTMIN + 9)
+static volatile uintptr_t s_prof_pc, s_prof_lr;
+static volatile int s_prof_done;
+
+static void eu_prof_handler(int sig, siginfo_t* si, void* uctx)
+{
+    (void)sig; (void)si;
+#if defined(__aarch64__)
+    const ucontext_t* uc = (const ucontext_t*)uctx;
+    s_prof_pc = (uintptr_t)uc->uc_mcontext.pc;
+    s_prof_lr = (uintptr_t)uc->uc_mcontext.regs[30];
+#else
+    (void)uctx;
+    s_prof_pc = s_prof_lr = 0;
+#endif
+    __atomic_store_n(&s_prof_done, 1, __ATOMIC_RELEASE);
+}
+
+typedef struct { const void* sym; const char* name; uintptr_t off; int hits; } eu_hot;
+
+static void eu_profile_thread(int tid, const char* label)
+{
+    enum { SAMPLES = 40, MAXSYM = 64 };
+    eu_hot hot[MAXSYM];
+    int nh = 0, taken = 0;
+    for (int k = 0; k < SAMPLES; k++) {
+        __atomic_store_n(&s_prof_done, 0, __ATOMIC_RELEASE);
+        if (syscall(SYS_tgkill, getpid(), tid, EU_PROF_SIG) != 0) return;   /* thread gone */
+        for (int w = 0; w < 200 && !__atomic_load_n(&s_prof_done, __ATOMIC_ACQUIRE); w++) usleep(100);
+        if (!__atomic_load_n(&s_prof_done, __ATOMIC_ACQUIRE)) continue;
+        taken++;
+        Dl_info di;
+        memset(&di, 0, sizeof di);
+        const uintptr_t pc = s_prof_pc;
+        const void* key = (const void*)pc;
+        const char* name = "?";
+        uintptr_t off = pc;
+        if (dladdr((void*)pc, &di)) {
+            if (di.dli_sname) { key = di.dli_saddr; name = di.dli_sname; off = 0; }
+            else if (di.dli_fbase) { key = (const void*)(pc & ~(uintptr_t)0xFFF); off = pc - (uintptr_t)di.dli_fbase; }
+        }
+        int j = 0;
+        while (j < nh && hot[j].sym != key) j++;
+        if (j == nh && nh < MAXSYM) { hot[nh].sym = key; hot[nh].name = name; hot[nh].off = off; hot[nh].hits = 0; nh++; }
+        if (j < nh) hot[j].hits++;
+        usleep(5000);
+    }
+    for (int a = 0; a < nh; a++)
+        for (int b = a + 1; b < nh; b++)
+            if (hot[b].hits > hot[a].hits) { eu_hot t = hot[a]; hot[a] = hot[b]; hot[b] = t; }
+    char line[1024];
+    int o = snprintf(line, sizeof line, "[hot] %s tid %d (%d samples):", label, tid, taken);
+    for (int a = 0; a < nh && a < 6 && o < (int)sizeof line - 96; a++) {
+        if (hot[a].off) o += snprintf(line + o, sizeof line - o, " libps3eu+0x%lx x%d", (unsigned long)hot[a].off, hot[a].hits);
+        else o += snprintf(line + o, sizeof line - o, " %s x%d", hot[a].name, hot[a].hits);
+    }
+    fprintf(stderr, "%s\n", line);
+}
+
 #define EU_MAX_THREADS 512
 typedef struct { int tid; uint64_t ticks; char name[20]; } eu_tsample;
 
@@ -343,6 +405,13 @@ static void* eu_cpu_thread(void* arg)
                             100.0 * (double)dt[idx[k]] / (double)(hz * 10));
         }
         fprintf(stderr, "%s\n", line);
+        /* Where the two busiest threads spend their time. */
+        for (int k = 0; k < nc && k < 2; k++) {
+            if (dt[idx[k]] * 2 < (uint64_t)(hz * 10)) break;   /* only threads above 50% */
+            char label[24];
+            snprintf(label, sizeof label, "busiest#%d", k + 1);
+            eu_profile_thread(cur[idx[k]].tid, label);
+        }
         memcpy(prev, cur, sizeof(eu_tsample) * (size_t)nc);
         np = nc;
     }
@@ -359,6 +428,12 @@ __attribute__((constructor)) static void eu_diagnostics_init(void)
     sigemptyset(&sa.sa_mask);
     const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT};
     for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &sa, NULL);
+    struct sigaction pa;
+    memset(&pa, 0, sizeof pa);
+    pa.sa_sigaction = eu_prof_handler;
+    pa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&pa.sa_mask);
+    sigaction(EU_PROF_SIG, &pa, NULL);
     pthread_t t;
     if (pthread_create(&t, NULL, eu_cpu_thread, NULL) == 0) pthread_detach(t);
 }
