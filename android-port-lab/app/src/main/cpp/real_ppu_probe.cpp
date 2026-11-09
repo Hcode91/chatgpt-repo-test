@@ -304,7 +304,7 @@ std::string run(const uint8_t* file,size_t n) {
   // main thread ID and ELF TLS template address/filesize/memsize.
   c.r[3]=1;c.r[7]=0x1000000;c.r[8]=tlsVa;c.r[9]=tlsFileSize;c.r[10]=tlsMemSize;
   c.r[13]=0; // sys_initialize_tls must create the actual thread-local state.
-  unsigned hleCalls=0;
+  unsigned hleCalls=0, lv2Calls=0;
   o<<"Parsed firmware imports: "<<imports.size()<<"\n";
   o<<"Guest initial TLS template: addr="<<hx(tlsVa)
    <<" filesz="<<tlsFileSize<<" memsz="<<tlsMemSize<<"\n";
@@ -447,7 +447,36 @@ std::string run(const uint8_t* file,size_t n) {
         mask|=(1u<<(31-bit));
       c.r[ra]=v&mask;break;
     }
-    case 17:stop="PS3 LV2 syscall needs HLE implementation";ok=false;break;
+    case 17: {
+      // PS3 LV2 syscall is selected in r11 (unlike Linux on PowerPC).
+      // RPCS3/ps3recomp: 352 = sys_memory_get_user_memory_size(info*),
+      // struct {be32 total_user_memory; be32 available_user_memory}.
+      if(c.r[11]==352) {
+        const uint64_t info=c.r[3];
+        if(!inrange(info,8,LIMIT)) {
+          stop="sys_memory_get_user_memory_size: invalid guest result pointer "+hx(info);
+          ok=false;
+          break;
+        }
+        constexpr uint32_t modeledTotal=0x10000000u; // PS3 256 MiB main memory
+        constexpr uint32_t modeledAvailable=0x0E000000u; // 224 MiB simulated free
+        if(!m.put(info,4,modeledTotal)||!m.put(info+4,4,modeledAvailable)){
+          stop="sys_memory_get_user_memory_size: could not write 8-byte result at "+hx(info);
+          ok=false;break;
+        }
+        c.r[3]=0;c.writes+=2;lv2Calls++;
+        if(lv2Calls<8)
+          o<<"[LV2 HLE] sys_memory_get_user_memory_size (352): modeled PS3 user memory total="
+           <<hx(modeledTotal)<<", available="<<hx(modeledAvailable)
+           <<", destination="<<hx(info)<<"\n";
+      } else {
+        stop="PS3 LV2 syscall "+std::to_string(c.r[11])+
+          " not implemented at guest PC "+hx(here)+
+          "; r3="+hx(c.r[3])+", r4="+hx(c.r[4]);
+        ok=false;
+      }
+      break;
+    }
     default:ok=false;break;
     }
     if(step<48)o<<"["<<step<<"] "<<hx(here)<<" "<<hx(ins)<<(ok?" executed":" unsupported")<<"\n";
@@ -463,6 +492,7 @@ std::string run(const uint8_t* file,size_t n) {
   }
   if(stop.empty())stop="Instruction budget reached";
   o<<"\nGuest firmware HLE calls handled: "<<hleCalls<<"\n"
+   <<"LV2 syscalls handled: "<<lv2Calls<<"\n"
    <<"Real PPU instructions executed: "<<c.instructions<<"\n"
    <<"Branches: "<<c.branches<<"; linked calls: "<<c.calls<<"\n"
    <<"Guest memory reads: "<<c.reads<<"; writes: "<<c.writes<<"\n"
