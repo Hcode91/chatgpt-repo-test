@@ -29,6 +29,8 @@ final class EuBridge {
 
     /** The bridge of the boot currently running (or last run), shared between screens. */
     static volatile EuBridge current;
+    /** What is drawing the frames, for the game screen's label. */
+    static volatile String rendererLabel = "";
 
     final File file;
     private final MappedByteBuffer buf;

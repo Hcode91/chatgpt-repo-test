@@ -238,6 +238,40 @@ if(INFAMOUS_EU_UPSTREAM_TITLE)
     endif()
     target_link_libraries(infamous_eu_upstream_title PRIVATE
         ps3recomp_runtime ps3recomp_ucontext)
+
+    # GPU renderer: Vulkan 1.3 backend for the toolkit's register-file draw
+    # engine, compiling the decompiled HLSL with glslang (+ SPIRV-Tools for the
+    # HLSL legalization passes). Entry points are loaded at run time, so no
+    # libvulkan link. Without a glslang checkout the CPU preview stays.
+    set(EU_GLSLANG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/glslang")
+    if(EXISTS "${EU_GLSLANG_DIR}/CMakeLists.txt")
+        set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+        set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+        set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+        set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+        set(ENABLE_HLSL ON CACHE BOOL "" FORCE)
+        set(ENABLE_OPT ON CACHE BOOL "" FORCE)
+        set(ENABLE_CTEST OFF CACHE BOOL "" FORCE)
+        set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
+        set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
+        set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
+        set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
+        set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+        add_subdirectory("${EU_GLSLANG_DIR}" "${CMAKE_BINARY_DIR}/glslang" EXCLUDE_FROM_ALL)
+        target_sources(infamous_eu_upstream_title PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/eu_vk_backend.cpp")
+        set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/eu_vk_backend.cpp" PROPERTIES
+            INCLUDE_DIRECTORIES "${EU_GLSLANG_DIR}"
+            COMPILE_OPTIONS "-std=c++17")
+        target_link_libraries(infamous_eu_upstream_title PRIVATE
+            glslang glslang-default-resource-limits dl)
+        if(TARGET SPIRV)
+            target_link_libraries(infamous_eu_upstream_title PRIVATE SPIRV)
+        endif()
+        message(STATUS "European game: Vulkan GPU renderer enabled (glslang ${EU_GLSLANG_DIR})")
+    else()
+        message(WARNING "European game: no glslang checkout -- CPU software preview only")
+    endif()
     target_link_options(infamous_eu_upstream_title PRIVATE
         "-Wl,-z,max-page-size=16384")
     set_target_properties(infamous_eu_upstream_title PROPERTIES
