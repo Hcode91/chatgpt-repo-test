@@ -1,6 +1,35 @@
 # European BCES00220: real Android game boot workstream
 
-**Status: private game boot build target implemented; NOT a successfully booted game.**
+**Status: upstream-title ARM64 build path wired, NOT yet compiled with the complete game lift or booted on Android.**
+
+## Architectural correction (2026-11-09)
+
+The 'RUN REAL EUROPEAN GAME STARTUP (DIRECT PPU)' button runs a small hand-written
+instruction interpreter and has repeatedly stopped at missing opcodes. This was
+useful diagnostics but is **not a viable way to port the entire game**. The
+existing inFAMOUSreborn project already lifts the full game PPU instruction
+stream, including `srw r9,r4,r10` (the latest 0x7C895430 stop), and contains
+game-specific runtime hooks. We should not add hundreds of instructions to the
+diagnostic interpreter while treating each few hundred startup instructions as
+a new milestone.
+
+The default private build now targets `infamous_eu_upstream_title`, which
+compiles the existing inFAMOUSreborn `main.cpp`, `stubs.cpp`, `trainer.cpp`
+and generated PPU code instead of the synthetic SDK `boot_main.cpp`.
+`INFAMOUS_EU_UPSTREAM_TITLE=ON` activates this new target. This CMake
+wiring has not been validated with the real generated code and will likely
+require Android portability adjustments to the upstream title's native
+renderer, input, OS functions and SPU modules. The trace button remains a
+diagnostic tool only. The public CI APK still has **no private lifted game
+code** and cannot show inFAMOUS gameplay.
+
+The next validation is to run the upstream PPU lifter on the verified private
+European ELF, compile the generated units for ARM64 with the real title target,
+and fix integration errors based on those compiler/linker logs, not to patch
+another missing interpreter opcode. Public GitHub Actions may continue to
+compile-test the SDK integration with synthetic inputs, but should not
+pretend that this proves the real title runner builds.
+
 
 The verified user's EBOOT.elf has SHA-256:
 `095d851432f3b55179cd725b46838ffedb3e5eb9f73889e52b6f11f3d3f494fd`.
