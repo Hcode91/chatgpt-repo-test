@@ -23,6 +23,12 @@ test -f "$ROOT/third_party/SDL2-src/CMakeLists.txt" || {
 test -f "$ROOT/third_party/libucontext/arch/aarch64/getcontext.S" || {
   echo "ERROR: checkout libucontext, see README_EU_PRIVATE_BOOT.md" >&2; exit 2;
 }
+# Apply the same tested Android portability changes that public CI uses.
+# This edits only the local upstream clone, never the source repository.
+if [[ ! -e "$ROOT/third_party/SDL2" ]]; then
+  ln -s SDL2-src/include "$ROOT/third_party/SDL2"
+fi
+python3 "$ROOT/tools/patch_android_upstream.py" "$CHECKOUT/ps3recomp"
 BUILD="$PRIVATE/arm64-build"
 cmake -S "$ROOT/runtime-integration" -B "$BUILD" -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
