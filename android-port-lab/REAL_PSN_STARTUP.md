@@ -24,3 +24,24 @@ Neither the ELF nor RAP is uploaded to GitHub. **Do not** add game content to co
 4. Require user-supplied game assets to remain on device or within a private local build environment, never public CI.
 
 A passing CI means our app and synthetic probe compile. It does **not** imply real inFAMOUS boot success.
+
+## PS3 firmware 4.93 support experiment
+
+The user's PS3UPDAT.PUP was inspected locally (not committed):
+- SCEUF version string 4.93, 206,197,916 bytes and 9 outer segments.
+- The inner Update_Files TAR contains 50 entries, including 23 numbered `dev_flash_000` through `dev_flash_022` packages, an additional `dev_flash3` package, and `CORE_OS_PACKAGE.pkg`.
+- Sony's packages remain encrypted. This prototype **does not** decrypt or execute those firmware modules.
+
+The Android app now includes `INSPECT MY PS3UPDAT.PUP FIRMWARE (LOCAL)`.
+It uses an Android document picker and a bounded streaming SCEUF+TAR header scanner that does not extract anything or transmit user files.
+
+The real ELF has 13 PRX import libraries and 198 named import entries. The first observed stop is the
+`sysPrxForUser` NID `0x744680A2`, `sys_initialize_tls`, stub VA `0x55E844`. Its imported
+trampoline is not a valid executable target until the PS3 runtime resolves it.
+A separate PPU startup probe HLE handler has been added for this import. This remains a targeted
+startup experiment and is not a substitute for complete PS3 firmware HLE, module linking, thread creation,
+memory system, SPU or RSX.
+
+**Next device check**: select the previously extracted EBOOT.elf in TRACE REAL inFAMOUS EBOOT STARTUP, record
+the PPU trace and stopping reason. Then optionally inspect PS3UPDAT.PUP for version/packaging details.
+Neither file should be committed or uploaded into a public CI workflow.
