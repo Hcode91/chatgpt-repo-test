@@ -87,6 +87,8 @@ jobs:
           /tmp/infamous-eu-ppu-engine android-port-lab/generated/smoke.elf \
             | tee /tmp/infamous-eu-engine.log
           grep -q "REAL PS3 EBOOT STARTUP TRACE" /tmp/infamous-eu-engine.log
+          /tmp/infamous-eu-ppu-engine --test-time-hle | tee /tmp/eu-time-hle.log
+          grep -q "TIME_HLE_REGRESSION_PASS" /tmp/eu-time-hle.log
           ! grep -q "Status: GAME BOOT SUCCESS" /tmp/infamous-eu-engine.log
       - name: Cross-compile upstream PPU, LV2, SPU, RSX, input and audio for Android ARM64
         run: |
