@@ -249,11 +249,20 @@ public final class MainActivity extends Activity {
                         throw new IOException("ELF has no program headers");
                 }
                 result = out;
+                String outputSha = sha256(out);
+                final String expectedEuropean = "095d851432f3b55179cd725b46838ffedb3e5eb9f73889e52b6f11f3d3f494fd";
+                String compatibility = selfType == 4
+                        ? (outputSha.equalsIgnoreCase(expectedEuropean)
+                            ? "EU BCES00220 inFAMOUS RECOMP FINGERPRINT: MATCH!"
+                            : "EU BCES00220 inFAMOUS RECOMP FINGERPRINT: NOT MATCHED. "
+                                + "Different disc revision or title; do not use upstream patches.")
+                        : "EU BCES00220 recomp fingerprint: not applicable to PSN release.";
                 outcome = "ELF extracted and header verified!\n"
                         + "Executable type: " + executableKind + "\n"
                         + "Content ID: " + contentId + "\n"
                         + "Output bytes: " + out.length() + "\n"
-                        + "SHA-256: " + sha256(out) + "\n\n"
+                        + "SHA-256: " + outputSha + "\n"
+                        + compatibility + "\n\n"
                         + "Engine log:\n" + log + "\n"
                         + "This does not by itself establish game compatibility.";
             } catch (Exception e) {
