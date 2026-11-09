@@ -151,7 +151,7 @@ if(INFAMOUS_EU_UPSTREAM_TITLE)
     # workloads are a logged blocker, not something we pretend to emulate.
     set(EU_SPU_SOURCES "")
     if(INFAMOUS_EU_SPU_DIR)
-        file(GLOB_RECURSE EU_SPU_SOURCES CONFIGURE_DEPENDS
+        file(GLOB EU_SPU_SOURCES CONFIGURE_DEPENDS
             "${INFAMOUS_EU_SPU_DIR}/*/spu_recomp.c"
             "${INFAMOUS_EU_SPU_DIR}/*/spu_recomp_rc.c")
         foreach(_registration IN ITEMS
@@ -160,6 +160,14 @@ if(INFAMOUS_EU_UPSTREAM_TITLE)
                 list(APPEND EU_SPU_SOURCES "${INFAMOUS_EU_SPU_DIR}/${_registration}")
             endif()
         endforeach()
+        if(EU_SPU_SOURCES)
+            # The real title's many lifted SPU functions need the upstream
+            # musttail indirect dispatch trampoline (not the stubbed runner).
+            list(APPEND EU_SPU_SOURCES
+                "${UP_SOURCE}/runtime/spu/spu_dispatch_mt.c")
+            target_compile_definitions(ps3recomp_runtime PRIVATE
+                SPU_USE_DISPATCH_MT=1)
+        endif()
     endif()
     add_executable(infamous_eu_upstream_title
         "${EU_TITLE_DIR}/main.cpp"
@@ -184,6 +192,15 @@ if(INFAMOUS_EU_UPSTREAM_TITLE)
         "${UP_SOURCE}/runtime/syscalls"
         "${UP_SOURCE}/runtime/platform"
         "${UP_SOURCE}/libs/video")
+    if(EU_SPU_SOURCES)
+        target_compile_definitions(infamous_eu_upstream_title PRIVATE
+            SPU_USE_DISPATCH_MT=1)
+        target_include_directories(infamous_eu_upstream_title PRIVATE
+            "${UP_SOURCE}/runtime/spu")
+        message(STATUS "European game: generated real SPU workloads enabled")
+    else()
+        message(WARNING "European game: no SPU workloads available; game boot cannot complete")
+    endif()
     target_link_libraries(infamous_eu_upstream_title PRIVATE
         ps3recomp_runtime ps3recomp_ucontext)
     target_link_options(infamous_eu_upstream_title PRIVATE
