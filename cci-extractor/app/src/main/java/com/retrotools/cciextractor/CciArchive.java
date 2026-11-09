@@ -31,7 +31,6 @@ public final class CciArchive {
         public final List<Entry> entries;
         public final List<String> notes;
         public final int partitions;
-        /** 16-character game Title ID read from the NCSD/NCCH headers, not the filename. */
         public final String titleId;
         Info(List<Entry> entries, List<String> notes, int partitions, String titleId) {
             this.entries = Collections.unmodifiableList(entries);
@@ -97,47 +96,35 @@ public final class CciArchive {
         return n;
     }
 
-    /** Read a 3DS title ID (stored little-endian) as a folder-safe, uppercase hex value. */
     private static String titleId(byte[] bytes, int offset) {
         StringBuilder value = new StringBuilder(16);
-        boolean nonzero = false, notAllFF = false;
-        final char[] hex = "0123456789ABCDEF".toCharArray();
-        for (int i = 7; i >= 0; i--) {
-            int octet = bytes[offset + i] & 0xFF;
-            nonzero |= octet != 0;
-            notAllFF |= octet != 0xFF;
-            value.append(hex[octet >>> 4]).append(hex[octet & 0xF]);
+        boolean nonzero=false, notAllFF=false;
+        final char[] hex="0123456789ABCDEF".toCharArray();
+        for(int i=7;i>=0;i--) {
+            int x=bytes[offset+i]&255;
+            nonzero|=x!=0;notAllFF|=x!=255;
+            value.append(hex[x>>>4]).append(hex[x&15]);
         }
-        return nonzero && notAllFF ? value.toString() : null;
+        return nonzero && notAllFF?value.toString():null;
     }
-
-    /**
-     * Convert internal partition paths into mod-ready output paths.
-     *
-     * partition_0/romfs/... becomes <TITLE_ID>/romfs/...
-     * Other partitions stay separate to avoid accidentally treating manuals/
-     * update content as part of the main game's RomFS mod directory.
-     */
     public static String exportPath(String internalPath, String gameTitleId) {
-        if (internalPath == null || !internalPath.startsWith("partition_"))
+        if(internalPath==null || !internalPath.startsWith("partition_"))
             throw new IllegalArgumentException("Invalid partition path");
-        int slash = internalPath.indexOf('/');
-        if (slash < 0 || slash == internalPath.length() - 1)
+        int slash=internalPath.indexOf('/');
+        if(slash<0 || slash==internalPath.length()-1)
             throw new IllegalArgumentException("Invalid extraction path");
-        String partition = internalPath.substring(0, slash);
-        String remainder = internalPath.substring(slash + 1);
-        if (!partition.matches("partition_[0-7]") || remainder.startsWith("/") ||
-                remainder.contains("..") || remainder.contains("\\"))
+        String partition=internalPath.substring(0,slash);
+        String remainder=internalPath.substring(slash+1);
+        if(!partition.matches("partition_[0-7]") || remainder.startsWith("/") ||
+            remainder.contains("..") || remainder.contains("\\"))
             throw new IllegalArgumentException("Unsafe extraction path");
-        if (partition.equals("partition_0")) {
-            if (gameTitleId != null && gameTitleId.matches("[0-9A-F]{16}"))
-                return gameTitleId + "/" + remainder;
-            // Do not invent an ID when it is absent from the game metadata.
+        if(partition.equals("partition_0")) {
+            if(gameTitleId!=null && gameTitleId.matches("[0-9A-F]{16}"))
+                return gameTitleId+"/"+remainder;
             return internalPath;
         }
-        return "other_partitions/" + internalPath;
+        return "other_partitions/"+internalPath;
     }
-
     public static Info parse(FileChannel channel) throws IOException {
         Reader r = new Reader(channel);
         if (r.length < 0x4000) throw new IOException("Not a valid CCI: image is too small");
@@ -151,7 +138,7 @@ public final class CciArchive {
         List<Entry> out = new ArrayList<>();
         List<String> notes = new ArrayList<>();
         int partitions = 0;
-        String titleId = titleId(ncsd, 0x108);
+        String titleId = titleId(ncsd,0x108);
         for (int i = 0; i < 8; i++) {
             long startUnits = u32(ncsd, 0x120 + 8 * i);
             long sizeUnits = u32(ncsd, 0x124 + 8 * i);
@@ -166,13 +153,12 @@ public final class CciArchive {
                 continue;
             }
             partitions++;
-            // The application NCCH's Program ID is authoritative for the RomFS.
-            if (i == 0) {
-                String programId = titleId(ncch, 0x118);
-                if (programId != null) {
-                    if (titleId != null && !titleId.equals(programId))
+            if(i==0) {
+                String programId=titleId(ncch,0x118);
+                if(programId!=null) {
+                    if(titleId!=null && !titleId.equals(programId))
                         notes.add("NCSD media ID differs from application NCCH Program ID; using Program ID");
-                    titleId = programId;
+                    titleId=programId;
                 }
             }
             int shift = ncch[0x18e] & 0xff;
@@ -210,8 +196,7 @@ public final class CciArchive {
             throw new IOException("No extractable files found. This version requires decrypted CCI images. " +
                     (notes.isEmpty() ? "" : notes.get(0)));
         }
-        if (titleId == null)
-            notes.add("Game Title ID unavailable; partition folders will be retained");
+        if(titleId==null)notes.add("Game Title ID unavailable; partition folders will be retained");
         return new Info(out, notes, partitions, titleId);
     }
 
