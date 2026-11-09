@@ -323,6 +323,52 @@ void crcmp(CPU& c,unsigned field,uint64_t a,uint64_t b,bool uns=false) {
 }
 bool crbit(const CPU& c,unsigned i) {return ((c.cr>>(31-(i&31)))&1)!=0;}
 
+// Division X-form operations. Read sources before writing the result:
+// actual BCES00220 startup uses divdu r27,r27,r3 (0x7F7B1B92).
+// Reject undefined zero-divisor and signed-overflow cases rather than
+// pretending the game produced a valid quotient.
+bool ppu_divide(uint32_t ins,CPU& c,std::string& error) {
+  if((ins>>26)!=31) return false;
+  const unsigned xo=(ins>>1)&1023;
+  if(xo!=457 && xo!=489 && xo!=459 && xo!=491) return false;
+  const unsigned rt=(ins>>21)&31,ra=(ins>>16)&31,rb=(ins>>11)&31;
+  const uint64_t dividend=c.r[ra],divisor=c.r[rb];
+  if(divisor==0 || ((xo==459 || xo==491) && uint32_t(divisor)==0)) {
+    error="Division by zero in PowerPC "+std::to_string(xo)+
+          " at dividend="+hx(dividend)+", divisor="+hx(divisor);
+    return false;
+  }
+  uint64_t quotient=0;
+  switch(xo) {
+    case 457: // divdu: unsigned 64-bit quotient
+      quotient=dividend/divisor;
+      break;
+    case 489: { // divd: signed 64-bit quotient
+      const int64_t a=int64_t(dividend),b=int64_t(divisor);
+      if(a==INT64_MIN && b==-1) {
+        error="Signed 64-bit divd overflow (INT64_MIN / -1)";return false;
+      }
+      quotient=uint64_t(a/b);break;
+    }
+    case 459: { // divwu: unsigned 32-bit quotient
+      const uint32_t a=uint32_t(dividend),b=uint32_t(divisor);
+      quotient=uint64_t(a/b);break;
+    }
+    case 491: { // divw: signed 32-bit quotient
+      const int32_t a=int32_t(uint32_t(dividend));
+      const int32_t b=int32_t(uint32_t(divisor));
+      if(a==INT32_MIN && b==-1) {
+        error="Signed 32-bit divw overflow (INT32_MIN / -1)";return false;
+      }
+      quotient=uint64_t(int64_t(a/b));break;
+    }
+  }
+  c.r[rt]=quotient;
+  // Record forms use CR0 and compare the result signed.
+  if(ins&1) crcmp(c,0,quotient,0);
+  return true;
+}
+
 std::string run(const uint8_t* file,size_t n) {
   std::ostringstream o;
   o<<"REAL PS3 EBOOT STARTUP TRACE\n";
@@ -486,6 +532,14 @@ std::string run(const uint8_t* file,size_t n) {
       case 28:c.r[ra]=c.r[rt]&c.r[rb];break;
       case 316:c.r[ra]=c.r[rt]^c.r[rb];break;
       case 266:c.r[rt]=c.r[ra]+c.r[rb];break;
+      case 457:case 489:case 459:case 491: {
+        std::string div_error;
+        if(!ppu_divide(ins,c,div_error)) {
+          stop=div_error+" at guest PC "+hx(here);
+          ok=false;
+        }
+        break;
+      }
       case 40:c.r[rt]=c.r[rb]-c.r[ra];break;
       case 23:c.r[rt]=load(base(ra)+c.r[rb],4);break;
       case 21:c.r[rt]=load(base(ra)+c.r[rb],8);break;
@@ -677,11 +731,68 @@ int test_lv2_time_services() {
     (unsigned long long)sec,(unsigned long long)nsec);
   return 0;
 }
+int test_division_ops() {
+  std::string err;
+  realppu::CPU c;
+  // Exact instruction from user's European inFAMOUS trace:
+  // 0x7F7B1B92 == divdu r27,r27,r3, 64-bit unsigned division.
+  c.r[27]=100000000000ULL;
+  c.r[3]=125ULL;
+  if(!realppu::ppu_divide(0x7F7B1B92u,c,err) ||
+     c.r[27]!=800000000ULL) {
+    std::fprintf(stderr,"BCES00220 divdu failed: %s\n",err.c_str());return 1;
+  }
+  // Same instruction with Rc=1: quotient updates CR0, preserve XER.
+  c.r[27]=128;c.r[3]=8;c.xer=0x60000000u;c.cr=0;
+  if(!realppu::ppu_divide(0x7F7B1B93u,c,err) || c.r[27]!=16 ||
+     (c.cr>>28)!=4 || c.xer!=0x60000000u) {
+    std::fputs("divdu. CR0 result / XER preservation failed\n",stderr);return 1;
+  }
+  c.r[27]=123;c.r[3]=0;err.clear();
+  if(realppu::ppu_divide(0x7F7B1B92u,c,err) ||
+     err.find("Division by zero")==std::string::npos ||
+     c.r[27]!=123) {
+    std::fputs("divdu zero-divisor should stop without writing\n",stderr);return 1;
+  }
+  // Signed 64-bit division, divd r27,r27,r3.
+  const uint32_t divd=(0x7F7B1B92u&~(1023u<<1))|(489u<<1);
+  c.r[27]=uint64_t(-144ll);c.r[3]=12;err.clear();
+  if(!realppu::ppu_divide(divd,c,err) || int64_t(c.r[27])!=-12) {
+    std::fputs("divd signed quotient incorrect\n",stderr);return 1;
+  }
+  // Unsigned 32-bit division rejects a zero LOW word even when high
+  // bits of the original 64-bit register are nonzero.
+  const uint32_t divwu=(0x7F7B1B92u&~(1023u<<1))|(459u<<1);
+  c.r[27]=0xFFFFFFFFu;c.r[3]=0x100000000ULL;err.clear();
+  if(realppu::ppu_divide(divwu,c,err) ||
+     err.find("Division by zero")==std::string::npos) {
+    std::fputs("divwu low-word zero divisor check failed\n",stderr);return 1;
+  }
+  c.r[27]=0xFFFFFFFEu;c.r[3]=2;err.clear();
+  if(!realppu::ppu_divide(divwu,c,err) || c.r[27]!=0x7FFFFFFFULL) {
+    std::fputs("divwu 32-bit result incorrect\n",stderr);return 1;
+  }
+  // Signed 32-bit word division sign extends the quotient.
+  const uint32_t divw=(0x7F7B1B92u&~(1023u<<1))|(491u<<1);
+  c.r[27]=0xFFFFFFECu;c.r[3]=4;err.clear();
+  if(!realppu::ppu_divide(divw,c,err) || int64_t(c.r[27])!=-5) {
+    std::fputs("divw signed word quotient incorrect\n",stderr);return 1;
+  }
+  c.r[27]=uint64_t(INT64_MIN);c.r[3]=uint64_t(-1ll);err.clear();
+  if(realppu::ppu_divide(divd,c,err) ||
+     err.find("overflow")==std::string::npos) {
+    std::fputs("divd signed-overflow check failed\n",stderr);return 1;
+  }
+  std::puts("PPC_DIVISION_REGRESSION_PASS: actual BCES00220 divdu and 32/64-bit variants");
+  return 0;
+}
 int main(int argc,char** argv){
   if (argc==2 && std::string(argv[1])=="--test-time-hle")
     return test_time_hle();
   if (argc==2 && std::string(argv[1])=="--test-lv2-time")
     return test_lv2_time_services();
+  if(argc==2 && std::string(argv[1])=="--test-division")
+    return test_division_ops();
   if(argc!=2)return 2;
   std::ifstream in(argv[1],std::ios::binary);
   if(!in)return 2;
