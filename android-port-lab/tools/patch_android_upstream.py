@@ -341,4 +341,27 @@ change("runtime/ppu/tests/smoke/smoke_recomp.c",
 '''        smoke_emit(NV4097_CLEAR_SURFACE,         0xF0u);
         smoke_draw_rsx_triangle((unsigned)frame);
         vm_write32(ctrl + 0, g_fifo_len);''')
+# spu_xfk.h (v200 float post-pass, used by every register-cached WWS job
+# module) is x86 SSE only. On arm64 map each *_k op to the portable spu_helpers.h
+# reference op, which clamps every operand: that is upstream's own exact mode
+# (-DSPU_XFK_EXACT), so results are identical to the documented semantics.
+change("runtime/spu/spu_xfk.h",
+"""#if defined(SPU_XFK_EXACT)
+#  define SPU__XFKC(m, i, v) spu__xfq(v)""",
+"""#if !defined(__x86_64__) && !defined(_M_X64) && !defined(__i386__)
+#define spu_fa_k(a, b, m)      spu_fa((a), (b))
+#define spu_fs_k(a, b, m)      spu_fs((a), (b))
+#define spu_fm_k(a, b, m)      spu_fm((a), (b))
+#define spu_fma_k(a, b, c, m)  spu_fma((a), (b), (c))
+#define spu_fms_k(a, b, c, m)  spu_fms((a), (b), (c))
+#define spu_fnms_k(a, b, c, m) spu_fnms((a), (b), (c))
+#else /* x86: upstream definitions unchanged */
+#if defined(SPU_XFK_EXACT)
+#  define SPU__XFKC(m, i, v) spu__xfq(v)""")
+change("runtime/spu/spu_xfk.h",
+"""#define spu_fnms_k(a, b, c, m) spu__fst(_mm_fnmadd_ps(SPU__XFKC(m, 0, spu__fld(a)), SPU__XFKC(m, 1, spu__fld(b)), SPU__XFKC(m, 2, spu__fld(c))))
+#endif""",
+"""#define spu_fnms_k(a, b, c, m) spu__fst(_mm_fnmadd_ps(SPU__XFKC(m, 0, spu__fld(a)), SPU__XFKC(m, 1, spu__fld(b)), SPU__XFKC(m, 2, spu__fld(c))))
+#endif /* x86 */
+#endif""")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
