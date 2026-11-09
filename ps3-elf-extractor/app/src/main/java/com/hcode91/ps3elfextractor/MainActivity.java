@@ -58,14 +58,14 @@ public final class MainActivity extends Activity {
         ebootStatus = addText(root, "EBOOT: Not selected", 14, 0xffd6e4f9);
         button(root, "1. Select EBOOT.BIN", () -> choose(PICK_EBOOT));
         rapStatus = addText(root, "RAP: Not selected", 14, 0xffd6e4f9);
-        button(root, "2. Select matching .rap licence", () -> choose(PICK_RAP));
+        button(root, "2. Select .rap (PSN only; skip for discs)", () -> choose(PICK_RAP));
         addText(root, "Keysets: Built in (from RPCS3 GPL source). No manual keys file needed.", 14, 0xff9ce6ba);
 
         extract = button(root, "Decrypt and verify ELF", this::extract);
         save = button(root, "Save verified EBOOT.elf", this::save);
         save.setEnabled(false);
 
-        report = addText(root, "Ready. Select EBOOT.BIN and matching 16-byte RAP. Built-in PS3 keysets load automatically.", 14, 0xffa9f1c9);
+        report = addText(root, "Ready. Select EBOOT.BIN. Disc-based APP executables need no RAP; PSN NPDRM executables need a matching 16-byte RAP.", 14, 0xffa9f1c9);
         report.setTypeface(Typeface.MONOSPACE);
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
@@ -140,8 +140,8 @@ public final class MainActivity extends Activity {
 
     private void extract() {
         if (busy) return;
-        if (selected[0] == null || selected[1] == null) {
-            message("Please select EBOOT.BIN and its matching .rap licence.");
+        if (selected[0] == null) {
+            message("Please select EBOOT.BIN. RAP is only necessary for PSN NPDRM executables.");
             return;
         }
         busy = true;
@@ -173,17 +173,36 @@ public final class MainActivity extends Activity {
                 int eo = (int) embeddedOffset;
                 if (!elfHeader(head, eo))
                     throw new IOException("Embedded ELF header is not 64-bit big-endian PowerPC");
-                Matcher m = CONTENT_ID.matcher(new String(head, StandardCharsets.ISO_8859_1));
-                if (!m.find()) throw new IOException("Could not locate NPDRM content ID in SELF header");
-                String contentId = m.group();
-                String rapName = selectedNames[1];
-                if (!rapName.equalsIgnoreCase(contentId + ".rap"))
-                    throw new IOException("RAP name does not match EBOOT content ID " + contentId
-                            + "\nSelected: " + rapName);
-                File rap = new File(work, contentId + ".rap");
-                copy(selected[1], rap, 32);
-                if (rap.length() != 16)
-                    throw new IOException("PS3 RAP must be exactly 16 bytes, got " + rap.length());
+                // App info is a separate, bounded record whose SELF type is at +0x0C.
+                // scetool sce.h: SELF_TYPE_APP=4, SELF_TYPE_NPDRM=8.
+                long appInfoOffset = be64(head, 0x28);
+                if (appInfoOffset < 0x40 || appInfoOffset > head.length - 0x20)
+                    throw new IOException("APP info offset outside SELF header");
+                int selfType = (int)be32(head, (int)appInfoOffset + 12);
+                String contentId = "N/A (disc APP SELF)";
+                if (selfType == 8) {
+                    // Network-distributed EBOOT: match the user's local licence.
+                    Matcher m = CONTENT_ID.matcher(new String(head, StandardCharsets.ISO_8859_1));
+                    if (!m.find())
+                        throw new IOException("NPDRM SELF has no recognised content ID");
+                    contentId = m.group();
+                    if (selected[1] == null)
+                        throw new IOException("This PSN/NPDRM EBOOT needs its matching 16-byte RAP. "
+                                + "Disc APP EBOOTs do not.");
+                    String rapName = selectedNames[1];
+                    if (!rapName.equalsIgnoreCase(contentId + ".rap"))
+                        throw new IOException("RAP name does not match EBOOT content ID "
+                                + contentId + "\nSelected: " + rapName);
+                    File rap = new File(work, contentId + ".rap");
+                    copy(selected[1], rap, 32);
+                    if (rap.length() != 16)
+                        throw new IOException("PS3 RAP must be exactly 16 bytes, got " + rap.length());
+                } else if (selfType != 4) {
+                    throw new IOException("Unsupported PS3 SELF type " + selfType
+                            + "; only disc APP (4) or PSN NPDRM (8) supported.");
+                }
+                String executableKind = selfType == 4
+                        ? "Disc APP (no RAP required)" : "PSN NPDRM (RAP provided)";
                 // Copy pinned, GPL-compatible RPCS3-derived keyset from the APK into private storage.
                 try (InputStream internal = getAssets().open("scetool-keys.ini");
                      FileOutputStream dst = new FileOutputStream(keys, false)) {
@@ -219,7 +238,7 @@ public final class MainActivity extends Activity {
                 if (proc.exitValue() != 0)
                     throw new IOException("scetool exit " + proc.exitValue() + "\n" + log);
                 if (!out.isFile() || out.length() < 64)
-                    throw new IOException("scetool generated no ELF. Check keyset and RAP.\n" + log);
+                    throw new IOException("scetool generated no ELF. Check compatible keyset / licence.\n" + log);
                 if (!elfHeader(readHeader(out, 64), 0))
                     throw new IOException("Output is not ELF64 big-endian PowerPC.\n" + log);
                 // Not proof of full game compatibility, but rejects truncated or incorrectly formatted output.
@@ -231,14 +250,15 @@ public final class MainActivity extends Activity {
                 }
                 result = out;
                 outcome = "ELF extracted and header verified!\n"
-                        + "NPDRM Content ID: " + contentId + "\n"
+                        + "Executable type: " + executableKind + "\n"
+                        + "Content ID: " + contentId + "\n"
                         + "Output bytes: " + out.length() + "\n"
                         + "SHA-256: " + sha256(out) + "\n\n"
                         + "Engine log:\n" + log + "\n"
                         + "This does not by itself establish game compatibility.";
             } catch (Exception e) {
                 outcome = "Extraction not completed.\n" + e.getMessage() +
-                    "\n\nYour files remain on this device. Built-in RPCS3 keysets are used automatically.";
+                    "\n\nYour files remain on this device. Disc APP needs no RAP; PSN NPDRM may need RAP.";
             }
             File finalResult = result;
             String finalOutcome = outcome;
@@ -261,6 +281,10 @@ public final class MainActivity extends Activity {
     }
     private static int be16(byte[] b, int p) {
         return ((b[p] & 255) << 8) | (b[p + 1] & 255);
+    }
+    private static long be32(byte[] b, int p) {
+        return (((long)b[p] & 255) << 24) | (((long)b[p + 1] & 255) << 16)
+                | (((long)b[p + 2] & 255) << 8) | ((long)b[p + 3] & 255);
     }
     private static long be64(byte[] b, int p) {
         long r = 0;
