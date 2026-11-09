@@ -134,10 +134,7 @@ bool import_hle(const Import& imp,CPU& c,Memory& m,std::string& event,std::strin
     // RPCS3's layout: 0x30-byte thread system prefix, TLS image, then zero-fill.
     // PPC r13 points to the thread's ABI TLS anchor (+0x7000+0x30).
     c.r[13]=TLS_BASE+0x7000+0x30;
-    if(!m.put(c.r[1]+40,8,c.r[2])) {
-      stop="sys_initialize_tls: could not preserve caller TOC on stack";
-      return false;
-    }
+    // Caller TOC is saved centrally by the import bridge before this handler.
     event="[HLE] sysPrxForUser::sys_initialize_tls NID 0x744680A2 "+
       std::string("initialized ")+std::to_string(tlsBytes)+
       " guest TLS bytes; r13="+hx(c.r[13]);
@@ -321,6 +318,17 @@ std::string run(const uint8_t* file,size_t n) {
     auto imp=std::find_if(imports.begin(),imports.end(),
              [&](const Import& candidate){return candidate.stub==c.pc;});
     if(imp!=imports.end()) {
+      // The PS3 import trampoline includes 'std r2,40(r1)' before replacing
+      // the caller's TOC with the firmware module's own TOC. Intercepting the
+      // stub before executing it MUST preserve this ABI side effect.
+      // Without it, the guest's 'ld r2,40(r1)' restores zero and subsequent
+      // r2-relative global loads fault (as observed at 0x45713C).
+      if(!m.put(c.r[1]+40,8,c.r[2])) {
+        stop="Import bridge could not save caller TOC at stack address "+
+             hx(c.r[1]+40);
+        break;
+      }
+      ++c.writes;
       std::string event;
       if(!import_hle(*imp,c,m,event,stop))break;
       if(hleCalls<12)o<<event<<"\n";
@@ -333,12 +341,20 @@ std::string run(const uint8_t* file,size_t n) {
     unsigned rt=(ins>>21)&31,ra=(ins>>16)&31,rb=(ins>>11)&31;
     uint64_t here=c.pc,next=here+4;
     bool ok=true,memok=true;
+    uint64_t badAddress=0;int badBytes=0;
+    const char* badOperation="";
     auto base=[&](unsigned x)->uint64_t{return x?c.r[x]:0;};
     auto load=[&](uint64_t addr,int bytes)->uint64_t {
-      uint64_t v=0;if(!m.get(addr,bytes,v))memok=false;else c.reads++;return v;
+      uint64_t v=0;
+      if(!m.get(addr,bytes,v)) {
+        memok=false;badAddress=addr;badBytes=bytes;badOperation="load";
+      } else c.reads++;
+      return v;
     };
     auto store=[&](uint64_t addr,int bytes,uint64_t v){
-      if(!m.put(addr,bytes,v))memok=false;else c.writes++;
+      if(!m.put(addr,bytes,v)) {
+        memok=false;badAddress=addr;badBytes=bytes;badOperation="store";
+      } else c.writes++;
     };
     int64_t imm=int16_t(ins&65535);
     switch(op) {
@@ -436,7 +452,13 @@ std::string run(const uint8_t* file,size_t n) {
     }
     if(step<48)o<<"["<<step<<"] "<<hx(here)<<" "<<hx(ins)<<(ok?" executed":" unsupported")<<"\n";
     if(!ok){if(stop.empty())stop="Unsupported PPC instruction: opcode "+std::to_string(op)+" at "+hx(here);break;}
-    if(!memok){stop="Unmapped guest memory access at "+hx(here);break;}
+    if(!memok){
+      stop="Guest "+std::string(badOperation)+" out of bounds at "+hx(badAddress)+
+           " ("+std::to_string(badBytes)+" bytes), instruction PC="+hx(here)+
+           ", opcode="+hx(ins)+", r2/TOC="+hx(c.r[2])+
+           ", r1/stack="+hx(c.r[1]);
+      break;
+    }
     c.pc=next;c.instructions++;
   }
   if(stop.empty())stop="Instruction budget reached";
