@@ -417,7 +417,16 @@ std::string run(const uint8_t* file,size_t n) {
       switch(xo){
       case 339:if(spr==8)c.r[rt]=c.lr;else if(spr==9)c.r[rt]=c.ctr;else if(spr==1)c.r[rt]=c.xer;else ok=false;break;
       case 467:if(spr==8)c.lr=c.r[rt];else if(spr==9)c.ctr=c.r[rt];else if(spr==1)c.xer=c.r[rt];else ok=false;break;
-      case 444:c.r[ra]=c.r[rt]|c.r[rb];break;
+      // PowerPC X-form single-register logical operations.
+      // The source is RS (rt field) and destination RA (ra field).
+      // EXTSh appears at BCES00220 guest PC 0x44F0F4, then again at
+      // 0x44F0FC / 0x44F100. Preserve sign extension to full 64 bits.
+      case 954: c.r[ra]=uint64_t(int64_t(int8_t(c.r[rt]))); break;    // extsb
+      case 922: c.r[ra]=uint64_t(int64_t(int16_t(c.r[rt]))); break;   // extsh
+      case 986: c.r[ra]=uint64_t(int64_t(int32_t(c.r[rt]))); break;   // extsw
+      case 26: {uint32_t v=uint32_t(c.r[rt]);c.r[ra]=v?unsigned(__builtin_clz(v)):32u;break;} // cntlzw
+      case 58: {uint64_t v=c.r[rt];c.r[ra]=v?unsigned(__builtin_clzll(v)):64u;break;} // cntlzd
+            case 444:c.r[ra]=c.r[rt]|c.r[rb];break;
       case 28:c.r[ra]=c.r[rt]&c.r[rb];break;
       case 316:c.r[ra]=c.r[rt]^c.r[rb];break;
       case 266:c.r[rt]=c.r[ra]+c.r[rb];break;
@@ -431,6 +440,11 @@ std::string run(const uint8_t* file,size_t n) {
       case 32:crcmp(c,rt>>2,(ins&0x200000)?c.r[ra]:uint32_t(c.r[ra]),(ins&0x200000)?c.r[rb]:uint32_t(c.r[rb]),true);break;
       default:ok=false;break;
       }
+      // A set Rc bit on these X-form operations updates CR0 with signed
+      // result comparison, rather than leaving stale branch flags.
+      if(ok && (ins&1) &&
+         (xo==954 || xo==922 || xo==986 || xo==26 || xo==58))
+        crcmp(c,0,c.r[ra],0);
       break;
     }
     case 30:{
@@ -480,7 +494,15 @@ std::string run(const uint8_t* file,size_t n) {
     default:ok=false;break;
     }
     if(step<48)o<<"["<<step<<"] "<<hx(here)<<" "<<hx(ins)<<(ok?" executed":" unsupported")<<"\n";
-    if(!ok){if(stop.empty())stop="Unsupported PPC instruction: opcode "+std::to_string(op)+" at "+hx(here);break;}
+    if(!ok) {
+      if(stop.empty()) {
+        stop="Unsupported PPC instruction: opcode "+std::to_string(op);
+        if(op==31 || op==19)
+          stop+=" XO="+std::to_string((ins>>1)&1023);
+        stop+=" instruction="+hx(ins)+" at guest PC "+hx(here);
+      }
+      break;
+    }
     if(!memok){
       stop="Guest "+std::string(badOperation)+" out of bounds at "+hx(badAddress)+
            " ("+std::to_string(badBytes)+" bytes), instruction PC="+hx(here)+
@@ -497,6 +519,8 @@ std::string run(const uint8_t* file,size_t n) {
    <<"Branches: "<<c.branches<<"; linked calls: "<<c.calls<<"\n"
    <<"Guest memory reads: "<<c.reads<<"; writes: "<<c.writes<<"\n"
    <<"Final guest PC: "<<hx(c.pc)<<"\n"
+   <<"Final r3: "<<hx(c.r[3])<<"\n"
+   <<"Final r2/TOC: "<<hx(c.r[2])<<"\n"
    <<"Stop: "<<stop<<"\n"
    <<"Status: PARTIAL GUEST STARTUP, NOT GAME BOOT\n"
    <<"Next: resolve PS3 imports, LV2 syscalls, SPU, RSX and game filesystem.\n";
