@@ -1,0 +1,12 @@
+/.gradle/
+/build/
+/app/build/
+/app/src/main/jniLibs/
+/*.iml
+/local.properties
+# Do not commit private executables, licenses, or keys.
+*.rap
+*.rif
+EBOOT.BIN
+EBOOT.elf
+keys
