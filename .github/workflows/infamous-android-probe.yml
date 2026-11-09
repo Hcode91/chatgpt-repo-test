@@ -58,6 +58,18 @@ jobs:
             --output android-port-lab/generated \
             --functions android-port-lab/generated/functions.json \
             --jobs 1 --single-file
+      - name: Assert upstream lifter implements the previous unsupported PPC SRW
+        run: |
+          # The old custom interpreter stopped on this exact instruction word.
+          # Upstream is expected to lift it into actual host arithmetic.
+          python3 - <<'PY'
+          from pathlib import Path
+          src = "\n".join(p.read_text() for p in Path("android-port-lab/generated").glob("ppu_recomp*.c"))
+          assert "ctx->gpr[9]" in src, "Upstream lift missed the srw destination"
+          assert "ctx->gpr[4]" in src and "ctx->gpr[10]" in src, "Upstream lift missed srw sources"
+          assert ">>" in src and "& 0x20" in src, "Upstream lift lacks PPC 32-bit shift semantics"
+          print("UPSTREAM_SRW_LIFT_PASS: real srw compiled as host C++")
+          PY
       - name: Compile and execute lifted PPU smoke on Linux
         run: |
           c++ -std=c++20 -O0 -DPPU_SMOKE_HOST \
