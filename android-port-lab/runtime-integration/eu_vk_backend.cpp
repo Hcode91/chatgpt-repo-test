@@ -94,7 +94,7 @@ namespace {
     X(vkFreeMemory) X(vkDestroyBuffer) X(vkCreateImage) X(vkGetImageMemoryRequirements) \
     X(vkBindImageMemory) X(vkDestroyImage) X(vkCreateImageView) X(vkDestroyImageView) \
     X(vkCmdPipelineBarrier) X(vkResetCommandBuffer) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) \
-    X(vkResetFences) X(vkQueueSubmit) X(vkWaitForFences) X(vkCmdCopyBufferToImage) \
+    X(vkResetFences) X(vkQueueSubmit) X(vkWaitForFences) X(vkGetFenceStatus) X(vkCmdCopyBufferToImage) \
     X(vkCmdCopyImageToBuffer) X(vkCreateShaderModule) X(vkCreateSampler) X(vkCreateGraphicsPipelines) \
     X(vkDestroyPipeline) X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) \
     X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCmdBindPipeline) \
@@ -162,9 +162,8 @@ VkFormat g_depth_fmt = VK_FORMAT_UNDEFINED;
 bool g_bc_ok;
 bool g_mirror_clamp_ok;
 VkCommandPool g_cmdpool;
-VkCommandBuffer g_cb, g_cb_imm;
-VkFence g_fence, g_fence_imm;
-VkDescriptorPool g_dpool;
+VkCommandBuffer g_cb_imm;
+VkFence g_fence_imm;
 bool g_active;
 char g_log[8192];
 
@@ -224,9 +223,32 @@ bool buffer_ensure(Buffer& b, VkDeviceSize need, VkBufferUsageFlags usage)
     return buffer_create(b, sz, usage);
 }
 
-Buffer g_stage_buf;     /* vertex/index/uniform data for one submit */
 Buffer g_upload_buf;    /* texture uploads */
-Buffer g_readback_buf;  /* present + readback */
+
+/* Two submission slots: the CPU records and encodes frame N+1 while the GPU
+ * still runs frame N. Each slot owns everything the GPU reads from the host
+ * side (command buffer, descriptor pool, vertex/uniform staging, present
+ * readback); a slot is only reused after its fence has signalled. */
+constexpr u32 NUM_SLOTS = 2;
+struct Slot {
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    VkDescriptorPool dpool = VK_NULL_HANDLE;
+    Buffer stage;      /* vertex/index/uniform data for one submit */
+    Buffer readback;   /* present image copy */
+    bool in_flight = false, publish = false;
+    u32 pw = 0, ph = 0;
+    uint64_t serial = 0;
+};
+Slot g_slot[NUM_SLOTS];
+u32 g_cur;                 /* slot being encoded */
+uint64_t g_serial;         /* submissions made */
+uint64_t g_completed;      /* highest submission known finished */
+#define g_cb (g_slot[g_cur].cb)
+#define g_fence (g_slot[g_cur].fence)
+#define g_dpool (g_slot[g_cur].dpool)
+#define g_stage_buf (g_slot[g_cur].stage)
+#define g_readback_buf (g_slot[g_cur].readback)
 Buffer g_zero_ubo;      /* bound when a stage has no constants */
 
 /* ------------------------------------------------------------------ objects */
@@ -242,6 +264,10 @@ struct Obj {
     u32 w = 0, h = 0, mips = 1, layers = 1;
     u32 parent = 0;                      /* surface_view: the owning surface    */
     bool initialised = false;            /* moved out of UNDEFINED              */
+    uint64_t retire_after = 0;           /* destroy once this submission is done */
+    u32 frame_writes = 0;                /* draws/clears into it in frame write_frame */
+    u32 write_frame = 0;
+    float last_clear[4] = {0, 0, 0, 0};
 };
 Obj g_obj[MAX_OBJECTS];
 u32 g_obj_count;
@@ -285,9 +311,8 @@ u32 g_rec_count;   /* forward: records pending (objects can't be recycled while 
 
 void collect_retired()
 {
-    if (g_rec_count) return;
     for (u32 i = 0; i < g_obj_count; i++) {
-        if (!g_obj[i].live || !g_obj[i].retired) continue;
+        if (!g_obj[i].live || !g_obj[i].retired || g_completed < g_obj[i].retire_after) continue;
         obj_destroy_now(g_obj[i]);
         g_obj_free[g_obj_free_count++] = i;
     }
@@ -532,6 +557,7 @@ VkCommandBuffer imm_begin()
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(g_cb_imm, &bi);
     init_layouts(g_cb_imm);
+    barrier_all(g_cb_imm);   /* after any frame still running on the GPU */
     return g_cb_imm;
 }
 
@@ -1045,6 +1071,28 @@ u32 g_guest_draws, g_last_guest_draws, g_skipped_draws;
 
 void encode_and_submit(u32 present_surface);
 
+/* A full record list is flushed to the GPU instead of dropping the rest of the
+ * frame (build #20 lost the end of busy frames -- usually the final composite,
+ * which left the screen black). */
+u32 g_mid_flushes;
+u32 g_frame_no = 1;
+void mark_write(u32 h, const float* clear = nullptr)
+{
+    Obj* o = obj(h);
+    if (!o) return;
+    if (o->write_frame != g_frame_no) { o->write_frame = g_frame_no; o->frame_writes = 0; }
+    o->frame_writes++;
+    if (clear) memcpy(o->last_clear, clear, sizeof o->last_clear);
+}
+
+void rec_room()
+{
+    if (g_rec_count >= MAX_RECORDS) {
+        g_mid_flushes++;
+        encode_and_submit(0);
+    }
+}
+
 bool stage_reserve(u32 bytes, u32* off)
 {
     const u32 start = (g_stage_used + STAGE_ALIGN - 1u) & ~(STAGE_ALIGN - 1u);
@@ -1406,14 +1454,60 @@ uint64_t now_ms()
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
+/* Retire slot `k` if its GPU work is done (or wait for it): publish its
+ * present copy and recycle its descriptor pool. False = still running. */
+bool slot_finish(u32 k, bool wait)
+{
+    Slot& sl = g_slot[k];
+    if (!sl.in_flight) return true;
+    VkResult r;
+    if (wait) {
+        r = vkWaitForFences(g_dev, 1, &sl.fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
+        if (r != VK_SUCCESS) {
+            fprintf(stderr, "[RSX vulkan] GPU did not finish (result %d) -- device lost?\n", (int)r);
+            if (r == VK_ERROR_DEVICE_LOST) g_active = false;
+        }
+    } else {
+        r = vkGetFenceStatus(g_dev, sl.fence);
+        if (r == VK_NOT_READY) return false;
+    }
+    sl.in_flight = false;
+    if (sl.serial > g_completed) g_completed = sl.serial;
+    vkResetDescriptorPool(g_dev, sl.dpool, 0);
+    if (sl.publish && r == VK_SUCCESS)
+        eu_bridge_frame_rgba((const uint8_t*)sl.readback.map, sl.pw, sl.ph, sl.pw * 4);
+    sl.publish = false;
+    return true;
+}
+
+void wait_all_slots()
+{
+    for (u32 k = 0; k < NUM_SLOTS; k++) slot_finish(k, true);
+    collect_retired();
+}
+
+uint64_t g_gpu_wait_us;   /* time the CPU spent blocked on a busy slot */
+
 /* Encode everything recorded, optionally scale `present_surface` into the
- * RGBA8 present image and read it back, submit, wait, recycle. */
+ * RGBA8 present image and read it back, then submit WITHOUT waiting: the
+ * next submission goes to the other slot, and this one is collected (and its
+ * picture published) once its fence signals. */
 void encode_and_submit(u32 present_surface)
 {
     if (!g_active) return;
     Obj* src = obj(present_surface);
     static uint64_t next_publish;
     const bool publish = src && src->view && eu_bridge_frame_rgba && now_ms() >= next_publish;
+
+    /* the slot we are about to fill must be idle */
+    if (g_slot[g_cur].in_flight) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        slot_finish(g_cur, true);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        g_gpu_wait_us += (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000u + (uint64_t)(t1.tv_nsec - t0.tv_nsec) / 1000u;
+        if (!g_active) return;
+    }
 
     if (g_stage_used && !buffer_ensure(g_stage_buf, (VkDeviceSize)g_stage_used + UBO_PAD,
                                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
@@ -1430,6 +1524,7 @@ void encode_and_submit(u32 present_surface)
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(g_cb, &bi);
     init_layouts(g_cb);
+    barrier_all(g_cb);   /* GPU work stays in order across slots; only the CPU overlaps */
     encode_records(g_cb);
 
     u32 pw = 0, ph = 0;
@@ -1454,28 +1549,23 @@ void encode_and_submit(u32 present_surface)
     si.pCommandBuffers = &g_cb;
     vkResetFences(g_dev, 1, &g_fence);
     VkResult qr = vkQueueSubmit(g_queue, 1, &si, g_fence);
+    Slot& sl = g_slot[g_cur];
     if (qr == VK_SUCCESS) {
-        VkResult wr = vkWaitForFences(g_dev, 1, &g_fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
-        if (wr != VK_SUCCESS) {
-            fprintf(stderr, "[RSX vulkan] GPU did not finish (result %d) -- device lost?\n", (int)wr);
-            if (wr == VK_ERROR_DEVICE_LOST) g_active = false;
-        }
+        sl.in_flight = true;
+        sl.serial = ++g_serial;
+        sl.publish = publish;
+        sl.pw = pw;
+        sl.ph = ph;
+        if (publish) next_publish = now_ms() + 33;
     } else {
         fprintf(stderr, "[RSX vulkan] queue submit failed (%d)\n", (int)qr);
         if (qr == VK_ERROR_DEVICE_LOST) g_active = false;
-    }
-    vkResetDescriptorPool(g_dev, g_dpool, 0);
-
-    if (publish && qr == VK_SUCCESS) {
-        eu_bridge_frame_rgba((const uint8_t*)g_readback_buf.map, pw, ph, pw * 4);
-        next_publish = now_ms() + 33;
-    }
-    if (g_dropped) {
-        fprintf(stderr, "[RSX vulkan] dropped %u record(s) (cap %u)\n", g_dropped, MAX_RECORDS);
-        g_dropped = 0;
+        vkResetDescriptorPool(g_dev, sl.dpool, 0);
     }
     g_rec_count = 0;
     g_stage_used = 0;
+    g_cur = (g_cur + 1) % NUM_SLOTS;
+    for (u32 k = 0; k < NUM_SLOTS; k++) slot_finish(k, false);   /* publish whatever is done */
     collect_retired();
 }
 
@@ -1519,6 +1609,7 @@ void be_obj_release(void*, u32 handle)
     Obj* o = obj(handle);
     if (!o || o->retired) return;
     o->retired = true;
+    o->retire_after = g_serial + 1;   /* pending records go out in the next submission */
     for (u32 i = 0; i < g_view_count; i++)
         if (g_views[i].surface == handle) {
             be_obj_release(nullptr, g_views[i].view);
@@ -1594,10 +1685,7 @@ u32 be_depth_target_create(void*, u32 w, u32 h) { return depth_create(w, h); }
 u32 be_depth_snapshot(void*, u32 depth, u32 w, u32 h)
 {
     if (!obj(depth) || !g_depth_pipe) return 0;
-    if (g_rec_count >= MAX_RECORDS) {
-        g_dropped++;
-        return 0;
-    }
+    rec_room();
     const u32 dst = be_color_target_create(nullptr, RSX_BE_FMT_R32F, w, h, nullptr, 0);
     if (!dst) return 0;
     Rec& r = g_rec[g_rec_count++];
@@ -1733,10 +1821,7 @@ void be_draw(void*, rsx_topology topology, const void* vertices, u32 vertex_coun
              const u32* indices, u32 index_count)
 {
     if (!vertex_count || !stride) return;
-    if (g_rec_count >= MAX_RECORDS) {
-        g_dropped++;
-        return;
-    }
+    rec_room();
     u32 vb = 0, ib = 0;
     if (!stage_copy(vertices, vertex_count * stride, &vb)) return;
     if (indices && index_count && !stage_copy(indices, index_count * (u32)sizeof(u32), &ib)) return;
@@ -1749,28 +1834,24 @@ void be_draw(void*, rsx_topology topology, const void* vertices, u32 vertex_coun
     r.vertex_count = vertex_count;
     r.ib_off = ib;
     r.index_count = indices ? index_count : 0;
+    for (u32 i = 0; i < r.nrt && i < RSX_BE_MAX_COLOR_TARGETS; i++) mark_write(r.rt[i]);
 }
 
 void be_clear_color(void*, u32 surface, const float rgba[4])
 {
-    if (g_rec_count >= MAX_RECORDS) {
-        g_dropped++;
-        return;
-    }
+    rec_room();
     Rec& r = g_rec[g_rec_count++];
     memset(&r, 0, sizeof r);
     r.kind = REC_CLEAR_COLOR;
     r.rt[0] = surface;
     r.nrt = 1;
     memcpy(r.clear_rgba, rgba, sizeof r.clear_rgba);
+    mark_write(surface, rgba);
 }
 
 void be_clear_depth_stencil(void*, u32 depth, u32 flags, float depth_value, u8 stencil)
 {
-    if (g_rec_count >= MAX_RECORDS) {
-        g_dropped++;
-        return;
-    }
+    rec_room();
     Rec& r = g_rec[g_rec_count++];
     memset(&r, 0, sizeof r);
     r.kind = REC_CLEAR_DS;
@@ -1780,9 +1861,38 @@ void be_clear_depth_stencil(void*, u32 depth, u32 flags, float depth_value, u8 s
     r.clear_stencil = stencil;
 }
 
+/* What is being shown: grey/black screens are usually a presented surface
+ * nothing drew into this frame, so log that. */
+u32 g_pres_unwritten, g_pres_cleared_only, g_pres_missing, g_pres_total;
+void present_diag(u32 surface)
+{
+    static u32 last_surface, logged;
+    g_pres_total++;
+    Obj* o = obj(surface);
+    if (!o) {
+        g_pres_missing++;
+    } else if (o->write_frame != g_frame_no) {
+        g_pres_unwritten++;
+    }
+    if (surface != last_surface && logged < 60) {
+        logged++;
+        if (o)
+            fprintf(stderr, "[RSX vulkan] presenting surface %u: %ux%u fmt %d, %u write(s) this frame%s, "
+                    "last clear (%.2f %.2f %.2f %.2f)\n", surface, o->w, o->h, (int)o->bfmt,
+                    o->write_frame == g_frame_no ? o->frame_writes : 0u,
+                    o->write_frame == g_frame_no ? "" : " (NOT drawn this frame)",
+                    o->last_clear[0], o->last_clear[1], o->last_clear[2], o->last_clear[3]);
+        else
+            fprintf(stderr, "[RSX vulkan] presenting surface %u: no such surface\n", surface);
+    }
+    last_surface = surface;
+}
+
 void be_present(void*, u32 surface)
 {
+    present_diag(surface);
     encode_and_submit(surface);
+    g_frame_no++;
     g_last_guest_draws = g_guest_draws;
     g_guest_draws = 0;
     static uint64_t next_report;
@@ -1795,6 +1905,11 @@ void be_present(void*, u32 surface)
                 "topology %u, vertex fetch %u, rebuild %u, zero count %u, no colour target %u, "
                 "no pipeline %u, index reserve %u, FP constants %u | immediate-mode %u\n",
                 d[0], d[10], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[12]);
+        fprintf(stderr, "[RSX vulkan] frames (5s): %u presented, %u of an undrawn surface, %u of no surface | "
+                "%u mid-frame flushes | CPU waited %.0f ms for the GPU\n", g_pres_total, g_pres_unwritten,
+                g_pres_missing, g_mid_flushes, (double)g_gpu_wait_us / 1000.0);
+        g_pres_total = g_pres_unwritten = g_pres_missing = g_mid_flushes = 0;
+        g_gpu_wait_us = 0;
     }
     static u32 presents;
     if (++presents == 1 || presents % 600 == 0)
@@ -1809,6 +1924,7 @@ void be_readback(void*, u32 surface, u32 x, u32 y, u32 w, u32 h, void* out, u32 
     Obj* o = obj(surface);
     if (!o || !out || !out_pitch || !w || !h || x + w > o->w || y + h > o->h || o->depth) return;
     if (g_rec_count) encode_and_submit(0);
+    wait_all_slots();
     const u32 bpp = bytes_per_pixel(o->fmt);
     if (!buffer_ensure(g_upload_buf, (VkDeviceSize)w * h * bpp, VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                                                    VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return;
@@ -1963,11 +2079,13 @@ bool init_device()
     cai.commandPool = g_cmdpool;
     cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cai.commandBufferCount = 1;
-    vkAllocateCommandBuffers(g_dev, &cai, &g_cb);
     vkAllocateCommandBuffers(g_dev, &cai, &g_cb_imm);
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    vkCreateFence(g_dev, &fci, nullptr, &g_fence);
     vkCreateFence(g_dev, &fci, nullptr, &g_fence_imm);
+    for (u32 k = 0; k < NUM_SLOTS; k++) {
+        vkAllocateCommandBuffers(g_dev, &cai, &g_slot[k].cb);
+        vkCreateFence(g_dev, &fci, nullptr, &g_slot[k].fence);
+    }
 
     VkDescriptorPoolSize sizes[] = {
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_RECORDS * 2 + 64},
@@ -1980,7 +2098,8 @@ bool init_device()
     dpi.maxSets = MAX_RECORDS + 64;
     dpi.poolSizeCount = 5;
     dpi.pPoolSizes = sizes;
-    if (vkCreateDescriptorPool(g_dev, &dpi, nullptr, &g_dpool) != VK_SUCCESS) return false;
+    for (u32 k = 0; k < NUM_SLOTS; k++)
+        if (vkCreateDescriptorPool(g_dev, &dpi, nullptr, &g_slot[k].dpool) != VK_SUCCESS) return false;
     return true;
 }
 
@@ -1988,8 +2107,9 @@ bool init_resources()
 {
     if (!buffer_create(g_zero_ubo, UBO_PAD, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) return false;
     memset(g_zero_ubo.map, 0, UBO_PAD);
-    if (!buffer_create(g_readback_buf, (VkDeviceSize)PRESENT_MAX_W * PRESENT_MAX_H * 4,
-                       VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return false;
+    for (u32 k = 0; k < NUM_SLOTS; k++)
+        if (!buffer_create(g_slot[k].readback, (VkDeviceSize)PRESENT_MAX_W * PRESENT_MAX_H * 4,
+                           VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return false;
 
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.magFilter = si.minFilter = VK_FILTER_LINEAR;

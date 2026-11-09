@@ -207,6 +207,11 @@ static size_t s_nsyms;
 static char* s_strtab;
 static uintptr_t s_self_base;
 static uintptr_t s_self_end;   /* end of the highest function, relative */
+/* executable sections, so an address no symbol covers can still be placed
+ * (e.g. .plt stubs or hand-written assembly) */
+typedef struct { uintptr_t addr, size; char name[24]; } eu_sect;
+static eu_sect s_sects[48];
+static int s_nsects;
 
 static int eu_fsym_cmp(const void* a, const void* b)
 {
@@ -230,6 +235,21 @@ static void eu_load_symtab(void)
     sh = (Elf64_Shdr*)calloc(eh.e_shnum, sizeof *sh);
     if (!sh || fseeko(f, (off_t)eh.e_shoff, SEEK_SET) != 0 || fread(sh, sizeof *sh, eh.e_shnum, f) != eh.e_shnum)
         goto out;
+    if (eh.e_shstrndx < eh.e_shnum) {
+        const Elf64_Shdr* ss = &sh[eh.e_shstrndx];
+        char* names = (char*)malloc(ss->sh_size + 1);
+        if (names && fseeko(f, (off_t)ss->sh_offset, SEEK_SET) == 0 && fread(names, 1, ss->sh_size, f) == ss->sh_size) {
+            names[ss->sh_size] = 0;
+            for (unsigned i = 0; i < eh.e_shnum && s_nsects < 48; i++) {
+                if (!(sh[i].sh_flags & SHF_EXECINSTR) || !sh[i].sh_size || sh[i].sh_name >= ss->sh_size) continue;
+                s_sects[s_nsects].addr = sh[i].sh_addr;
+                s_sects[s_nsects].size = sh[i].sh_size;
+                snprintf(s_sects[s_nsects].name, sizeof s_sects[s_nsects].name, "%s", names + sh[i].sh_name);
+                s_nsects++;
+            }
+        }
+        free(names);
+    }
     for (unsigned i = 0; i < eh.e_shnum; i++) {
         if (sh[i].sh_type != SHT_SYMTAB || sh[i].sh_link >= eh.e_shnum) continue;
         const Elf64_Shdr* st = &sh[sh[i].sh_link];
@@ -245,8 +265,16 @@ static void eu_load_symtab(void)
         }
         s_strtab[st->sh_size] = 0;
         for (size_t k = 0; k < n; k++) {
-            if (ELF64_ST_TYPE(syms[k].st_info) != STT_FUNC || !syms[k].st_value) continue;
+            const int ty = ELF64_ST_TYPE(syms[k].st_info);
+            if ((ty != STT_FUNC && ty != STT_NOTYPE) || !syms[k].st_value) continue;
             if (syms[k].st_name >= st->sh_size) continue;
+            if (ty == STT_NOTYPE) {
+                /* assembly labels count; mapping symbols ($x/$d) and locals (.L) don't */
+                const char* nm = s_strtab + syms[k].st_name;
+                if (!nm[0] || nm[0] == '$' || nm[0] == '.') continue;
+                if (syms[k].st_shndx == SHN_UNDEF || syms[k].st_shndx >= eh.e_shnum ||
+                    !(sh[syms[k].st_shndx].sh_flags & SHF_EXECINSTR)) continue;
+            }
             s_syms[s_nsyms].addr = syms[k].st_value;
             s_syms[s_nsyms].size = syms[k].st_size;
             s_syms[s_nsyms].name = syms[k].st_name;
@@ -262,6 +290,27 @@ out:
     fclose(f);
     fprintf(stderr, "[EU bridge] symbol table: %zu functions%s\n", s_nsyms,
             s_nsyms ? "" : " (stripped -- crash/hot-spot names limited to exported symbols)");
+}
+
+/* Where an unnamed address sits: section, nearest symbol below it. */
+static void eu_place(uintptr_t pc, char* out, size_t cap)
+{
+    out[0] = 0;
+    if (pc < s_self_base) return;
+    const uintptr_t rel = pc - s_self_base;
+    const char* sect = "?";
+    for (int i = 0; i < s_nsects; i++)
+        if (rel >= s_sects[i].addr && rel < s_sects[i].addr + s_sects[i].size) { sect = s_sects[i].name; break; }
+    size_t lo = 0, hi = s_nsyms;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (s_syms[mid].addr <= rel) lo = mid + 1; else hi = mid;
+    }
+    if (lo)
+        snprintf(out, cap, "[%s, after %s+0x%lx]", sect, s_strtab + s_syms[lo - 1].name,
+                 (unsigned long)(rel - s_syms[lo - 1].addr));
+    else
+        snprintf(out, cap, "[%s]", sect);
 }
 
 /* Name of the function containing pc in this binary, or NULL. */
@@ -390,7 +439,7 @@ static void eu_prof_handler(int sig, siginfo_t* si, void* uctx)
     __atomic_store_n(&s_prof_done, 1, __ATOMIC_RELEASE);
 }
 
-typedef struct { const void* sym; const char* name; uintptr_t off; int hits; } eu_hot;
+typedef struct { const void* sym; const char* name; uintptr_t off, lr; int hits; } eu_hot;
 
 static void eu_profile_thread(int tid, const char* label)
 {
@@ -406,6 +455,7 @@ static void eu_profile_thread(int tid, const char* label)
         Dl_info di;
         memset(&di, 0, sizeof di);
         const uintptr_t pc = s_prof_pc;
+        const uintptr_t lr = s_prof_lr;
         const void* key = (const void*)pc;
         const char* name = "?";
         uintptr_t off = pc;
@@ -418,7 +468,7 @@ static void eu_profile_thread(int tid, const char* label)
         }
         int j = 0;
         while (j < nh && hot[j].sym != key) j++;
-        if (j == nh && nh < MAXSYM) { hot[nh].sym = key; hot[nh].name = name; hot[nh].off = off; hot[nh].hits = 0; nh++; }
+        if (j == nh && nh < MAXSYM) { hot[nh].sym = key; hot[nh].name = name; hot[nh].off = off; hot[nh].lr = lr; hot[nh].hits = 0; nh++; }
         if (j < nh) hot[j].hits++;
         usleep(5000);
     }
@@ -432,6 +482,19 @@ static void eu_profile_thread(int tid, const char* label)
         else o += snprintf(line + o, sizeof line - o, " %s x%d", hot[a].name, hot[a].hits);
     }
     fprintf(stderr, "%s\n", line);
+    /* unnamed hot spots: say where they are and who called in */
+    for (int a = 0; a < nh && a < 6; a++) {
+        if (!hot[a].off || hot[a].hits < 4) continue;
+        char where[160], from[160];
+        eu_place(s_self_base + hot[a].off, where, sizeof where);
+        uintptr_t lo = 0;
+        const char* caller = eu_own_symbol(hot[a].lr, &lo);
+        if (caller) snprintf(from, sizeof from, "%s+0x%lx", caller, (unsigned long)lo);
+        else snprintf(from, sizeof from, "0x%lx", (unsigned long)(hot[a].lr >= s_self_base ? hot[a].lr - s_self_base : hot[a].lr));
+        const uint32_t* ins = (const uint32_t*)(s_self_base + hot[a].off);
+        fprintf(stderr, "[hot]   libps3eu+0x%lx %s called from %s; code %08x %08x %08x %08x\n",
+                (unsigned long)hot[a].off, where, from, ins[0], ins[1], ins[2], ins[3]);
+    }
 }
 
 #define EU_MAX_THREADS 512
