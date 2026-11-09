@@ -34,14 +34,20 @@ if [[ ! -e "$ROOT/third_party/SDL2" ]]; then
   ln -s SDL2-src/include "$ROOT/third_party/SDL2"
 fi
 "$PY" "$ROOT/tools/patch_android_upstream.py" "$CHECKOUT/ps3recomp"
+# Build the actual game-specific inFAMOUSreborn title runner by default;
+# the old SDK synthetic boot harness is NOT the intended Android game port.
+# This can expose host-specific backend/ABI errors, which must be fixed,
+# not papered over by switching back to the smoke executable.
 BUILD="$PRIVATE/arm64-build"
 cmake -S "$ROOT/runtime-integration" -B "$BUILD" -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
   -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
   -DANDROID_STL=c++_shared -DCMAKE_BUILD_TYPE=Release \
-  -DINFAMOUS_PRIVATE_RECOMP="$PRIVATE/recompiled"
-cmake --build "$BUILD" --target infamous_eu_private_boot --parallel "${EU_BUILD_JOBS:-2}"
-BIN="$BUILD/libps3eu.so"
+  -DINFAMOUS_PRIVATE_RECOMP="$PRIVATE/recompiled" \
+  -DINFAMOUS_EU_UPSTREAM_TITLE=ON \
+  -DINFAMOUS_EU_SPU_DIR="$PRIVATE/spu"
+cmake --build "$BUILD" --target infamous_eu_upstream_title --parallel "${EU_BUILD_JOBS:-2}"
+BIN="$BUILD/libps3eu_title.so"
 test -s "$BIN"
 "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h "$BIN" | grep -q AArch64
 # The public App JNI library still needs its separate harmless smoke lift.
@@ -63,6 +69,8 @@ if [[ -e "$APK_LIB/libps3eu.so" ]]; then
 fi
 cleanup() { rm -f "$APK_LIB/libps3eu.so"; }
 trap cleanup EXIT
+# The UI already looks for libps3eu.so. Preserve that name while swapping
+# its implementation from the synthetic SDK harness to the upstream title.
 cp "$BIN" "$APK_LIB/libps3eu.so"
 (cd "$ROOT" && gradle --no-daemon assembleDebug)
 OUT="$PRIVATE/infamous-eu-private-boot.apk"
