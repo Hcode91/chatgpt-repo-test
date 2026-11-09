@@ -84,6 +84,12 @@ if(INFAMOUS_PRIVATE_RECOMP)
     # ps3recomp emits C++ (extern "C", inline templates) even when named .c.
     # Without this, Android NDK clang compiles the generated code as plain C.
     set_source_files_properties(${PRIVATE_PPU_SOURCES} PROPERTIES LANGUAGE CXX)
+    # Same flags as upstream infamous-recomp/CMakeLists.txt off Windows.
+    # -ffp-contract=off is a CORRECTNESS flag on arm64: clang otherwise fuses
+    # a*b+c into one fmadd, so lifted PPC float maths would round differently
+    # from the console (a PPC fmadd is emitted as an explicit fma() call).
+    set_source_files_properties(${PRIVATE_PPU_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-w;-ffp-contract=off")
     if(EXISTS "${INFAMOUS_PRIVATE_RECOMP}/ppu_hle_nids.cpp")
         set(PRIVATE_HLE_NID_TABLE "${INFAMOUS_PRIVATE_RECOMP}/ppu_hle_nids.cpp")
     else()
@@ -149,24 +155,47 @@ if(INFAMOUS_EU_UPSTREAM_TITLE)
     endforeach()
     # SPU is optional during first PPU-linked boot; the runner's missing
     # workloads are a logged blocker, not something we pretend to emulate.
+    # Mirrors upstream infamous-recomp/CMakeLists.txt (PORT_ENABLE_SPU,
+    # PORT_SPU_REGCACHE=ON): every <dir>/spu_recomp.c, its register-cached
+    # twin where present, the generated registration TUs and the musttail
+    # dispatcher. INFAMOUS_EU_SPU_DIR is the private, lock-verified
+    # <copy>/infamous-recomp/spu produced by run_upstream_pipeline.py.
     set(EU_SPU_SOURCES "")
     if(INFAMOUS_EU_SPU_DIR)
-        file(GLOB EU_SPU_SOURCES CONFIGURE_DEPENDS
-            "${INFAMOUS_EU_SPU_DIR}/*/spu_recomp.c"
-            "${INFAMOUS_EU_SPU_DIR}/*/spu_recomp_rc.c")
-        foreach(_registration IN ITEMS
-            spu_workloads.c jobmods_register.c taskset_policy_bytes.c)
-            if(EXISTS "${INFAMOUS_EU_SPU_DIR}/${_registration}")
-                list(APPEND EU_SPU_SOURCES "${INFAMOUS_EU_SPU_DIR}/${_registration}")
+        file(GLOB _eu_spu_plain CONFIGURE_DEPENDS
+            "${INFAMOUS_EU_SPU_DIR}/*/spu_recomp.c")
+        set(_eu_spu_rc "")
+        foreach(_f IN LISTS _eu_spu_plain)
+            get_filename_component(_d "${_f}" DIRECTORY)
+            if(EXISTS "${_d}/spu_recomp_rc.c")
+                list(APPEND _eu_spu_rc "${_d}/spu_recomp_rc.c")
             endif()
         endforeach()
+        set(EU_SPU_SOURCES ${_eu_spu_plain} ${_eu_spu_rc})
         if(EU_SPU_SOURCES)
+            list(LENGTH _eu_spu_plain _eu_spu_n)
+            list(LENGTH _eu_spu_rc _eu_spu_rc_n)
+            message(STATUS "European game: ${_eu_spu_n} lifted SPU image(s) + ${_eu_spu_rc_n} register-cached twin(s)")
             # The real title's many lifted SPU functions need the upstream
             # musttail indirect dispatch trampoline (not the stubbed runner).
             list(APPEND EU_SPU_SOURCES
                 "${UP_SOURCE}/runtime/spu/spu_dispatch_mt.c")
-            target_compile_definitions(ps3recomp_runtime PRIVATE
-                SPU_USE_DISPATCH_MT=1)
+            foreach(_registration IN ITEMS
+                spu_workloads.c jobmods_register.c taskset_policy_bytes.c)
+                if(EXISTS "${INFAMOUS_EU_SPU_DIR}/${_registration}")
+                    list(APPEND EU_SPU_SOURCES "${INFAMOUS_EU_SPU_DIR}/${_registration}")
+                else()
+                    message(STATUS "  (no ${_registration} -- not registered)")
+                endif()
+            endforeach()
+            # Upstream scopes these to the SPU TUs only; a target-wide define
+            # would change (and rebuild) every huge lifted PPU TU. The x86
+            # -msse4.1/-mavx2 flags have no ARM64 equivalent and are dropped;
+            # -w as upstream does for job modules keeps CI logs readable.
+            set_source_files_properties(${EU_SPU_SOURCES} PROPERTIES
+                INCLUDE_DIRECTORIES "${UP_SOURCE}/runtime/spu"
+                COMPILE_DEFINITIONS SPU_USE_DISPATCH_MT
+                COMPILE_OPTIONS "-O2;-w")
         endif()
     endif()
     add_executable(infamous_eu_upstream_title
@@ -196,10 +225,6 @@ if(INFAMOUS_EU_UPSTREAM_TITLE)
         "${UP_SOURCE}/runtime/platform"
         "${UP_SOURCE}/libs/video")
     if(EU_SPU_SOURCES)
-        target_compile_definitions(infamous_eu_upstream_title PRIVATE
-            SPU_USE_DISPATCH_MT=1)
-        target_include_directories(infamous_eu_upstream_title PRIVATE
-            "${UP_SOURCE}/runtime/spu")
         message(STATUS "European game: generated real SPU workloads enabled")
     else()
         message(WARNING "European game: no SPU workloads available; game boot cannot complete")
