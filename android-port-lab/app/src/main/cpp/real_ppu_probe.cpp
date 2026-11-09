@@ -278,6 +278,45 @@ bool import_hle(const Import& imp,CPU& c,Memory& m,std::string& event,std::strin
   return false;
 }
 
+// PS3 LV2 time services. The 80 MHz timebase follows RPCS3's
+// sys_time.cpp implementation (constant 80000000, no guest pointers).
+// sys_time_get_current_time has two big-endian signed 64-bit out pointers.
+constexpr uint64_t PS3_TIMEBASE_HZ=80000000ull;
+bool lv2_time_service(uint64_t number, CPU& c, Memory& m,
+                      std::string& event, std::string& stop) {
+  if(number==147) { // sys_time_get_timebase_frequency()
+    c.r[3]=PS3_TIMEBASE_HZ; // PPC64 ABI: 64-bit integer result in r3
+    event="[LV2 HLE] sys_time_get_timebase_frequency (147): "+
+          std::to_string(PS3_TIMEBASE_HZ)+" Hz";
+    return true;
+  }
+  if(number==145) { // sys_time_get_current_time(s64* sec, s64* nsec)
+    const uint64_t secAddr=c.r[3], nsecAddr=c.r[4];
+    if(!secAddr || !nsecAddr || (secAddr&7) || (nsecAddr&7) ||
+       !inrange(secAddr,8,LIMIT) || !inrange(nsecAddr,8,LIMIT)) {
+      stop="sys_time_get_current_time: invalid 64-bit guest output pointer "
+           "sec="+hx(secAddr)+" nsec="+hx(nsecAddr);
+      return false;
+    }
+    // Real Unix wall-clock time rather than monotonic process uptime.
+    const auto now=std::chrono::system_clock::now().time_since_epoch();
+    const auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+    int64_t sec=ns/1000000000ll;
+    int64_t nsec=ns%1000000000ll;
+    if(nsec<0){--sec;nsec+=1000000000ll;}
+    if(!m.put(secAddr,8,uint64_t(sec)) || !m.put(nsecAddr,8,uint64_t(nsec))) {
+      stop="sys_time_get_current_time: failed guest write";
+      return false;
+    }
+    c.writes+=2;
+    c.r[3]=0; // CELL_OK
+    event="[LV2 HLE] sys_time_get_current_time (145): sec="+
+          std::to_string(sec)+", nsec="+std::to_string(nsec);
+    return true;
+  }
+  return false;
+}
+
 void crcmp(CPU& c,unsigned field,uint64_t a,uint64_t b,bool uns=false) {
   int v=uns?(a<b?8:a>b?4:2):(int64_t(a)<int64_t(b)?8:int64_t(a)>int64_t(b)?4:2);
   unsigned sh=28-((field&7)*4);c.cr=(c.cr&~(0xfu<<sh))|(uint32_t(v)<<sh);
@@ -500,6 +539,13 @@ std::string run(const uint8_t* file,size_t n) {
           o<<"[LV2 HLE] sys_memory_get_user_memory_size (352): modeled PS3 user memory total="
            <<hx(modeledTotal)<<", available="<<hx(modeledAvailable)
            <<", destination="<<hx(info)<<"\n";
+      } else if(c.r[11]==147 || c.r[11]==145) {
+        std::string event;
+        if(!lv2_time_service(c.r[11],c,m,event,stop)) {
+          ok=false;break;
+        }
+        ++lv2Calls;
+        if(lv2Calls<16) o<<event<<"\n";
       } else {
         stop="PS3 LV2 syscall "+std::to_string(c.r[11])+
           " not implemented at guest PC "+hx(here)+
@@ -590,9 +636,52 @@ int test_time_hle() {
     (unsigned long long)(cpu.r[3]-first));
   return 0;
 }
+int test_lv2_time_services() {
+  realppu::Memory m;
+  realppu::CPU c;
+  const uint64_t savedWrites=c.writes;
+  const uint64_t prevR4=0xFFFF;
+  c.r[3]=0x9edcc0;
+  c.r[4]=prevR4;
+  std::string event, stop;
+  if(!realppu::lv2_time_service(147,c,m,event,stop) ||
+     c.r[3]!=realppu::PS3_TIMEBASE_HZ || c.r[4]!=prevR4 ||
+     c.writes!=savedWrites || event.find("80000000 Hz")==std::string::npos) {
+    std::fprintf(stderr,"timebase frequency syscall failed: %s\n",stop.c_str());
+    return 1;
+  }
+  // Current time: verify both 8-byte big-endian PS3 guest outputs are
+  // populated, nanoseconds stay within [0, 1e9), and r3 reports CELL_OK.
+  c.r[3]=0x10000;
+  c.r[4]=0x10008;
+  if(!realppu::lv2_time_service(145,c,m,event,stop) ||
+     c.r[3]!=0 || c.writes!=2) {
+    std::fprintf(stderr,"current time syscall failed: %s\n",stop.c_str());
+    return 1;
+  }
+  uint64_t sec=0,nsec=0;
+  if(!m.get(0x10000,8,sec)||!m.get(0x10008,8,nsec) ||
+     sec<1700000000ULL || nsec>=1000000000ULL) {
+    std::fputs("current time guest memory format invalid\n",stderr);
+    return 1;
+  }
+  c.r[3]=realppu::LIMIT-4;
+  c.r[4]=0x10008;
+  if(realppu::lv2_time_service(145,c,m,event,stop) ||
+     stop.find("invalid 64-bit guest output pointer")==std::string::npos) {
+    std::fputs("time syscall must reject invalid guest pointers\n",stderr);
+    return 1;
+  }
+  std::printf("LV2_TIME_SERVICES_PASS: 147=%llu Hz, 145 returned sec=%llu/nsec=%llu\n",
+    (unsigned long long)realppu::PS3_TIMEBASE_HZ,
+    (unsigned long long)sec,(unsigned long long)nsec);
+  return 0;
+}
 int main(int argc,char** argv){
   if (argc==2 && std::string(argv[1])=="--test-time-hle")
     return test_time_hle();
+  if (argc==2 && std::string(argv[1])=="--test-lv2-time")
+    return test_lv2_time_services();
   if(argc!=2)return 2;
   std::ifstream in(argv[1],std::ios::binary);
   if(!in)return 2;
