@@ -138,6 +138,26 @@ jobs:
           echo "PRIVATE_GAME_TARGET_LINK_CHECK=PASS (SYNTHETIC ONLY)"
           # Never package this synthetic alternate as the user's real game.
           ! test -e android-port-lab/app/src/main/jniLibs/arm64-v8a/libps3eu.so
+      - name: Probe actual inFAMOUSreborn title runner on Android ARM64 (synthetic functions only)
+        id: title-runner-probe
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -eo pipefail
+          # Public build never receives the copyrighted game ELF or lifted code.
+          # This probes REAL inFAMOUSreborn main.cpp/stubs.cpp/trainer.cpp
+          # against synthetic function-table interfaces to expose ARM64 errors.
+          mkdir -p android-port-lab/build/integrated-logs
+          cmake -S android-port-lab/runtime-integration \
+            -B android-port-lab/build/integrated \
+            -DINFAMOUS_PRIVATE_RECOMP="$PWD/android-port-lab/generated" \
+            -DINFAMOUS_EU_UPSTREAM_TITLE=ON \
+            -DINFAMOUS_EU_SPU_DIR="" \
+            2>&1 | tee android-port-lab/build/integrated-logs/eu-title-configure.log
+          cmake --build android-port-lab/build/integrated \
+            --target infamous_eu_upstream_title --parallel 3 \
+            2>&1 | tee android-port-lab/build/integrated-logs/eu-title-compile.log
+          echo "UPSTREAM_TITLE_RUNNER_ARM64_SYNTHETIC_PROBE=PASS"
       - name: Package actual upstream Android ARM64 boot executable and test ELF
         run: |
           set -e
