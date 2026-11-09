@@ -14,7 +14,12 @@ test -f "$CHECKOUT/installer/infamous.toml" || {
   echo "ERROR: clone inFAMOUSreborn into $CHECKOUT (or set EU_UPSTREAM)" >&2; exit 2;
 }
 test -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
-python3 "$ROOT/tools/prepare_eu_game_lift.py" \
+mkdir -p "$PRIVATE"
+python3 -m venv "$PRIVATE/.venv"
+PY="$PRIVATE/.venv/bin/python"
+"$PY" -m pip install --disable-pip-version-check \
+  -r "$CHECKOUT/ps3recomp/requirements.txt"
+"$PY" "$ROOT/tools/prepare_eu_game_lift.py" \
   --elf "$EU_ELF" --checkout "$CHECKOUT" \
   --private-out "$PRIVATE" --jobs "${EU_PPU_JOBS:-2}"
 test -f "$ROOT/third_party/SDL2-src/CMakeLists.txt" || {
@@ -28,7 +33,7 @@ test -f "$ROOT/third_party/libucontext/arch/aarch64/getcontext.S" || {
 if [[ ! -e "$ROOT/third_party/SDL2" ]]; then
   ln -s SDL2-src/include "$ROOT/third_party/SDL2"
 fi
-python3 "$ROOT/tools/patch_android_upstream.py" "$CHECKOUT/ps3recomp"
+"$PY" "$ROOT/tools/patch_android_upstream.py" "$CHECKOUT/ps3recomp"
 BUILD="$PRIVATE/arm64-build"
 cmake -S "$ROOT/runtime-integration" -B "$BUILD" -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
@@ -42,8 +47,8 @@ test -s "$BIN"
 # The public App JNI library still needs its separate harmless smoke lift.
 # That smoke code is not used by the REAL European boot executable.
 mkdir -p "$ROOT/generated" "$ROOT/app/src/main/assets"
-python3 "$ROOT/tools/generate_ppu_smoke.py" --out "$ROOT/generated"
-python3 "$CHECKOUT/ps3recomp/tools/ppu_lifter.py" \
+"$PY" "$ROOT/tools/generate_ppu_smoke.py" --out "$ROOT/generated"
+"$PY" "$CHECKOUT/ps3recomp/tools/ppu_lifter.py" \
   "$ROOT/generated/smoke.elf" --functions "$ROOT/generated/functions.json" \
   --output "$ROOT/generated" --jobs 1 --single-file
 cp "$ROOT/generated/smoke.elf" "$ROOT/app/src/main/assets/smoke.elf"
