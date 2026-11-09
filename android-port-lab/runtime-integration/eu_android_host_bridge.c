@@ -46,6 +46,12 @@ EU_WEAK int (*volatile g_uiov_paused_fn)(void) = 0;
 EU_WEAK volatile int g_uiov_request = 0;
 EU_WEAK volatile unsigned long long g_pause_menu_built_ms = 0;
 
+/* Draw-distance scaling toggle read by the lifted LOD job module (upstream
+ * lodx_v231.h / lodx_v233.h). Upstream defines it in the Windows D3D12
+ * backend, flipped by F5; its default 0 = upstream's improved draw distance
+ * ON. Same default here until an Android renderer owns the toggle. */
+EU_WEAK volatile int g_lodx_f5_off = 0;
+
 /* cellGcmSys.c calls this to notice that guest FIFO/semaphore data may have
  * changed. This bridge only establishes a conservative cross-thread memory
  * ordering edge, NOT the full RSX write-watch invalidation scheme. The
