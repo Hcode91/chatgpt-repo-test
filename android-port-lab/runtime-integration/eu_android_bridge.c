@@ -15,7 +15,9 @@
  *   8  u32 pad_seq               40 u32 frame_h
  *  12  u32 pad_connected         44 u32 frames_published
  *  16  u32 buttons (CELL_PAD_CTRL_*)  48 u32 runner_alive
- *  20  u8  lx ly rx ry l2 r2     64 pixels, RGBA8888 rows (max 1280x720)
+ *  20  u8  lx ly rx ry l2 r2     52 u32 capture_req  (app bumps it: capture a frame)
+ *                                56 u32 capture_done (runner: last capture written)
+ *                                64 pixels, RGBA8888 rows (max 1280x720)
  *
  * Contains no game code. Everything here is a no-op when the variable is unset.
  */
@@ -44,6 +46,7 @@ typedef struct {
     _Atomic uint8_t axes[6];
     uint8_t _pad0[6];
     _Atomic uint32_t frame_seq, frame_w, frame_h, frames_published, runner_alive;
+    _Atomic uint32_t capture_req, capture_done;
 } eu_bridge_hdr;
 
 #include <stddef.h>
@@ -51,6 +54,8 @@ _Static_assert(offsetof(eu_bridge_hdr, buttons) == 16, "layout");
 _Static_assert(offsetof(eu_bridge_hdr, axes) == 20, "layout");
 _Static_assert(offsetof(eu_bridge_hdr, frame_seq) == 32, "layout");
 _Static_assert(offsetof(eu_bridge_hdr, runner_alive) == 48, "layout");
+_Static_assert(offsetof(eu_bridge_hdr, capture_req) == 52, "layout");
+_Static_assert(offsetof(eu_bridge_hdr, capture_done) == 56, "layout");
 _Static_assert(sizeof(eu_bridge_hdr) <= 64, "bridge header must fit in 64 bytes");
 
 static uint8_t* s_map;
@@ -95,6 +100,23 @@ static eu_bridge_hdr* bridge(void)
     atomic_store(&h->runner_alive, 1u);
     fprintf(stderr, "[EU bridge] mapped %s: Android screen + controller channel ready\n", path);
     return h;
+}
+
+/* Frame-capture request from the app's CAP button: returns the request number
+ * when one is outstanding, else 0. The renderer calls eu_bridge_capture_done(n)
+ * after writing the files. */
+unsigned eu_bridge_capture_pending(void)
+{
+    eu_bridge_hdr* b = bridge();
+    if (!b) return 0;
+    const uint32_t req = atomic_load_explicit(&b->capture_req, memory_order_acquire);
+    return req != atomic_load_explicit(&b->capture_done, memory_order_relaxed) ? req : 0u;
+}
+
+void eu_bridge_capture_done(unsigned n)
+{
+    eu_bridge_hdr* b = bridge();
+    if (b) atomic_store_explicit(&b->capture_done, n, memory_order_release);
 }
 
 /* Called by cellPad (weak reference) on every host poll. Returns 1 and fills
@@ -439,7 +461,14 @@ static void eu_prof_handler(int sig, siginfo_t* si, void* uctx)
     __atomic_store_n(&s_prof_done, 1, __ATOMIC_RELEASE);
 }
 
-typedef struct { const void* sym; const char* name; uintptr_t off, lr; int hits; } eu_hot;
+typedef struct { const void* sym; const char* name; const char* mod; uintptr_t off, lr; int hits; } eu_hot;
+
+static const char* eu_basename(const char* p)
+{
+    if (!p) return "?";
+    const char* f = strrchr(p, '/');
+    return f ? f + 1 : p;
+}
 
 static void eu_profile_thread(int tid, const char* label)
 {
@@ -458,17 +487,22 @@ static void eu_profile_thread(int tid, const char* label)
         const uintptr_t lr = s_prof_lr;
         const void* key = (const void*)pc;
         const char* name = "?";
+        const char* mod = "?";
         uintptr_t off = pc;
         uintptr_t own_off = 0;
         const char* own = eu_own_symbol(pc, &own_off);
         if (own) { key = (const void*)(pc - own_off); name = own; off = 0; }
         else if (dladdr((void*)pc, &di)) {
             if (di.dli_sname) { key = di.dli_saddr; name = di.dli_sname; off = 0; }
-            else if (di.dli_fbase) { key = (const void*)(pc & ~(uintptr_t)0xFFF); off = pc - (uintptr_t)di.dli_fbase; }
+            else if (di.dli_fbase) {
+                key = (const void*)(pc & ~(uintptr_t)0xFFF);
+                off = pc - (uintptr_t)di.dli_fbase;
+                mod = eu_basename(di.dli_fname);
+            }
         }
         int j = 0;
         while (j < nh && hot[j].sym != key) j++;
-        if (j == nh && nh < MAXSYM) { hot[nh].sym = key; hot[nh].name = name; hot[nh].off = off; hot[nh].lr = lr; hot[nh].hits = 0; nh++; }
+        if (j == nh && nh < MAXSYM) { hot[nh].sym = key; hot[nh].name = name; hot[nh].off = off; hot[nh].mod = mod; hot[nh].lr = lr; hot[nh].hits = 0; nh++; }
         if (j < nh) hot[j].hits++;
         usleep(5000);
     }
@@ -478,22 +512,29 @@ static void eu_profile_thread(int tid, const char* label)
     char line[1024];
     int o = snprintf(line, sizeof line, "[hot] %s tid %d (%d samples):", label, tid, taken);
     for (int a = 0; a < nh && a < 6 && o < (int)sizeof line - 96; a++) {
-        if (hot[a].off) o += snprintf(line + o, sizeof line - o, " libps3eu+0x%lx x%d", (unsigned long)hot[a].off, hot[a].hits);
+        if (hot[a].off) o += snprintf(line + o, sizeof line - o, " %s+0x%lx x%d", hot[a].mod, (unsigned long)hot[a].off, hot[a].hits);
         else o += snprintf(line + o, sizeof line - o, " %s x%d", hot[a].name, hot[a].hits);
     }
     fprintf(stderr, "%s\n", line);
-    /* unnamed hot spots: say where they are and who called in */
+    /* unnamed hot spots: which library, and who called in */
     for (int a = 0; a < nh && a < 6; a++) {
         if (!hot[a].off || hot[a].hits < 4) continue;
-        char where[160], from[160];
-        eu_place(s_self_base + hot[a].off, where, sizeof where);
+        char where[160] = "", from[200];
+        Dl_info pi;
+        memset(&pi, 0, sizeof pi);
+        const uintptr_t pc = (uintptr_t)hot[a].sym;   /* page of the first sample */
+        if (dladdr((void*)pc, &pi) && pi.dli_fbase == (void*)s_self_base) eu_place(s_self_base + hot[a].off, where, sizeof where);
         uintptr_t lo = 0;
         const char* caller = eu_own_symbol(hot[a].lr, &lo);
+        Dl_info li;
+        memset(&li, 0, sizeof li);
         if (caller) snprintf(from, sizeof from, "%s+0x%lx", caller, (unsigned long)lo);
-        else snprintf(from, sizeof from, "0x%lx", (unsigned long)(hot[a].lr >= s_self_base ? hot[a].lr - s_self_base : hot[a].lr));
-        const uint32_t* ins = (const uint32_t*)(s_self_base + hot[a].off);
-        fprintf(stderr, "[hot]   libps3eu+0x%lx %s called from %s; code %08x %08x %08x %08x\n",
-                (unsigned long)hot[a].off, where, from, ins[0], ins[1], ins[2], ins[3]);
+        else if (hot[a].lr && dladdr((void*)hot[a].lr, &li) && li.dli_fbase)
+            snprintf(from, sizeof from, "%s+0x%lx (%s)", eu_basename(li.dli_fname),
+                     (unsigned long)(hot[a].lr - (uintptr_t)li.dli_fbase), li.dli_sname ? li.dli_sname : "no symbol");
+        else snprintf(from, sizeof from, "0x%lx (no module)", (unsigned long)hot[a].lr);
+        fprintf(stderr, "[hot]   %s+0x%lx%s%s called from %s\n", hot[a].mod, (unsigned long)hot[a].off,
+                where[0] ? " " : "", where, from);
     }
 }
 

@@ -264,7 +264,7 @@ if(INFAMOUS_EU_UPSTREAM_TITLE)
             INCLUDE_DIRECTORIES "${EU_GLSLANG_DIR}"
             COMPILE_OPTIONS "-std=c++17")
         target_link_libraries(infamous_eu_upstream_title PRIVATE
-            glslang glslang-default-resource-limits dl)
+            glslang glslang-default-resource-limits dl z)
         if(TARGET SPIRV)
             target_link_libraries(infamous_eu_upstream_title PRIVATE SPIRV)
         endif()
