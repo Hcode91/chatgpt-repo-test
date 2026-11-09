@@ -200,7 +200,7 @@ if(INFAMOUS_EU_UPSTREAM_TITLE)
             set_source_files_properties(${EU_SPU_SOURCES} PROPERTIES
                 INCLUDE_DIRECTORIES "${UP_SOURCE}/runtime/spu"
                 COMPILE_DEFINITIONS SPU_USE_DISPATCH_MT
-                COMPILE_OPTIONS "-O2;-w;-include;${UP_SOURCE}/runtime/platform/win32_compat.h")
+                COMPILE_OPTIONS "-O2;-w;-ferror-limit=0;-include;${UP_SOURCE}/runtime/platform/win32_compat.h")
         endif()
     endif()
     add_executable(infamous_eu_upstream_title
