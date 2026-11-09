@@ -77,15 +77,21 @@ public final class EuBootActivity extends Activity {
             "Game ELF loaded into guest memory",
             "Game filesystem root set (VFS)",
             "Recompiled PPU functions, HLE and syscalls registered; guest entry dispatched",
-            "RSX backend initialised (CPU software preview, not a GPU renderer)",
+            "RSX renderer initialised",
             "Game created guest threads",
             "Game opened a file from its data folder",
             "Guest submitted a display flip",
             "First guest frame sent to the Android screen (software preview)",
             "Android controller connected to the game (port 0)",
+            "A button press reached the game",
+    };
+    private static final String[] RENDERERS = {
+            "Vulkan GPU renderer (falls back to software if unavailable)",
+            "Software preview (CPU, no shaders)",
+            "Software, no triangle drawing (speed test)",
     };
     private static final int M_PROC = 0, M_MAIN = 1, M_MEM = 2, M_ELF = 3, M_VFS = 4,
-            M_ENTRY = 5, M_RSX = 6, M_THREADS = 7, M_FILES = 8, M_FLIP = 9, M_SCREEN = 10, M_PAD = 11;
+            M_ENTRY = 5, M_RSX = 6, M_THREADS = 7, M_FILES = 8, M_FLIP = 9, M_SCREEN = 10, M_PAD = 11, M_PRESS = 12;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final Object lock = new Object();
@@ -101,6 +107,8 @@ public final class EuBootActivity extends Activity {
     private TextView buildInfo, elfStatus, dataStatus, milestones, logView, runState;
     private EditText pathEdit;
     private CheckBox verbose, upstreamEnv, lean, lowCpu, openScreen;
+    private Button rendererButton;
+    private int renderer;
     private Button bootButton, stopButton;
     private volatile Process child;
     private File logFile;
@@ -190,6 +198,15 @@ public final class EuBootActivity extends Activity {
         openScreen.setTextColor(Color.WHITE);
         openScreen.setChecked(true);
         root.addView(openScreen);
+        renderer = prefs.getInt("renderer", 0);
+        rendererButton = button("");
+        rendererButton.setOnClickListener(v -> {
+            renderer = (renderer + 1) % RENDERERS.length;
+            prefs.edit().putInt("renderer", renderer).apply();
+            rendererButton.setText("Renderer: " + RENDERERS[renderer] + "  (tap to change)");
+        });
+        rendererButton.setText("Renderer: " + RENDERERS[renderer] + "  (tap to change)");
+        root.addView(rendererButton);
         bootButton = button("BOOT inFAMOUS");
         bootButton.setOnClickListener(v -> startBoot());
         root.addView(bootButton);
@@ -579,6 +596,12 @@ public final class EuBootActivity extends Activity {
         // inFamous' immediate-mode movie quad carries its UVs in attribute 1
         // (upstream rsx_null_backend.c note) -- for the software preview.
         env.put("NULLSW_UVATTR", "1");
+        env.put("EU_RSX", renderer == 0 ? "vulkan" : "soft");
+        if (renderer == 2) env.put("EU_SOFT_DRAW", "0");
+        else env.remove("EU_SOFT_DRAW");
+        header.append("# renderer: ").append(RENDERERS[renderer]).append('\n');
+        EuBridge.rendererLabel = renderer == 0 ? "Starting renderer…"
+                : renderer == 1 ? "Software preview (CPU, no shaders)" : "Speed test: drawing off";
         header.append("# lean=").append(lean.isChecked()).append(" low_cpu=")
                 .append(lowCpu.isChecked()).append('\n');
         try {
@@ -749,7 +772,7 @@ public final class EuBootActivity extends Activity {
         } else if (l.startsWith("[boot] VFS root:")) mark(M_VFS, 1, l);
         else if (l.startsWith("[boot] dispatching entry OPD")) mark(M_ENTRY, 1, l);
         else if (l.startsWith("[rsx] ") && l.contains("backend init")) {
-            mark(M_RSX, l.contains("FAILED") ? -1 : 1, l);
+            if (state[M_RSX] == 0 || l.contains("FAILED")) mark(M_RSX, l.contains("FAILED") ? -1 : 1, l);
         } else if (l.startsWith("[SYS] sys_ppu_thread_create")) {
             threads++;
             mark(M_THREADS, 1, threads + " thread(s); latest: " + l);
@@ -761,6 +784,14 @@ public final class EuBootActivity extends Activity {
                 filesOk++;
                 mark(M_FILES, 1, filesOk + " file(s) opened; latest: " + l);
             }
+        } else if (l.startsWith("[RSX vulkan] GPU renderer active")) {
+            mark(M_RSX, 1, l);
+            EuBridge.rendererLabel = "Vulkan GPU renderer";
+        } else if (l.startsWith("[RSX vulkan] ") && l.contains("using the CPU software preview")) {
+            mark(M_RSX, 1, "Vulkan unavailable, software fallback: " + l);
+            EuBridge.rendererLabel = "Software preview (Vulkan unavailable)";
+        } else if (l.startsWith("[EU bridge] pad buttons 0x") && !l.endsWith("0x0000")) {
+            mark(M_PRESS, 1, l);
         } else if (l.startsWith("[EU bridge] first frame published")) {
             mark(M_SCREEN, 1, l);
         } else if (l.startsWith("[EU bridge] Android controller connected")) {

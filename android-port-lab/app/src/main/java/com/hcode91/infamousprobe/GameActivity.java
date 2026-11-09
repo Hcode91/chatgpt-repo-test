@@ -20,7 +20,7 @@ import android.view.WindowManager;
  * Game screen: shows the frames the runner publishes through EuBridge and sends
  * controller state back. Input: on-screen controls (multi-touch) and any
  * Bluetooth/USB gamepad. The picture comes from whatever RSX backend the runner
- * uses -- in this build upstream's CPU software preview, not a real renderer.
+ * uses: the Vulkan GPU renderer, or upstream's CPU software preview.
  */
 public final class GameActivity extends Activity implements Choreographer.FrameCallback {
     private GameView view;
@@ -310,7 +310,7 @@ public final class GameActivity extends Activity implements Choreographer.FrameC
             text.setTextSize(h / 34f);
             text.setColor(Color.argb(170, 255, 255, 255));
             text.setTextAlign(Paint.Align.LEFT);
-            canvas.drawText("Software preview (CPU, no shaders) · frames "
+            canvas.drawText(EuBridge.rendererLabel + " · frames "
                     + (b == null ? 0 : b.framesPublished())
                     + (padSeen ? " · gamepad" : ""), h / 40f, h - h / 40f, text);
             text.setTextAlign(Paint.Align.CENTER);

@@ -111,6 +111,13 @@ int eu_bridge_pad(unsigned* buttons, unsigned char axes[6])
         said = 1;
         fprintf(stderr, "[EU bridge] Android controller connected on pad port 0\n");
     }
+    /* Log button changes (bounded) so a boot log shows that input arrived. */
+    static unsigned last, logged;
+    if (*buttons != last && logged < 200) {
+        logged++;
+        fprintf(stderr, "[EU bridge] pad buttons 0x%04X\n", *buttons);
+    }
+    last = *buttons;
     return 1;
 }
 
@@ -119,6 +126,29 @@ static uint64_t now_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* Publish rows that are already R,G,B,A bytes (the Vulkan renderer's readback). */
+void eu_bridge_frame_rgba(const uint8_t* rgba, unsigned w, unsigned h, unsigned pitch)
+{
+    eu_bridge_hdr* b = bridge();
+    if (!b || !rgba || w == 0 || h == 0 || w > EU_BRIDGE_MAX_W || h > EU_BRIDGE_MAX_H) return;
+    uint32_t seq = atomic_load_explicit(&b->frame_seq, memory_order_relaxed);
+    atomic_store_explicit(&b->frame_seq, seq + 1u, memory_order_release);
+    atomic_thread_fence(memory_order_seq_cst);
+    uint8_t* dst = s_map + EU_BRIDGE_HDR;
+    for (unsigned y = 0; y < h; y++) {
+        uint8_t* row = dst + (size_t)y * w * 4u;
+        memcpy(row, rgba + (size_t)y * pitch, (size_t)w * 4u);
+        for (unsigned x = 0; x < w; x++) row[x * 4u + 3u] = 0xFF;   /* opaque on screen */
+    }
+    atomic_store_explicit(&b->frame_w, w, memory_order_relaxed);
+    atomic_store_explicit(&b->frame_h, h, memory_order_relaxed);
+    atomic_thread_fence(memory_order_seq_cst);
+    atomic_store_explicit(&b->frame_seq, seq + 2u, memory_order_release);
+    uint32_t n_pub = atomic_fetch_add(&b->frames_published, 1u) + 1u;
+    if (n_pub == 1)
+        fprintf(stderr, "[EU bridge] first frame published to the Android screen (%ux%u, GPU)\n", w, h);
 }
 
 /* Called by the RSX backend on each present. fb holds 0x00RRGGBB pixels.

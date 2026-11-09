@@ -415,4 +415,49 @@ change("libs/video/rsx_null_backend.c",
 #if defined(__ANDROID__)
     if (eu_bridge_frame) eu_bridge_frame(s_soft.fb, s_soft.width, s_soft.height);
 #endif''')
+# Android GPU renderer (runtime-integration/eu_vk_backend.cpp): tried first;
+# any failure falls back to the CPU software preview below. EU_SOFT_DRAW=0
+# keeps the preview's clears but skips its triangle filling (speed test).
+change("libs/video/rsx_null_backend.c",
+'''#if defined(__ANDROID__)
+extern void eu_bridge_frame(const unsigned int* fb, unsigned w, unsigned h) __attribute__((weak));
+#endif''',
+'''#if defined(__ANDROID__)
+extern void eu_bridge_frame(const unsigned int* fb, unsigned w, unsigned h) __attribute__((weak));
+extern int  eu_vk_rsx_init(unsigned w, unsigned h) __attribute__((weak));
+extern int  eu_vk_rsx_active(void) __attribute__((weak));
+extern void rsx_draw_engine_present(void);
+#endif''')
+change("libs/video/rsx_null_backend.c",
+'''static void draw_prim(u32 prim, u32 first, u32 count)
+{
+    const rsx_state* st = s_soft.state;''',
+'''static void draw_prim(u32 prim, u32 first, u32 count)
+{
+#if defined(__ANDROID__)
+    { static int s_draw = -1;
+      if (s_draw < 0) { const char* e = getenv("EU_SOFT_DRAW"); s_draw = !(e && *e == '0');
+                        if (!s_draw) fprintf(stderr, "[RSX null] EU_SOFT_DRAW=0: triangle filling OFF (speed test)\\n"); }
+      if (!s_draw) return; }
+#endif
+    const rsx_state* st = s_soft.state;''')
+change("libs/video/rsx_null_backend.c",
+'''int rsx_null_backend_init(u32 width, u32 height, const char* title)
+{
+    memset(&s_soft, 0, sizeof(s_soft));''',
+'''int rsx_null_backend_init(u32 width, u32 height, const char* title)
+{
+#if defined(__ANDROID__)
+    if (eu_vk_rsx_init && eu_vk_rsx_init(width ? width : 1280, height ? height : 720) == 0) return 0;
+#endif
+    memset(&s_soft, 0, sizeof(s_soft));''')
+change("libs/video/rsx_null_backend.c",
+'''void rsx_null_backend_present(void) { nullsw_present(NULL, 0); }''',
+'''void rsx_null_backend_present(void)
+{
+#if defined(__ANDROID__)
+    if (eu_vk_rsx_active && eu_vk_rsx_active()) { rsx_draw_engine_present(); return; }
+#endif
+    nullsw_present(NULL, 0);
+}''')
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
