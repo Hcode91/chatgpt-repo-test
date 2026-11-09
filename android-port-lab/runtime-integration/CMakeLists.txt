@@ -192,10 +192,15 @@ if(INFAMOUS_EU_UPSTREAM_TITLE)
             # would change (and rebuild) every huge lifted PPU TU. The x86
             # -msse4.1/-mavx2 flags have no ARM64 equivalent and are dropped;
             # -w as upstream does for job modules keeps CI logs readable.
+            # The lifted WWS plugin code (and upstream patches to it) calls
+            # Win32 helpers -- Interlocked*, GetTickCount64 -- that upstream's
+            # MSVC/clang-cl build gets from <windows.h>. Off Windows, the
+            # runtime's own win32_compat.h provides them (C11 _Generic in C),
+            # exactly as it already does for the title's main.cpp.
             set_source_files_properties(${EU_SPU_SOURCES} PROPERTIES
                 INCLUDE_DIRECTORIES "${UP_SOURCE}/runtime/spu"
                 COMPILE_DEFINITIONS SPU_USE_DISPATCH_MT
-                COMPILE_OPTIONS "-O2;-w")
+                COMPILE_OPTIONS "-O2;-w;-include;${UP_SOURCE}/runtime/platform/win32_compat.h")
         endif()
     endif()
     add_executable(infamous_eu_upstream_title
