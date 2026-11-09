@@ -22,6 +22,17 @@ PY="$PRIVATE/.venv/bin/python"
 "$PY" "$ROOT/tools/prepare_eu_game_lift.py" \
   --elf "$EU_ELF" --checkout "$CHECKOUT" \
   --private-out "$PRIVATE" --jobs "${EU_PPU_JOBS:-2}"
+# Generate real inFAMOUS SPU workloads (8 embedded images + WWS policy)
+# and, when the owner has the full extracted USRDIR, 21 game job modules.
+# No generated game code or binaries leave this private directory.
+SPU_ARGS=()
+if [[ -n "${EU_USRDIR:-}" ]]; then
+  test -d "$EU_USRDIR" || { echo "EU_USRDIR is not a directory" >&2; exit 2; }
+  SPU_ARGS=(--usrdir "$EU_USRDIR")
+fi
+"$PY" "$ROOT/tools/prepare_eu_spu_lift.py" \
+  --elf "$EU_ELF" --checkout "$CHECKOUT" \
+  --private-out "$PRIVATE" "${SPU_ARGS[@]}"
 test -f "$ROOT/third_party/SDL2-src/CMakeLists.txt" || {
   echo "ERROR: checkout SDL2 source, see README_EU_PRIVATE_BOOT.md" >&2; exit 2;
 }
