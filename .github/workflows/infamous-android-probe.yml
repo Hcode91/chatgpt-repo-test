@@ -30,6 +30,14 @@ jobs:
           test -x "$SDKMANAGER"
           yes | "$SDKMANAGER" --licenses > /dev/null || true
           "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+      - name: Check private EU PPU/SPU build scripts without game files
+        run: |
+          python3 -m py_compile \
+            android-port-lab/tools/prepare_eu_game_lift.py \
+            android-port-lab/tools/prepare_eu_spu_lift.py
+          bash -n android-port-lab/tools/build_private_eu_apk.sh
+          # No user EBOOT and no game-derived code enters public CI.
+          ! test -e android-port-lab/app/src/main/jniLibs/arm64-v8a/libps3eu.so
       - name: Checkout official game port source (no proprietary game files)
         run: git clone --depth 1 https://github.com/whompay/inFAMOUSreborn.git android-port-lab/upstream
       - name: Fetch SDL2 headers for Android input and audio compatibility
