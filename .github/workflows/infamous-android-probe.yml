@@ -78,6 +78,16 @@ jobs:
             -o /tmp/ppu-elf-smoke
           /tmp/ppu-elf-smoke android-port-lab/generated/smoke.elf
           /tmp/ppu-elf-smoke android-port-lab/generated/smoke.elf --reject-mutated
+      - name: Verify direct European PPU engine without bundling the game
+        run: |
+          # Synthetic ELF only: real EU ELF remains entirely on user's phone.
+          c++ -std=c++17 -O2 -Wall -Wextra -DREAL_PPU_PROBE_HOST \
+            android-port-lab/app/src/main/cpp/real_ppu_probe.cpp \
+            -o /tmp/infamous-eu-ppu-engine
+          /tmp/infamous-eu-ppu-engine android-port-lab/generated/smoke.elf \
+            | tee /tmp/infamous-eu-engine.log
+          grep -q "REAL PS3 EBOOT STARTUP TRACE" /tmp/infamous-eu-engine.log
+          ! grep -q "Status: GAME BOOT SUCCESS" /tmp/infamous-eu-engine.log
       - name: Cross-compile upstream PPU, LV2, SPU, RSX, input and audio for Android ARM64
         run: |
           python3 android-port-lab/tools/audit_runtime_android.py \
