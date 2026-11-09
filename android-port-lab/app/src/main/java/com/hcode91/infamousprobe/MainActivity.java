@@ -18,6 +18,7 @@ import java.util.Locale;
 public final class MainActivity extends Activity {
     private static final int PICK_EXECUTABLE = 101;
     private static final int PICK_REAL_PPU = 102;
+    private static final int PICK_FIRMWARE = 103;
     private TextView output;
     private String startup;
     private int testRunCount = 0;
@@ -121,6 +122,16 @@ public final class MainActivity extends Activity {
             choose.setType("*/*");
             choose.addCategory(Intent.CATEGORY_OPENABLE);
             startActivityForResult(choose, PICK_REAL_PPU);
+        });
+
+        Button firmware = new Button(this);
+        firmware.setText("INSPECT MY PS3UPDAT.PUP FIRMWARE (LOCAL)");
+        root.addView(firmware);
+        firmware.setOnClickListener(v -> {
+            Intent chooser = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            chooser.setType("*/*");
+            chooser.addCategory(Intent.CATEGORY_OPENABLE);
+            startActivityForResult(chooser, PICK_FIRMWARE);
         });
 
         output = new TextView(this);
@@ -242,6 +253,10 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == PICK_FIRMWARE && resultCode == RESULT_OK && data != null && data.getData() != null) {
+            inspectFirmware(data.getData());
+            return;
+        }
         if (requestCode == PICK_REAL_PPU && resultCode == RESULT_OK && data != null && data.getData() != null) {
             runRealPpuTrace(data.getData());
             return;
@@ -275,6 +290,21 @@ public final class MainActivity extends Activity {
         } catch (IOException e) {
             output.setText(startup + "\n\nFile error: " + e.getMessage());
         }
+    }
+
+    private void inspectFirmware(Uri uri) {
+        output.setText("Reading PS3 firmware package metadata on-device...");
+        new Thread(() -> {
+            String result;
+            try {
+                result = FirmwareInspector.inspect(getContentResolver(), uri);
+            } catch (Throwable e) {
+                result = "FIRMWARE INSPECTION FAILED\n" + e.getClass().getSimpleName()
+                        + ": " + e.getMessage();
+            }
+            String finalResult = result;
+            runOnUiThread(() -> output.setText(finalResult));
+        }, "ps3-firmware-inspector").start();
     }
 
     private void runRealPpuTrace(Uri uri) {
