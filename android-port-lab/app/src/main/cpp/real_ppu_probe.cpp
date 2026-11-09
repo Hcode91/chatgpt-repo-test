@@ -18,6 +18,9 @@
 namespace realppu {
 constexpr uint64_t LIMIT = 48ull * 1024 * 1024;
 constexpr unsigned MAX_STEPS = 50000;
+// The initial main PPU thread ID is passed as r7 by the launcher. The same
+// ID is used by startup lwmutex ownership and thread-get-id HLE.
+constexpr uint64_t MAIN_PPU_THREAD_ID = 0x01000000ull;
 uint16_t be16(const uint8_t* p) {return (uint16_t(p[0])<<8)|p[1];}
 uint32_t be32(const uint8_t* p) {return (uint32_t(p[0])<<24)|(uint32_t(p[1])<<16)|(uint32_t(p[2])<<8)|p[3];}
 uint64_t be64(const uint8_t* p) {return (uint64_t(be32(p))<<32)|be32(p+4);}
@@ -160,6 +163,27 @@ bool import_hle(const Import& imp,CPU& c,Memory& m,std::string& event,std::strin
           "monotonic clock="+std::to_string(micros)+" usec";
     return true;
   }
+  if (imp.module=="sysPrxForUser" && imp.nid==0x350d454eu) {
+    // sys_ppu_thread_get_id(sys_ppu_thread_t* out)
+    // RPCS3 rpcs3/Emu/Cell/Modules/sys_ppu_thread_.cpp:
+    //   *thread_id = ppu.id; return CELL_OK;
+    // A sys_ppu_thread_t is 64-bit; PS3 PPC ABI stores it big-endian.
+    const uint64_t out=c.r[3];
+    if(!out || (out&7u) || !inrange(out,8,LIMIT)) {
+      stop="sys_ppu_thread_get_id: invalid 64-bit guest output pointer "+hx(out);
+      return false;
+    }
+    if(!m.put(out,8,MAIN_PPU_THREAD_ID)) {
+      stop="sys_ppu_thread_get_id: failed to write main thread ID at "+hx(out);
+      return false;
+    }
+    ++c.writes;
+    c.r[3]=0; // CELL_OK, not the thread ID itself.
+    c.pc=c.lr;
+    event="[HLE] sys_ppu_thread_get_id NID 0x350D454E: "
+          "wrote 64-bit thread_id="+hx(MAIN_PPU_THREAD_ID)+" at "+hx(out);
+    return true;
+  }
   if (imp.module=="sysPrxForUser") {
     // Verified NID mapping: RPCS3 PPUFunction.cpp, sysPrxForUser import table.
     // Handle the guest's 24-byte lightweight-mutex structure using big-endian
@@ -223,7 +247,7 @@ bool import_hle(const Import& imp,CPU& c,Memory& m,std::string& event,std::strin
              ": mutex not registered or invalid "+hx(mutex);
         return false;
       }
-      constexpr uint32_t thread_id=0x01000000u;
+      constexpr uint32_t thread_id=uint32_t(MAIN_PPU_THREAD_ID);
       if (imp.nid==0xc3476d0cu) {
         if (it->owner!=0xffffffffu) {
           stop="sys_lwmutex_destroy: mutex still locked "+hx(mutex);
@@ -404,7 +428,7 @@ std::string run(const uint8_t* file,size_t n) {
   CPU c;c.pc=pc;c.r[1]=0x2f00000;c.r[2]=toc;
   // RPCS3 process-entry ABI: r3..6=argc/argv/envp/etc; r7..10 hold the
   // main thread ID and ELF TLS template address/filesize/memsize.
-  c.r[3]=1;c.r[7]=0x1000000;c.r[8]=tlsVa;c.r[9]=tlsFileSize;c.r[10]=tlsMemSize;
+  c.r[3]=1;c.r[7]=MAIN_PPU_THREAD_ID;c.r[8]=tlsVa;c.r[9]=tlsFileSize;c.r[10]=tlsMemSize;
   c.r[13]=0; // sys_initialize_tls must create the actual thread-local state.
   unsigned hleCalls=0, lv2Calls=0;
   o<<"Parsed firmware imports: "<<imports.size()<<"\n";
@@ -786,6 +810,46 @@ int test_division_ops() {
   std::puts("PPC_DIVISION_REGRESSION_PASS: actual BCES00220 divdu and 32/64-bit variants");
   return 0;
 }
+int test_thread_get_id() {
+  realppu::Memory m;
+  realppu::CPU c;
+  c.pc=0x55d8ec;
+  c.lr=0x447c40;
+  c.r[3]=0x2effaf0; // Actual pointer reported from BCES00220 startup.
+  const realppu::Import imp{0x55d8ec,0x350d454eu,"sysPrxForUser"};
+  std::string event, stop;
+  if(!realppu::import_hle(imp,c,m,event,stop)) {
+    std::fprintf(stderr,"sys_ppu_thread_get_id HLE failed: %s\n",stop.c_str());
+    return 1;
+  }
+  uint64_t value=0;
+  if(!m.get(0x2effaf0,8,value) ||
+     value!=realppu::MAIN_PPU_THREAD_ID ||
+     c.r[3]!=0 || c.pc!=c.lr || c.writes!=1 ||
+     event.find("wrote 64-bit thread_id")==std::string::npos) {
+    std::fputs("sys_ppu_thread_get_id wrong ABI / guest write / LR return\n",stderr);
+    return 1;
+  }
+  const uint8_t expected[8]={0,0,0,0,1,0,0,0};
+  if(std::memcmp(m.image.data()+0x2effaf0,expected,8)) {
+    std::fputs("sys_ppu_thread_get_id not big-endian 64-bit\n",stderr);
+    return 1;
+  }
+  // Avoid silent writes to null, unaligned, or unmapped pointers.
+  for(uint64_t addr : {0ull,0x2effaf1ull,realppu::LIMIT-4}) {
+    c.r[3]=addr;
+    c.pc=imp.stub;
+    stop.clear();
+    if(realppu::import_hle(imp,c,m,event,stop) ||
+       stop.find("invalid 64-bit guest output pointer")==std::string::npos ||
+       c.pc!=imp.stub || c.writes!=1) {
+      std::fputs("sys_ppu_thread_get_id must fail closed on invalid pointer\n",stderr);
+      return 1;
+    }
+  }
+  std::puts("PPU_THREAD_ID_REGRESSION_PASS: 64-bit BE guest store and return");
+  return 0;
+}
 int main(int argc,char** argv){
   if (argc==2 && std::string(argv[1])=="--test-time-hle")
     return test_time_hle();
@@ -793,6 +857,8 @@ int main(int argc,char** argv){
     return test_lv2_time_services();
   if(argc==2 && std::string(argv[1])=="--test-division")
     return test_division_ops();
+  if(argc==2 && std::string(argv[1])=="--test-thread-id")
+    return test_thread_get_id();
   if(argc!=2)return 2;
   std::ifstream in(argv[1],std::ios::binary);
   if(!in)return 2;
