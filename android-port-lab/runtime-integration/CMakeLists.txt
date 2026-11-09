@@ -170,6 +170,9 @@ if(INFAMOUS_EU_UPSTREAM_TITLE)
         endif()
     endif()
     add_executable(infamous_eu_upstream_title
+        # Android-owned host services needed by the actual title runner.
+        # Weak fallbacks do NOT implement real RSX, overlay or SPU backends.
+        "${CMAKE_CURRENT_SOURCE_DIR}/eu_android_host_bridge.c"
         "${EU_TITLE_DIR}/main.cpp"
         "${EU_TITLE_DIR}/stubs.cpp"
         "${EU_TITLE_DIR}/trainer.cpp"
