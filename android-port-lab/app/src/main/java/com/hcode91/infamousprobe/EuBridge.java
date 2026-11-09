@@ -74,6 +74,21 @@ final class EuBridge {
         return v < 0 ? 0 : Math.min(v, 255);
     }
 
+    /** Ask the runner to capture the next frame (CAP button). Returns the request number. */
+    synchronized int requestCapture() {
+        int n = buf.getInt(52) + 1;
+        buf.putInt(52, n);
+        return n;
+    }
+
+    int captureRequested() {
+        return buf.getInt(52);
+    }
+
+    int captureDone() {
+        return buf.getInt(56);
+    }
+
     int framesPublished() {
         return buf.getInt(44);
     }

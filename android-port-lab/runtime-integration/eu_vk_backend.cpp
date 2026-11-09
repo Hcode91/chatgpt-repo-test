@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <zlib.h>
 #include <string>
 #include <vector>
 #include <deque>
@@ -78,6 +79,8 @@ static rsx_backend g_noop_vtable = {
 };
 extern "C" void eu_bridge_frame_rgba(const uint8_t* rgba, unsigned w, unsigned h,
                                      unsigned pitch) __attribute__((weak));
+extern "C" unsigned eu_bridge_capture_pending(void) __attribute__((weak));
+extern "C" void eu_bridge_capture_done(unsigned n) __attribute__((weak));
 
 namespace {
 
@@ -224,6 +227,8 @@ bool buffer_ensure(Buffer& b, VkDeviceSize need, VkBufferUsageFlags usage)
 }
 
 Buffer g_upload_buf;    /* texture uploads */
+uint64_t g_st_total, g_st_vb, g_st_ib, g_up_bytes;   /* bytes moved, per 5 s report */
+u32 g_up_count;
 
 /* Two submission slots: the CPU records and encodes frame N+1 while the GPU
  * still runs frame N. Each slot owns everything the GPU reads from the host
@@ -576,6 +581,8 @@ void imm_end()
 void upload_now(Obj& o, u32 face, u32 mip, u32 w, u32 h, const void* src, u32 row_bytes, u32 rows)
 {
     const size_t bytes = (size_t)row_bytes * rows;
+    g_up_count++;
+    g_up_bytes += bytes;
     if (!buffer_ensure(g_upload_buf, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return;
     memcpy(g_upload_buf.map, src, bytes);
     VkCommandBuffer cb = imm_begin();
@@ -1095,6 +1102,7 @@ void rec_room()
 
 bool stage_reserve(u32 bytes, u32* off)
 {
+    g_st_total += bytes;
     const u32 start = (g_stage_used + STAGE_ALIGN - 1u) & ~(STAGE_ALIGN - 1u);
     if ((u64)start + bytes > STAGE_MAX) {
         encode_and_submit(0);
@@ -1303,6 +1311,316 @@ void helper_pass(VkCommandBuffer cb, VkPipeline pl, VkImageView src, VkSampler s
 
 /* One pass per contiguous run of draws on the same attachments; clears
  * immediately ahead fold into load ops (mirrors eng_encode_records). */
+/* ------------------------------------------------------------------ frame capture
+ * The game screen's CAP button asks for one frame to be captured: every render
+ * pass is described in the log (targets, formats, clears, draws, textures it
+ * reads) and shrunk to a thumbnail, and every texture the frame reads is
+ * thumbnailed too. The thumbnails go to two PNG contact sheets in the game
+ * folder, so a dark or grey picture can be traced to the pass that goes wrong. */
+constexpr u32 CAP_TW = 192, CAP_TH = 108;
+constexpr u32 CAP_PASS_TILES = 160, CAP_TEX_TILES = 96;
+constexpr u32 CAP_TILES = CAP_PASS_TILES + CAP_TEX_TILES;
+struct Capture {
+    bool active = false;
+    unsigned req = 0;
+    u32 passes = 0, pass_tiles = 0, tex_tiles = 0;
+    std::vector<std::string> lines;
+    std::vector<int> line_tile;       /* tile shown by each line, -1 = none */
+    std::vector<u32> tex_seen;
+};
+Capture g_cap;
+Buffer g_cap_buf;
+Obj g_cap_thumb;
+bool g_cap_ready;
+
+const char* fmt_name(VkFormat f)
+{
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_UNORM: return "RGBA8";
+    case VK_FORMAT_B8G8R8A8_UNORM: return "BGRA8";
+    case VK_FORMAT_R8G8B8A8_SRGB: return "RGBA8_sRGB";
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return "RGBA16F";
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return "RGBA32F";
+    case VK_FORMAT_R16G16_SFLOAT: return "RG16F";
+    case VK_FORMAT_R32_SFLOAT: return "R32F";
+    case VK_FORMAT_R16_SFLOAT: return "R16F";
+    case VK_FORMAT_R8_UNORM: return "R8";
+    case VK_FORMAT_R8G8_UNORM: return "RG8";
+    case VK_FORMAT_R5G6B5_UNORM_PACK16: return "RGB565";
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16: return "ARGB1555";
+    case VK_FORMAT_R4G4B4A4_UNORM_PACK16: return "RGBA4";
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return "RGB10A2";
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return "R11G11B10F";
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return "BC1";
+    case VK_FORMAT_BC2_UNORM_BLOCK: return "BC2";
+    case VK_FORMAT_BC3_UNORM_BLOCK: return "BC3";
+    case VK_FORMAT_D24_UNORM_S8_UINT: return "D24S8";
+    case VK_FORMAT_D32_SFLOAT_S8_UINT: return "D32FS8";
+    case VK_FORMAT_D32_SFLOAT: return "D32F";
+    case VK_FORMAT_D16_UNORM: return "D16";
+    default: return nullptr;
+    }
+}
+
+std::string obj_desc(u32 h)
+{
+    char b[160];
+    Obj* o = obj(h);
+    if (!o) { snprintf(b, sizeof b, "h%u(gone)", h); return b; }
+    const char* fn = fmt_name(o->fmt);
+    char fbuf[24];
+    if (!fn) { snprintf(fbuf, sizeof fbuf, "vk%d", (int)o->fmt); fn = fbuf; }
+    snprintf(b, sizeof b, "h%u %ux%u %s%s%s(rsx fmt %d)", h, o->w, o->h, fn, o->cube ? " cube" : "",
+             o->bc_decode ? " cpu-decoded " : " ", (int)o->bfmt);
+    return b;
+}
+
+bool cap_init()
+{
+    if (g_cap_ready) return true;
+    if (!buffer_create(g_cap_buf, (VkDeviceSize)CAP_TILES * CAP_TW * CAP_TH * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+        return false;
+    if (!image_create(g_cap_thumb, VK_FORMAT_R8G8B8A8_UNORM, CAP_TW, CAP_TH, 1, 1, false,
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+        buffer_destroy(g_cap_buf);
+        return false;
+    }
+    g_cap_thumb.att = make_view(g_cap_thumb.img, g_cap_thumb.fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT,
+                                1, 1, IDENTITY);
+    VkCommandBuffer cb = imm_begin();
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = g_cap_thumb.img;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
+                         0, nullptr, 1, &b);
+    imm_end();
+    memset(g_cap_buf.map, 0, (size_t)CAP_TILES * CAP_TW * CAP_TH * 4);
+    g_cap_ready = true;
+    return true;
+}
+
+/* Shrink `src` into tile `tile` of the capture buffer (outside a render pass). */
+void cap_thumb(VkCommandBuffer cb, VkImageView src, u32 tile)
+{
+    helper_pass(cb, g_blit_pipe, src, g_default_sampler, g_cap_thumb.att, CAP_TW, CAP_TH);
+    barrier_all(cb);
+    VkBufferImageCopy c{};
+    c.bufferOffset = (VkDeviceSize)tile * CAP_TW * CAP_TH * 4;
+    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.imageExtent = {CAP_TW, CAP_TH, 1};
+    vkCmdCopyImageToBuffer(cb, g_cap_thumb.img, VK_IMAGE_LAYOUT_GENERAL, g_cap_buf.buf, 1, &c);
+    barrier_all(cb);
+}
+
+void cap_line(const std::string& l, int tile)
+{
+    g_cap.lines.push_back(l);
+    g_cap.line_tile.push_back(tile);
+}
+
+/* Describe one pass and thumbnail its first colour target and any new textures. */
+void cap_pass(VkCommandBuffer cb, const u32* rt, u32 nrt, u32 depth, bool fallback_z, u32 n_cc,
+              const u32* cc_surf, const float (*cc_rgba)[4], bool depth_cleared, u32 d0, u32 d1, u32 drawn,
+              bool skipped_all)
+{
+    const u32 pass = g_cap.passes++;
+    int tile = -1;
+    Obj* t0 = nrt ? obj(rt[0]) : nullptr;
+    if (t0 && t0->view && !t0->depth && g_cap.pass_tiles < CAP_PASS_TILES) {
+        tile = (int)g_cap.pass_tiles++;
+        cap_thumb(cb, t0->view, (u32)tile);
+    }
+    std::string l;
+    char b[256];
+    snprintf(b, sizeof b, "pass %u", pass);
+    l = b;
+    if (tile >= 0) { snprintf(b, sizeof b, " [tile %d]", tile); l += b; }
+    l += ":";
+    if (!nrt) l += " depth-only";
+    for (u32 k = 0; k < nrt; k++) {
+        l += " colour " + obj_desc(rt[k]);
+        for (u32 c = 0; c < n_cc; c++)
+            if (cc_surf[c] == rt[k]) {
+                snprintf(b, sizeof b, " cleared(%.2f %.2f %.2f %.2f)", cc_rgba[c][0], cc_rgba[c][1], cc_rgba[c][2],
+                         cc_rgba[c][3]);
+                l += b;
+            }
+        l += ";";
+    }
+    if (depth) l += " depth " + obj_desc(depth) + (depth_cleared ? " cleared;" : ";");
+    else if (fallback_z) l += " depth (stand-in);";
+    snprintf(b, sizeof b, " %u draw(s), %u drawn%s", d1 - d0, drawn, skipped_all ? " (ALL SKIPPED: attachments)" : "");
+    l += b;
+    /* programs and textures */
+    std::vector<u32> pipes, texs;
+    float vp[4] = {0, 0, 0, 0};
+    for (u32 i = d0; i < d1; i++) {
+        const Rec& r = g_rec[i];
+        if (i == d0) memcpy(vp, r.vp, sizeof vp);
+        bool seen = false;
+        for (u32 x : pipes) seen |= x == r.pipeline;
+        if (!seen) pipes.push_back(r.pipeline);
+        for (u32 k = 0; k < RSX_BE_MAX_TEXTURES + RSX_BE_MAX_VERTEX_TEXTURES; k++) {
+            const u32 h = k < RSX_BE_MAX_TEXTURES ? r.tex[k] : r.vtex[k - RSX_BE_MAX_TEXTURES];
+            if (!h) continue;
+            bool s2 = false;
+            for (u32 x : texs) s2 |= x == h;
+            if (!s2) texs.push_back(h);
+        }
+    }
+    if (d1 > d0) {
+        snprintf(b, sizeof b, " | viewport %.0f,%.0f %.0fx%.0f | pipelines", vp[0], vp[1], vp[2], vp[3]);
+        l += b;
+        for (size_t k = 0; k < pipes.size() && k < 10; k++) {
+            snprintf(b, sizeof b, " %u", pipes[k]);
+            l += b;
+        }
+        if (pipes.size() > 10) l += " ...";
+    }
+    if (!texs.empty()) {
+        l += " | reads";
+        for (size_t k = 0; k < texs.size(); k++) {
+            u32 h = texs[k];
+            bool seen = false;
+            for (u32 x : g_cap.tex_seen) seen |= x == h;
+            int tt = -1;
+            Obj* o = obj(h);
+            if (!seen) {
+                g_cap.tex_seen.push_back(h);
+                if (o && o->view && !o->cube && !o->depth && g_cap.tex_tiles < CAP_TEX_TILES) {
+                    tt = (int)(CAP_PASS_TILES + g_cap.tex_tiles++);
+                    cap_thumb(cb, o->view, (u32)tt);
+                }
+            }
+            if (k < 12) {
+                l += " " + obj_desc(h);
+                if (tt >= 0) { snprintf(b, sizeof b, " [tex tile %d]", tt - (int)CAP_PASS_TILES); l += b; }
+                l += ",";
+            }
+        }
+        if (texs.size() > 12) { snprintf(b, sizeof b, " +%zu more", texs.size() - 12); l += b; }
+    }
+    cap_line(l, tile);
+}
+
+bool write_png(const char* path, const uint8_t* rgb, u32 w, u32 h)
+{
+    std::vector<uint8_t> raw((size_t)(w * 3 + 1) * h);
+    for (u32 y = 0; y < h; y++) {
+        raw[(size_t)y * (w * 3 + 1)] = 0;
+        memcpy(&raw[(size_t)y * (w * 3 + 1) + 1], rgb + (size_t)y * w * 3, (size_t)w * 3);
+    }
+    uLongf zlen = compressBound((uLong)raw.size());
+    std::vector<uint8_t> z(zlen);
+    if (compress2(z.data(), &zlen, raw.data(), (uLong)raw.size(), 6) != Z_OK) return false;
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    auto be32 = [](uint8_t* p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; };
+    auto chunk = [&](const char* type, const uint8_t* data, uint32_t len) {
+        uint8_t hd[8];
+        be32(hd, len);
+        memcpy(hd + 4, type, 4);
+        fwrite(hd, 1, 8, f);
+        if (len) fwrite(data, 1, len, f);
+        uLong crc = crc32(0, (const Bytef*)type, 4);
+        if (len) crc = crc32(crc, data, len);
+        uint8_t c[4];
+        be32(c, (uint32_t)crc);
+        fwrite(c, 1, 4, f);
+    };
+    static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    fwrite(sig, 1, 8, f);
+    uint8_t ihdr[13];
+    be32(ihdr, w);
+    be32(ihdr + 4, h);
+    ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+    chunk("IHDR", ihdr, 13);
+    chunk("IDAT", z.data(), (uint32_t)zlen);
+    chunk("IEND", nullptr, 0);
+    const bool ok = ferror(f) == 0;
+    fclose(f);
+    return ok;
+}
+
+/* Lay tiles [first, first+count) out as a grid with 2-pixel gaps. */
+bool write_sheet(const char* path, u32 first, u32 count, u32 cols)
+{
+    if (!count) return true;
+    const u32 rows = (count + cols - 1) / cols, gap = 2;
+    const u32 W = cols * (CAP_TW + gap), H = rows * (CAP_TH + gap);
+    std::vector<uint8_t> img((size_t)W * H * 3, 40);
+    const uint8_t* src = (const uint8_t*)g_cap_buf.map;
+    for (u32 t = 0; t < count; t++) {
+        const u32 ox = (t % cols) * (CAP_TW + gap), oy = (t / cols) * (CAP_TH + gap);
+        const uint8_t* tp = src + (size_t)(first + t) * CAP_TW * CAP_TH * 4;
+        for (u32 y = 0; y < CAP_TH; y++)
+            for (u32 x = 0; x < CAP_TW; x++) {
+                const uint8_t* s4 = tp + ((size_t)y * CAP_TW + x) * 4;
+                uint8_t* d = &img[((size_t)(oy + y) * W + ox + x) * 3];
+                d[0] = s4[0]; d[1] = s4[1]; d[2] = s4[2];
+            }
+    }
+    return write_png(path, img.data(), W, H);
+}
+
+void cap_tile_stats(u32 tile, float* avg, u32* maxc)
+{
+    const uint8_t* tp = (const uint8_t*)g_cap_buf.map + (size_t)tile * CAP_TW * CAP_TH * 4;
+    double sum[3] = {0, 0, 0};
+    *maxc = 0;
+    for (u32 i = 0; i < CAP_TW * CAP_TH; i++)
+        for (int c = 0; c < 3; c++) {
+            sum[c] += tp[i * 4 + c];
+            if (tp[i * 4 + c] > *maxc) *maxc = tp[i * 4 + c];
+        }
+    for (int c = 0; c < 3; c++) avg[c] = (float)(sum[c] / (CAP_TW * CAP_TH));
+}
+
+void wait_all_slots();
+void cap_finish(u32 present_surface)
+{
+    wait_all_slots();
+    const char* root = getenv("PS3_VFS_ROOT");
+    std::string base = std::string(root && *root ? root : ".") + "/eu_capture_" + std::to_string(g_cap.req);
+    fprintf(stderr, "[capture] ===== frame capture %u: %u pass(es), %zu texture(s) read, presented %s =====\n",
+            g_cap.req, g_cap.passes, g_cap.tex_seen.size(), obj_desc(present_surface).c_str());
+    std::string report;
+    for (size_t i = 0; i < g_cap.lines.size(); i++) {
+        std::string l = g_cap.lines[i];
+        if (g_cap.line_tile[i] >= 0) {
+            float a[3];
+            u32 mx;
+            cap_tile_stats((u32)g_cap.line_tile[i], a, &mx);
+            char b[96];
+            snprintf(b, sizeof b, " || picture avg rgb %.0f %.0f %.0f, brightest %u", a[0], a[1], a[2], mx);
+            l += b;
+        }
+        fprintf(stderr, "[capture] %s\n", l.c_str());
+        report += l + "\n";
+    }
+    for (u32 t = 0; t < g_cap.tex_tiles; t++) {
+        float a[3];
+        u32 mx;
+        cap_tile_stats(CAP_PASS_TILES + t, a, &mx);
+        char b[128];
+        snprintf(b, sizeof b, "texture tile %u: avg rgb %.0f %.0f %.0f, brightest %u", t, a[0], a[1], a[2], mx);
+        fprintf(stderr, "[capture] %s\n", b);
+        report += std::string(b) + "\n";
+    }
+    FILE* f = fopen((base + "_report.txt").c_str(), "w");
+    if (f) { fputs(report.c_str(), f); fclose(f); }
+    const bool p1 = write_sheet((base + "_passes.png").c_str(), 0, g_cap.pass_tiles, 10);
+    const bool p2 = write_sheet((base + "_textures.png").c_str(), CAP_PASS_TILES, g_cap.tex_tiles, 8);
+    fprintf(stderr, "[capture] files: %s_report.txt%s, %s_passes.png%s, %s_textures.png%s\n", base.c_str(),
+            f ? "" : " (FAILED)", base.c_str(), p1 ? "" : " (FAILED)", base.c_str(), p2 ? "" : " (FAILED)");
+    if (eu_bridge_capture_done) eu_bridge_capture_done(g_cap.req);
+    g_cap = Capture{};
+}
+
 void encode_records(VkCommandBuffer cb)
 {
     u32 i = 0;
@@ -1313,6 +1631,17 @@ void encode_records(VkCommandBuffer cb)
             Obj* dst = obj(r.resolve_dst);
             if (!src || !dst || !src->view || !dst->att || !g_depth_pipe) continue;
             helper_pass(cb, g_depth_pipe, src->view, g_point_sampler, dst->att, dst->w, dst->h);
+            if (g_cap.active) {
+                int tile = -1;
+                if (g_cap.pass_tiles < CAP_PASS_TILES) {
+                    barrier_all(cb);
+                    tile = (int)g_cap.pass_tiles++;
+                    cap_thumb(cb, dst->view, (u32)tile);
+                }
+                char b[64];
+                snprintf(b, sizeof b, "pass %u [tile %d]: depth copy ", g_cap.passes++, tile);
+                cap_line(std::string(b) + obj_desc(r.depth) + " -> " + obj_desc(r.resolve_dst), tile);
+            }
             continue;
         }
         u32 n_cc = 0;
@@ -1425,9 +1754,14 @@ void encode_records(VkCommandBuffer cb)
             /* Could not bind every attachment the draws name: take the clears,
              * skip those draws (as the Metal engine does). */
             vkCmdEndRendering(cb);
+            const u32 s0 = i;
             while (i < g_rec_count && g_rec[i].kind == REC_DRAW && targets_are(g_rec[i], rt, nrt)) i++;
+            if (g_cap.active)
+                cap_pass(cb, rt, nrt, depth, fallback_z, n_cc, cc_surf, cc_rgba, clear_here, s0, i, 0, true);
             continue;
         }
+        const u32 d0 = i;
+        u32 drawn = 0;
         while (i < g_rec_count && g_rec[i].kind == REC_DRAW && targets_are(g_rec[i], rt, nrt) &&
                (g_rec[i].depth == depth || (!g_rec[i].depth && fallback_z))) {
             const Rec& r = g_rec[i++];
@@ -1442,8 +1776,12 @@ void encode_records(VkCommandBuffer cb)
             }
             if (!p.variant[cls][donly]) continue;
             bind_draw(cb, r, p, p.variant[cls][donly], rw, rh);
+            drawn++;
         }
         vkCmdEndRendering(cb);
+        if (g_cap.active)
+            cap_pass(cb, rt, attach ? nrt : 0, depth, fallback_z, n_cc, cc_surf, cc_rgba, clear_here, d0, i, drawn,
+                     false);
     }
 }
 
@@ -1823,6 +2161,8 @@ void be_draw(void*, rsx_topology topology, const void* vertices, u32 vertex_coun
     if (!vertex_count || !stride) return;
     rec_room();
     u32 vb = 0, ib = 0;
+    g_st_vb += (uint64_t)vertex_count * stride;
+    if (indices && index_count) g_st_ib += (uint64_t)index_count * sizeof(u32);
     if (!stage_copy(vertices, vertex_count * stride, &vb)) return;
     if (indices && index_count && !stage_copy(indices, index_count * (u32)sizeof(u32), &ib)) return;
     Rec& r = g_rec[g_rec_count++];
@@ -1893,6 +2233,22 @@ void be_present(void*, u32 surface)
     present_diag(surface);
     encode_and_submit(surface);
     g_frame_no++;
+    if (g_cap.active) {
+        cap_finish(surface);
+    } else if (eu_bridge_capture_pending) {
+        const unsigned req = eu_bridge_capture_pending();
+        if (req) {
+            if (cap_init()) {
+                g_cap = Capture{};
+                g_cap.active = true;
+                g_cap.req = req;
+                fprintf(stderr, "[capture] capturing the next frame (request %u)\n", req);
+            } else {
+                fprintf(stderr, "[capture] could not set up the capture buffers\n");
+                if (eu_bridge_capture_done) eu_bridge_capture_done(req);
+            }
+        }
+    }
     g_last_guest_draws = g_guest_draws;
     g_guest_draws = 0;
     static uint64_t next_report;
@@ -1908,6 +2264,12 @@ void be_present(void*, u32 surface)
         fprintf(stderr, "[RSX vulkan] frames (5s): %u presented, %u of an undrawn surface, %u of no surface | "
                 "%u mid-frame flushes | CPU waited %.0f ms for the GPU\n", g_pres_total, g_pres_unwritten,
                 g_pres_missing, g_mid_flushes, (double)g_gpu_wait_us / 1000.0);
+        fprintf(stderr, "[RSX vulkan] data (5s): staged %.1f MB (vertices %.1f, indices %.1f, rest %.1f) | "
+                "%u texture uploads, %.1f MB\n", g_st_total / 1048576.0, g_st_vb / 1048576.0, g_st_ib / 1048576.0,
+                (double)(g_st_total - (g_st_vb + g_st_ib < g_st_total ? g_st_vb + g_st_ib : g_st_total)) / 1048576.0,
+                g_up_count, g_up_bytes / 1048576.0);
+        g_st_total = g_st_vb = g_st_ib = g_up_bytes = 0;
+        g_up_count = 0;
         g_pres_total = g_pres_unwritten = g_pres_missing = g_mid_flushes = 0;
         g_gpu_wait_us = 0;
     }
@@ -2089,13 +2451,13 @@ bool init_device()
 
     VkDescriptorPoolSize sizes[] = {
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_RECORDS * 2 + 64},
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAX_RECORDS * 20 + 64},
-        {VK_DESCRIPTOR_TYPE_SAMPLER, MAX_RECORDS * 20 + 64},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAX_RECORDS * 20 + 64 + CAP_TILES},
+        {VK_DESCRIPTOR_TYPE_SAMPLER, MAX_RECORDS * 20 + 64 + CAP_TILES},
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64},
     };
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpi.maxSets = MAX_RECORDS + 64;
+    dpi.maxSets = MAX_RECORDS + 64 + CAP_TILES;
     dpi.poolSizeCount = 5;
     dpi.pPoolSizes = sizes;
     for (u32 k = 0; k < NUM_SLOTS; k++)

@@ -173,7 +173,7 @@ public final class GameActivity extends Activity implements Choreographer.FrameC
 
     // ---------------------------------------------------------------- view
     private final class GameView extends View {
-        private static final int BTN = 0, DPAD = 1, STICK = 2, ACTION_LOG = 3, ACTION_HIDE = 4;
+        private static final int BTN = 0, DPAD = 1, STICK = 2, ACTION_LOG = 3, ACTION_HIDE = 4, ACTION_CAPTURE = 5;
 
         private final class Control {
             final int kind, mask;
@@ -230,6 +230,7 @@ public final class GameActivity extends Activity implements Choreographer.FrameC
                     new Control(BTN, EuBridge.SELECT, "SELECT", 0.44f, 0.92f, 0.05f),
                     new Control(BTN, EuBridge.START, "START", 0.56f, 0.92f, 0.05f),
                     new Control(BTN, EuBridge.R3, "R3", 0.64f, 0.92f, 0.045f),
+                    new Control(ACTION_CAPTURE, 0, "CAP", 0.32f, 0.06f, 0.045f),
                     new Control(ACTION_LOG, 0, "LOG", 0.44f, 0.06f, 0.045f),
                     new Control(ACTION_HIDE, 0, "PAD", 0.56f, 0.06f, 0.045f),
             };
@@ -312,7 +313,7 @@ public final class GameActivity extends Activity implements Choreographer.FrameC
             text.setTextAlign(Paint.Align.LEFT);
             canvas.drawText(EuBridge.rendererLabel + " · frames "
                     + (b == null ? 0 : b.framesPublished())
-                    + (padSeen ? " · gamepad" : ""), h / 40f, h - h / 40f, text);
+                    + (padSeen ? " · gamepad" : "") + captureStatus(b), h / 40f, h - h / 40f, text);
             text.setTextAlign(Paint.Align.CENTER);
             for (Control c : controls) {
                 if (!controlsVisible && c.kind != ACTION_HIDE) continue;
@@ -381,6 +382,14 @@ public final class GameActivity extends Activity implements Choreographer.FrameC
             }
         }
 
+        private String captureStatus(EuBridge b) {
+            if (b == null) return "";
+            int req = b.captureRequested(), done = b.captureDone();
+            if (req == 0) return "";
+            if (req != done) return " · capturing frame " + req + "… (can take a while)";
+            return " · capture " + done + " saved to the game folder";
+        }
+
         @Override
         public boolean onTouchEvent(MotionEvent e) {
             int action = e.getActionMasked();
@@ -391,6 +400,12 @@ public final class GameActivity extends Activity implements Choreographer.FrameC
                 if (c != null) {
                     if (c.kind == ACTION_LOG) {
                         finish();
+                        return true;
+                    }
+                    if (c.kind == ACTION_CAPTURE) {
+                        EuBridge cb = EuBridge.current;
+                        if (cb != null && cb.captureRequested() == cb.captureDone()) cb.requestCapture();
+                        invalidate();
                         return true;
                     }
                     if (c.kind == ACTION_HIDE) {
