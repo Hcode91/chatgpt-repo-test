@@ -460,4 +460,41 @@ change("libs/video/rsx_null_backend.c",
 #endif
     nullsw_present(NULL, 0);
 }''')
+# Draw-drop counters in the register-file engine (Android diagnostics).
+change("libs/video/rsx_draw_engine.c",
+'static void sink_end(void* user, const rsx_dispatch* r)\n{',
+'#if defined(__ANDROID__)\n/* Android diagnostics: why the register-file engine drops a draw. Read and\n * printed by eu_vk_backend.cpp. [0] calls [1] no packets [2] topology\n * [3] vertex fetch [4] rebuild [5] zero count [6] no colour target\n * [7] no pipeline [8] index reserve [9] FP constants [10] drawn\n * [11] target-set lookup found no surface. */\nunsigned g_eu_eng_drop[16];\n#define EU_DROP(i) (g_eu_eng_drop[(i)]++)\n#else\n#define EU_DROP(i) ((void)0)\n#endif\nstatic void sink_end(void* user, const rsx_dispatch* r)\n{\n    EU_DROP(0);')
+change("libs/video/rsx_draw_engine.c",
+'    if (!g.ready || !dc.n_packets) return;\n\n    const u32 prim = g.rsx.current_primitive;',
+'    if (!g.ready) return;\n    if (!dc.n_packets) { EU_DROP(1); return; }\n\n    const u32 prim = g.rsx.current_primitive;')
+change("libs/video/rsx_draw_engine.c",
+'        if (rsx_primitive_needs_expansion(prim)) return;',
+'        if (rsx_primitive_needs_expansion(prim)) { EU_DROP(2); return; }')
+change("libs/video/rsx_draw_engine.c",
+'        if (topology == RSX_TOPOLOGY_UNSUPPORTED) return;',
+'        if (topology == RSX_TOPOLOGY_UNSUPPORTED) { EU_DROP(2); return; }')
+change("libs/video/rsx_draw_engine.c",
+'    if (!dc.n_verts || !dc.fetch_ok) return;',
+'    if (!dc.n_verts || !dc.fetch_ok) { EU_DROP(3); return; }')
+change("libs/video/rsx_draw_engine.c",
+'        if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) return;',
+'        if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) { EU_DROP(4); return; }')
+change("libs/video/rsx_draw_engine.c",
+'    if (!n_draw) return;\n\n    rsx_be_render_state rs;',
+'    if (!n_draw) { EU_DROP(5); return; }\n\n    rsx_be_render_state rs;')
+change("libs/video/rsx_draw_engine.c",
+'    if (!n_targets) return;\n    const u32 target = targets[0];',
+'    if (!n_targets) { EU_DROP(6); return; }\n    const u32 target = targets[0];')
+change("libs/video/rsx_draw_engine.c",
+'    if (!pipeline) return;\n\n    if (indexed) {',
+'    if (!pipeline) { EU_DROP(7); return; }\n\n    if (indexed) {')
+change("libs/video/rsx_draw_engine.c",
+'        if (!dc_reserve_indices(n_draw)) return;',
+'        if (!dc_reserve_indices(n_draw)) { EU_DROP(8); return; }')
+change("libs/video/rsx_draw_engine.c",
+'    if (g.fp_cb_cap < fp_bytes) {\n        u8* n = (u8*)realloc(g.fp_cb, fp_bytes);\n        if (!n) return;',
+'    if (g.fp_cb_cap < fp_bytes) {\n        u8* n = (u8*)realloc(g.fp_cb, fp_bytes);\n        if (!n) { EU_DROP(9); return; }')
+change("libs/video/rsx_draw_engine.c",
+'    if (!pipeline_is_fixed) g.guest_draws++;',
+'    EU_DROP(10);\n    if (!pipeline_is_fixed) g.guest_draws++;')
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")

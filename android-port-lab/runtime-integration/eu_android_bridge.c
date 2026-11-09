@@ -179,3 +179,186 @@ void eu_bridge_frame(const uint32_t* fb, unsigned w, unsigned h)
     if (n_pub == 1)
         fprintf(stderr, "[EU bridge] first frame published to the Android screen (%ux%u)\n", w, h);
 }
+
+/* ======================================================================
+ * Diagnostics for on-device boot logs (only when launched by the app,
+ * i.e. PS3_ANDROID_BRIDGE is set). Both start before main():
+ *  - crash reporter: signal, fault address, pc/lr/sp, thread, and a
+ *    symbolised backtrace. Installed first, so upstream's own guest-pointer
+ *    fault handlers (ppu_loader.cpp, win32_compat.c), which chain to their
+ *    predecessor, still run and then reach this one.
+ *  - CPU sampler: every 10 s, the busiest threads by CPU time.
+ * ====================================================================== */
+#include <dirent.h>
+#include <dlfcn.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/prctl.h>
+#include <ucontext.h>
+#include <unwind.h>
+
+static void eu_sym(const char* tag, uintptr_t pc)
+{
+    Dl_info di;
+    memset(&di, 0, sizeof di);
+    if (pc && dladdr((void*)pc, &di) && di.dli_fname) {
+        const char* f = strrchr(di.dli_fname, '/');
+        f = f ? f + 1 : di.dli_fname;
+        if (di.dli_sname)
+            fprintf(stderr, "[crash] %s 0x%016lx %s+0x%lx (%s+0x%lx)\n", tag, (unsigned long)pc, di.dli_sname,
+                    (unsigned long)(pc - (uintptr_t)di.dli_saddr), f, (unsigned long)(pc - (uintptr_t)di.dli_fbase));
+        else
+            fprintf(stderr, "[crash] %s 0x%016lx (%s+0x%lx)\n", tag, (unsigned long)pc, f,
+                    (unsigned long)(pc - (uintptr_t)di.dli_fbase));
+    } else {
+        fprintf(stderr, "[crash] %s 0x%016lx (unknown module)\n", tag, (unsigned long)pc);
+    }
+}
+
+typedef struct { int n; } eu_bt_state;
+
+static _Unwind_Reason_Code eu_bt_step(struct _Unwind_Context* ctx, void* arg)
+{
+    eu_bt_state* st = (eu_bt_state*)arg;
+    uintptr_t pc = (uintptr_t)_Unwind_GetIP(ctx);
+    if (!pc) return _URC_END_OF_STACK;
+    char tag[16];
+    snprintf(tag, sizeof tag, "#%02d", st->n);
+    eu_sym(tag, pc);
+    return (++st->n >= 40) ? _URC_END_OF_STACK : _URC_NO_REASON;
+}
+
+static volatile sig_atomic_t s_in_crash;
+
+static void eu_crash(int sig, siginfo_t* si, void* uctx)
+{
+    if (!s_in_crash) {
+        s_in_crash = 1;
+        char tname[17] = {0};
+        prctl(PR_GET_NAME, tname, 0, 0, 0);
+        fprintf(stderr, "\n[crash] ===== signal %d (%s) code %d, fault address %p, thread '%s' tid %d =====\n",
+                sig, sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : sig == SIGILL ? "SIGILL"
+                   : sig == SIGFPE ? "SIGFPE" : sig == SIGABRT ? "SIGABRT" : "?",
+                si ? si->si_code : 0, si ? si->si_addr : NULL, tname, (int)gettid());
+#if defined(__aarch64__)
+        if (uctx) {
+            const ucontext_t* uc = (const ucontext_t*)uctx;
+            eu_sym("pc ", (uintptr_t)uc->uc_mcontext.pc);
+            eu_sym("lr ", (uintptr_t)uc->uc_mcontext.regs[30]);
+            fprintf(stderr, "[crash] sp 0x%016lx x0 0x%016lx x1 0x%016lx x2 0x%016lx\n",
+                    (unsigned long)uc->uc_mcontext.sp, (unsigned long)uc->uc_mcontext.regs[0],
+                    (unsigned long)uc->uc_mcontext.regs[1], (unsigned long)uc->uc_mcontext.regs[2]);
+        }
+#endif
+        eu_bt_state st = {0};
+        _Unwind_Backtrace(eu_bt_step, &st);
+        fprintf(stderr, "[crash] ===== end of report =====\n");
+        fflush(stderr);
+    }
+    /* Do not swallow it: restore the default action and let the fault re-run
+     * (synchronous signals) or re-raise (abort), so the process dies as before. */
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    sigaction(sig, &dfl, NULL);
+    if (sig == SIGABRT) raise(sig);
+}
+
+static uint64_t eu_ticks(const char* stat_line)
+{
+    /* Fields after ") ": state ppid ... utime(14) stime(15) counted from 1. */
+    const char* p = strrchr(stat_line, ')');
+    if (!p) return 0;
+    unsigned long long ut = 0, stt = 0;
+    if (sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &ut, &stt) != 2) return 0;
+    return ut + stt;
+}
+
+#define EU_MAX_THREADS 512
+typedef struct { int tid; uint64_t ticks; char name[20]; } eu_tsample;
+
+static int eu_sample(eu_tsample* out, int cap)
+{
+    DIR* d = opendir("/proc/self/task");
+    if (!d) return 0;
+    int n = 0;
+    struct dirent* e;
+    while ((e = readdir(d)) && n < cap) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        char path[64], buf[512];
+        snprintf(path, sizeof path, "/proc/self/task/%s/stat", e->d_name);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+        size_t got = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        buf[got] = 0;
+        const char* l = strchr(buf, '(');
+        const char* r = strrchr(buf, ')');
+        out[n].tid = atoi(e->d_name);
+        out[n].ticks = eu_ticks(buf);
+        out[n].name[0] = 0;
+        if (l && r && r > l) {
+            size_t len = (size_t)(r - l - 1);
+            if (len > sizeof out[n].name - 1) len = sizeof out[n].name - 1;
+            memcpy(out[n].name, l + 1, len);
+            out[n].name[len] = 0;
+        }
+        n++;
+    }
+    closedir(d);
+    return n;
+}
+
+static void* eu_cpu_thread(void* arg)
+{
+    (void)arg;
+    prctl(PR_SET_NAME, "eu-cpu-sampler", 0, 0, 0);
+    static eu_tsample prev[EU_MAX_THREADS], cur[EU_MAX_THREADS];
+    int np = eu_sample(prev, EU_MAX_THREADS);
+    const long hz = sysconf(_SC_CLK_TCK) > 0 ? sysconf(_SC_CLK_TCK) : 100;
+    for (;;) {
+        sleep(10);
+        int nc = eu_sample(cur, EU_MAX_THREADS);
+        /* Delta per thread, top 10. */
+        int idx[EU_MAX_THREADS];
+        uint64_t dt[EU_MAX_THREADS];
+        uint64_t total = 0;
+        for (int i = 0; i < nc; i++) {
+            uint64_t before = 0;
+            for (int j = 0; j < np; j++) if (prev[j].tid == cur[i].tid) { before = prev[j].ticks; break; }
+            dt[i] = cur[i].ticks >= before ? cur[i].ticks - before : 0;
+            total += dt[i];
+            idx[i] = i;
+        }
+        for (int a = 0; a < nc; a++)
+            for (int b = a + 1; b < nc; b++)
+                if (dt[idx[b]] > dt[idx[a]]) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
+        char line[1024];
+        int off = snprintf(line, sizeof line, "[cpu] 10s: %d threads, total %.0f%% of one core; busiest:",
+                           nc, 100.0 * (double)total / (double)(hz * 10));
+        for (int k = 0; k < nc && k < 10 && off < (int)sizeof line - 48; k++) {
+            if (!dt[idx[k]]) break;
+            off += snprintf(line + off, sizeof line - off, " %s/%d %.0f%%", cur[idx[k]].name, cur[idx[k]].tid,
+                            100.0 * (double)dt[idx[k]] / (double)(hz * 10));
+        }
+        fprintf(stderr, "%s\n", line);
+        memcpy(prev, cur, sizeof(eu_tsample) * (size_t)nc);
+        np = nc;
+    }
+    return NULL;
+}
+
+__attribute__((constructor)) static void eu_diagnostics_init(void)
+{
+    if (!getenv("PS3_ANDROID_BRIDGE")) return;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = eu_crash;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT};
+    for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &sa, NULL);
+    pthread_t t;
+    if (pthread_create(&t, NULL, eu_cpu_thread, NULL) == 0) pthread_detach(t);
+}
