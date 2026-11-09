@@ -39,8 +39,20 @@ cmake --build "$BUILD" --target infamous_eu_private_boot --parallel "${EU_BUILD_
 BIN="$BUILD/libps3eu.so"
 test -s "$BIN"
 "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h "$BIN" | grep -q AArch64
+# The public App JNI library still needs its separate harmless smoke lift.
+# That smoke code is not used by the REAL European boot executable.
+mkdir -p "$ROOT/generated" "$ROOT/app/src/main/assets"
+python3 "$ROOT/tools/generate_ppu_smoke.py" --out "$ROOT/generated"
+python3 "$CHECKOUT/ps3recomp/tools/ppu_lifter.py" \
+  "$ROOT/generated/smoke.elf" --functions "$ROOT/generated/functions.json" \
+  --output "$ROOT/generated" --jobs 1 --single-file
+cp "$ROOT/generated/smoke.elf" "$ROOT/app/src/main/assets/smoke.elf"
 APK_LIB="$ROOT/app/src/main/jniLibs/arm64-v8a"
 mkdir -p "$APK_LIB"
+# The Android boot executable uses NDK libc++_shared.so.
+LIBCPP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+test -s "$LIBCPP"
+if [[ ! -e "$APK_LIB/libc++_shared.so" ]]; then cp "$LIBCPP" "$APK_LIB/libc++_shared.so"; fi
 if [[ -e "$APK_LIB/libps3eu.so" ]]; then
   echo "ERROR: pre-existing private library, refusing overwrite" >&2; exit 2;
 fi
