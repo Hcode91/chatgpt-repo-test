@@ -93,6 +93,30 @@ missing game assets, HLE dependencies, SPU jobs, graphics or a crash.
 The first private boot may need further Android-specific compiler and
 linker fixes before the APK can be produced.
 
+## Real European SPU preparation implemented (2026-11-09)
+
+On the user's exact European `EBOOT.elf` (verified SHA-256), the actual
+game's **eight embedded SPU ELF images** were extracted successfully.
+Total original SPU image bytes: **634,452**. The upstream manifest's
+WWS policy module at file offset `0x68CD80`, length `0x2D80`, was also
+carved and hashed. These are **real game executables**, not synthetic
+SPU workloads.
+
+Private extraction input is kept outside public GitHub. The branch includes
+`tools/prepare_eu_spu_lift.py`, which invokes the existing upstream
+`extract_spu_images.py`, `wrap_spu_elf.py`,
+`find_spu_functions.py`, `build_spu_workloads.py`, optional
+`extract_jobmods.py`/`lift_jobmods.py`, `spu_regcache.py` and
+`plug_lift.py` in a proper private workspace. The private APK build
+script now calls it after the PPU lift, and the real upstream title
+CMake target includes the SPU translation units and register files.
+
+The full game `PS3_GAME/USRDIR` remains needed for the 21 WWS job
+modules (e.g. `patch.sdat` and `data.sdat`). The SPU C source
+generation, actual Android linking and complete game boot have not
+yet been validated, so do not confuse extracted inputs with a
+finished SPU recompilation.
+
 ## Not yet implemented or validated
 
 - Running the full game-specific PPU lift on this Android toolchain.
