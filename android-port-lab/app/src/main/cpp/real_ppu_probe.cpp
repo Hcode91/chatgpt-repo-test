@@ -25,6 +25,11 @@ uint64_t rol64(uint64_t x,unsigned n) {n &= 63; return n?((x<<n)|(x>>(64-n))):x;
 std::string hx(uint64_t n) {char b[32];std::snprintf(b,sizeof b,"0x%llX",(unsigned long long)n);return b;}
 struct Seg {uint64_t addr,off,filesz,memsz;uint32_t flags;};
 struct Memory {
+  struct LwMutex {
+    uint32_t guestAddr, id, attributes, owner, recursion;
+    bool alive;
+  };
+  std::vector<LwMutex> mutexes;
   std::vector<uint8_t> image;
   std::vector<Seg> segs;
   Memory():image(size_t(LIMIT),0){}
@@ -89,6 +94,23 @@ std::vector<Import> read_imports(const Memory& m,uint64_t prx_va) {
   }
   return imports;
 }
+const char* known_import_name(const Import& i) {
+  if (i.module != "sysPrxForUser") return "unknown import";
+  switch (i.nid) {
+    case 0x744680a2u: return "sys_initialize_tls";
+    case 0x2f85c0efu: return "sys_lwmutex_create";
+    case 0x1573dc3fu: return "sys_lwmutex_lock";
+    case 0xaeb78725u: return "sys_lwmutex_trylock";
+    case 0x1bc200f4u: return "sys_lwmutex_unlock";
+    case 0xc3476d0cu: return "sys_lwmutex_destroy";
+    case 0x350d454eu: return "sys_ppu_thread_get_id";
+    case 0xa3e3be68u: return "sys_ppu_thread_once";
+    case 0x6bf66ea7u: return "_sys_memcpy";
+    case 0x68b9b011u: return "_sys_memset";
+    case 0xbdb18f83u: return "_sys_malloc";
+    default: return "unmapped function NID";
+  }
+}
 bool import_hle(const Import& imp,CPU& c,Memory& m,std::string& event,std::string& stop) {
   // First real inFAMOUS CRT import: sysPrxForUser::sys_initialize_tls.
   // Model the PS3 per-thread TLS image and r13 register, not an arbitrary success.
@@ -124,8 +146,121 @@ bool import_hle(const Import& imp,CPU& c,Memory& m,std::string& event,std::strin
     c.pc=c.lr;
     return true;
   }
-  stop="Firmware HLE handler missing for "+imp.module+" NID "+hx(imp.nid)+
-    " (guest stub "+hx(imp.stub)+")";
+  if (imp.module=="sysPrxForUser") {
+    // Verified NID mapping: RPCS3 PPUFunction.cpp, sysPrxForUser import table.
+    // Handle the guest's 24-byte lightweight-mutex structure using big-endian
+    // fields and preserve a live mutex registry. No fake "always success" stub.
+    if (imp.nid==0x2f85c0efu) { // sys_lwmutex_create(mutex*, attributes*)
+      const uint64_t mutex=c.r[3], attr=c.r[4];
+      if (!mutex || !attr || !inrange(mutex,24,LIMIT) ||
+          !inrange(attr,16,LIMIT)) {
+        stop="sys_lwmutex_create: invalid guest addresses mutex="+hx(mutex)+
+             ", attr="+hx(attr);
+        return false;
+      }
+      const uint32_t protocol=guest32(m,attr), recursive=guest32(m,attr+4);
+      // Match PS3 sys_sync: FIFO=1, PRIORITY=2, RETRY=4;
+      // recursive=0x10, non-recursive=0x20.
+      if ((protocol!=1 && protocol!=2 && protocol!=4) ||
+          (recursive!=0x10 && recursive!=0x20)) {
+        stop="sys_lwmutex_create: unsupported guest attributes protocol="+
+             hx(protocol)+", recursive="+hx(recursive)+
+             ", mutex="+hx(mutex)+", attr="+hx(attr);
+        return false;
+      }
+      if (m.mutexes.size()>=128) {
+        stop="sys_lwmutex_create: per-probe mutex registry exhausted";
+        return false;
+      }
+      for (const auto& existing:m.mutexes) {
+        if (existing.guestAddr==uint32_t(mutex) && existing.alive) {
+          stop="sys_lwmutex_create: guest tried to recreate a live mutex";
+          return false;
+        }
+      }
+      uint32_t id=0x95000100u+uint32_t(m.mutexes.size())*0x100u;
+      // sys_lwmutex_t: u32 owner, waiter, attributes, recursion, sleep_queue, pad.
+      bool wrote=m.put(mutex+0,4,0xffffffffu)
+              && m.put(mutex+4,4,0)
+              && m.put(mutex+8,4,recursive|protocol)
+              && m.put(mutex+12,4,0)
+              && m.put(mutex+16,4,id)
+              && m.put(mutex+20,4,0);
+      if (!wrote) {stop="sys_lwmutex_create: writing guest mutex failed";return false;}
+      m.mutexes.push_back({uint32_t(mutex),id,recursive|protocol,0xffffffffu,0,true});
+      c.writes+=6;c.r[3]=0;c.pc=c.lr;
+      event="[HLE] sys_lwmutex_create NID 0x2F85C0EF:"
+           " mutex="+hx(mutex)+", attr="+hx(attr)+
+           ", policy="+std::to_string(protocol)+", recursive="+
+           std::to_string(recursive==0x10)+", id="+hx(id);
+      return true;
+    }
+    if (imp.nid==0x1573dc3fu || imp.nid==0xaeb78725u ||
+        imp.nid==0x1bc200f4u || imp.nid==0xc3476d0cu) {
+      // Single-threaded simulated mutex semantics for this narrow startup
+      // tracer. Any operation needing blocking/multithreading stops explicitly.
+      uint64_t mutex=c.r[3];
+      auto it=std::find_if(m.mutexes.begin(),m.mutexes.end(),
+                         [&](const Memory::LwMutex& st) {
+                           return st.alive && st.guestAddr==mutex;
+                         });
+      if (it==m.mutexes.end() || !inrange(mutex,24,LIMIT)) {
+        stop=std::string(known_import_name(imp))+
+             ": mutex not registered or invalid "+hx(mutex);
+        return false;
+      }
+      constexpr uint32_t thread_id=0x01000000u;
+      if (imp.nid==0xc3476d0cu) {
+        if (it->owner!=0xffffffffu) {
+          stop="sys_lwmutex_destroy: mutex still locked "+hx(mutex);
+          return false;
+        }
+        it->alive=false;
+        if (!m.put(mutex,4,0xfffffffeu)) {
+          stop="sys_lwmutex_destroy: failed guest write";return false;
+        }
+        c.r[3]=0;c.writes++;
+      } else if (imp.nid==0x1bc200f4u) {
+        if (it->owner!=thread_id) {
+          stop="sys_lwmutex_unlock: mutex not owned by guest thread";
+          return false;
+        }
+        if (it->recursion>0) --it->recursion;
+        else it->owner=0xffffffffu;
+        if (!m.put(mutex,4,it->owner) || !m.put(mutex+12,4,it->recursion)) {
+          stop="sys_lwmutex_unlock: guest memory write failed";return false;
+        }
+        c.r[3]=0;c.writes+=2;
+      } else {
+        if (it->owner==0xffffffffu) {
+          it->owner=thread_id;
+        } else if(it->owner==thread_id && (it->attributes&0x10u)) {
+          ++it->recursion;
+        } else if (imp.nid==0xaeb78725u) {
+          // CELL_EBUSY: do not fake acquiring an occupied mutex.
+          c.r[3]=0x8001000au;c.pc=c.lr;
+          event="[HLE] sys_lwmutex_trylock: mutex busy";
+          return true;
+        } else {
+          stop="sys_lwmutex_lock: would block (requires LV2 scheduler)";
+          return false;
+        }
+        if (!m.put(mutex,4,it->owner) || !m.put(mutex+12,4,it->recursion)) {
+          stop="sys_lwmutex_lock: guest memory write failed";return false;
+        }
+        c.r[3]=0;c.writes+=2;
+      }
+      c.pc=c.lr;
+      event="[HLE] "+std::string(known_import_name(imp))+
+            ": mutex="+hx(mutex)+" returned "+hx(c.r[3]);
+      return true;
+    }
+  }
+  stop="Firmware HLE handler missing for "+imp.module+" "+
+    known_import_name(imp)+" NID "+hx(imp.nid)+
+    " (guest stub "+hx(imp.stub)+")"+
+    "; guest args r3="+hx(c.r[3])+", r4="+hx(c.r[4])+
+    ", r5="+hx(c.r[5])+", r6="+hx(c.r[6]);
   return false;
 }
 
