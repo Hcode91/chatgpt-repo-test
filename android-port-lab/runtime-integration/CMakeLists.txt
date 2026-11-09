@@ -269,6 +269,9 @@ if(INFAMOUS_EU_UPSTREAM_TITLE)
             target_link_libraries(infamous_eu_upstream_title PRIVATE SPIRV)
         endif()
         message(STATUS "European game: Vulkan GPU renderer enabled (glslang ${EU_GLSLANG_DIR})")
+        # Crash reports (eu_android_bridge.c) name functions via dladdr, which
+        # only sees exported symbols; Gradle strips .symtab but keeps .dynsym.
+        target_link_options(infamous_eu_upstream_title PRIVATE "-Wl,--export-dynamic")
     else()
         message(WARNING "European game: no glslang checkout -- CPU software preview only")
     endif()

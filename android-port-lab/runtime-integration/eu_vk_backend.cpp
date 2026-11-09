@@ -53,6 +53,7 @@
 #include "rsx_draw_engine.h"
 #include "rsx_texture_layout.h"
 
+extern "C" unsigned g_eu_eng_drop[16] __attribute__((weak));
 extern "C" void eu_bridge_frame_rgba(const uint8_t* rgba, unsigned w, unsigned h,
                                      unsigned pitch) __attribute__((weak));
 
@@ -1762,6 +1763,17 @@ void be_present(void*, u32 surface)
     encode_and_submit(surface);
     g_last_guest_draws = g_guest_draws;
     g_guest_draws = 0;
+    static uint64_t next_report;
+    const uint64_t t = now_ms();
+    if (&g_eu_eng_drop[0] != nullptr && t >= next_report) {
+        next_report = t + 5000;
+        unsigned d[16];
+        for (int i = 0; i < 16; i++) { d[i] = g_eu_eng_drop[i]; g_eu_eng_drop[i] = 0; }
+        fprintf(stderr, "[RSX vulkan] engine draws (5s): %u calls, %u drawn | dropped: no packets %u, "
+                "topology %u, vertex fetch %u, rebuild %u, zero count %u, no colour target %u, "
+                "no pipeline %u, index reserve %u, FP constants %u\n",
+                d[0], d[10], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9]);
+    }
     static u32 presents;
     if (++presents == 1 || presents % 600 == 0)
         fprintf(stderr, "[RSX vulkan] present #%u: %u guest draws, %u skipped (attachment mismatch), "
