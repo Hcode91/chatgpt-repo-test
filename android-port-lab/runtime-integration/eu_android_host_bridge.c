@@ -73,9 +73,9 @@ EU_WEAK eu_spu_func spu_plug_lookup(void *ctx, uint32_t pc) {
 void eu_android_report_unimplemented_subsystems(void) {
     fprintf(stderr,
             "[EU Android] Real game PPU code linked; game-specific SPU/WWS "
-            "and RSX overlay are not fully implemented.\\n"
+            "and RSX overlay are not fully implemented.\n"
             "[EU Android] Missing optional WWS plugin lookup falls back to "
-            "the existing SPU interpreter.\\n"
+            "the existing SPU interpreter.\n"
             "[EU Android] RSX write-watch is a conservative memory fence, "
-            "NOT a renderer or full cache invalidation.\\n");
+            "NOT a renderer or full cache invalidation.\n");
 }
