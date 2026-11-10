@@ -672,8 +672,8 @@ change("libs/video/rsx_draw_engine.c",
 """        int sampled = -1;
 #if defined(__ANDROID__)
         /* Several targets can live at this address: take the one of the
-         * texture's size if there is one, else the most recently used, and
-         * never one this draw writes. */
+         * texture's size, else the newest one at least that big; never one
+         * this draw writes. Nothing fits -> guest memory, as upstream. */
         {
             u32 best_score = 0;
             for (u32 i = 0; i < g.n_surfaces; i++) {
@@ -682,8 +682,14 @@ change("libs/video/rsx_draw_engine.c",
                 int own = 0;
                 for (u32 k = 0; k < n_targets; k++) if (target_slots[k] == i) own = 1;
                 if (own) continue;
-                const u32 score = ((c->w == t.width && c->h == t.height) ? 0x80000000u : 0u) |
-                                  ((c->stamp & 0x7FFFFFFFu) + 1u);
+                /* exact size first, then one that covers the texture; a
+                 * smaller target is never substituted (a 256x256 picture
+                 * stretched over a 1280x720 read washed the frame out) */
+                u32 rank;
+                if (c->w == t.width && c->h == t.height) rank = 2u;
+                else if (c->w >= t.width && c->h >= t.height) rank = 1u;
+                else continue;
+                const u32 score = (rank << 30) | ((c->stamp & 0x3FFFFFFFu) + 1u);
                 if (score > best_score) { best_score = score; sampled = (int)i; }
             }
         }
