@@ -1328,6 +1328,7 @@ struct Rec {
     u32 pull_off, raw_off, raw_bytes;
 };
 extern "C" int g_eu_draw_tag;
+extern "C" void eu_thread_place(const char* what, int nice_val, int mode) __attribute__((weak));
 /* GPU vertex fetch: filled by the draw engine (rsx_draw_engine.c, Android patch), same layout there. */
 extern "C" {
 typedef struct eu_pull_attr {
@@ -2371,6 +2372,10 @@ uint64_t g_async_jobs, g_sync_jobs;
 void encode_thread_main()
 {
     pthread_setname_np(pthread_self(), "vk encode");
+    {   /* off the fastest core, which the FIFO thread has */
+        const char* e = getenv("EU_FIFO_PLACE");
+        if (!(e && *e == '0') && eu_thread_place) eu_thread_place("frame encode thread", -4, 2);
+    }
     for (;;) {
         u32 present;
         uint64_t serial;
