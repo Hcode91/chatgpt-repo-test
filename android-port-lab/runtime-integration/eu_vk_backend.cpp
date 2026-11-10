@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include <zlib.h>
 #include <string>
 #include <vector>
@@ -184,6 +185,7 @@ u32 mem_type(u32 bits, VkMemoryPropertyFlags want)
     return UINT32_MAX;
 }
 
+uint64_t g_mem_img, g_mem_buf;   /* device memory held by images / buffers (5 s memory readout) */
 bool buffer_create(Buffer& b, VkDeviceSize size, VkBufferUsageFlags usage)
 {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -206,12 +208,13 @@ bool buffer_create(Buffer& b, VkDeviceSize size, VkBufferUsageFlags usage)
     vkBindBufferMemory(g_dev, b.buf, b.mem, 0);
     vkMapMemory(g_dev, b.mem, 0, VK_WHOLE_SIZE, 0, &b.map);
     b.size = size;
+    g_mem_buf += size;
     return true;
 }
 
 void buffer_destroy(Buffer& b)
 {
-    if (b.mem) vkFreeMemory(g_dev, b.mem, nullptr);
+    if (b.mem) { vkFreeMemory(g_dev, b.mem, nullptr); g_mem_buf -= b.size; }
     if (b.buf) vkDestroyBuffer(g_dev, b.buf, nullptr);
     b = Buffer{};
 }
@@ -268,6 +271,7 @@ struct Obj {
     rsx_be_format bfmt = RSX_BE_FMT_NONE;
     u32 w = 0, h = 0, mips = 1, layers = 1;
     u32 parent = 0;                      /* surface_view: the owning surface    */
+    uint64_t memsz = 0;                  /* device memory it owns (memory readout) */
     bool initialised = false;            /* moved out of UNDEFINED              */
     uint64_t retire_after = 0;           /* destroy once this submission is done */
     u32 frame_writes = 0;                /* draws/clears into it in frame write_frame */
@@ -307,7 +311,7 @@ void obj_destroy_now(Obj& o)
     if (o.att) vkDestroyImageView(g_dev, o.att, nullptr);
     if (o.owns) {
         if (o.img) vkDestroyImage(g_dev, o.img, nullptr);
-        if (o.mem) vkFreeMemory(g_dev, o.mem, nullptr);
+        if (o.mem) { vkFreeMemory(g_dev, o.mem, nullptr); g_mem_img -= o.memsz; }
     }
     o = Obj{};
 }
@@ -488,6 +492,8 @@ bool image_create(Obj& o, VkFormat fmt, u32 w, u32 h, u32 mips, u32 layers, bool
         return false;
     }
     vkBindImageMemory(g_dev, o.img, o.mem, 0);
+    o.memsz = mr.size;
+    g_mem_img += mr.size;
     o.fmt = fmt;
     o.w = w;
     o.h = h;
@@ -2377,6 +2383,31 @@ void be_present(void*, u32 surface)
                 "%u texture uploads, %.1f MB\n", g_st_total / 1048576.0, g_st_vb / 1048576.0, g_st_ib / 1048576.0,
                 (double)(g_st_total - (g_st_vb + g_st_ib < g_st_total ? g_st_vb + g_st_ib : g_st_total)) / 1048576.0,
                 g_up_count, g_up_bytes / 1048576.0);
+        {   /* memory readout: is anything still growing? */
+            long rss_pages = 0, page = sysconf(_SC_PAGESIZE);
+            if (FILE* f = fopen("/proc/self/statm", "r")) { long sz; if (fscanf(f, "%ld %ld", &sz, &rss_pages) != 2) rss_pages = 0; fclose(f); }
+            long avail_kb = -1, total_kb = -1;
+            if (FILE* f = fopen("/proc/meminfo", "r")) {
+                char ln[128];
+                while (fgets(ln, sizeof ln, f)) {
+                    if (!strncmp(ln, "MemTotal:", 9)) total_kb = atol(ln + 9);
+                    else if (!strncmp(ln, "MemAvailable:", 13)) avail_kb = atol(ln + 13);
+                }
+                fclose(f);
+            }
+            u32 live = 0, imgs = 0, views = 0, retired = 0;
+            for (u32 i = 0; i < g_obj_count; i++) {
+                const Obj& o = g_obj[i];
+                if (!o.live) continue;
+                live++;
+                if (o.retired) retired++;
+                if (o.owns && o.img) imgs++; else if (o.parent) views++;
+            }
+            fprintf(stderr, "[mem] app %.0f MB resident | graphics: images %.0f MB, buffers %.0f MB | objects %u live "
+                    "(%u images, %u views, %u waiting to be freed), %u surface views | phone: %.0f of %.0f MB available\n",
+                    rss_pages * (double)page / 1048576.0, g_mem_img / 1048576.0, g_mem_buf / 1048576.0, live, imgs,
+                    views, retired, g_view_count, avail_kb / 1024.0, total_kb / 1024.0);
+        }
         g_st_total = g_st_vb = g_st_ib = g_up_bytes = 0;
         g_up_count = 0;
         g_pres_total = g_pres_unwritten = g_pres_missing = g_mid_flushes = 0;
