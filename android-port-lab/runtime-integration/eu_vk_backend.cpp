@@ -1344,6 +1344,7 @@ constexpr u32 CAP_PASS_TILES = 160, CAP_TEX_TILES = 96;
 constexpr u32 CAP_TILES = CAP_PASS_TILES + CAP_TEX_TILES;
 struct Capture {
     bool active = false;
+    bool automatic = false;           /* timed capture: not an app request */
     unsigned req = 0;
     u32 passes = 0, pass_tiles = 0, tex_tiles = 0;
     std::vector<std::string> lines;
@@ -1629,9 +1630,13 @@ void cap_finish(u32 present_surface)
 {
     wait_all_slots();
     const char* root = getenv("PS3_VFS_ROOT");
-    std::string base = std::string(root && *root ? root : ".") + "/eu_capture_" + std::to_string(g_cap.req);
-    fprintf(stderr, "[capture] ===== frame capture %u: %u pass(es), %zu texture(s) read, presented %s =====\n",
-            g_cap.req, g_cap.passes, g_cap.tex_seen.size(), obj_desc(present_surface).c_str());
+    /* timed captures cycle through 12 file names so they cannot fill the phone */
+    std::string base = std::string(root && *root ? root : ".") +
+                       (g_cap.automatic ? "/eu_capture_auto_" + std::to_string((g_cap.req - 1) % 12 + 1)
+                                        : "/eu_capture_" + std::to_string(g_cap.req));
+    fprintf(stderr, "[capture] ===== %sframe capture %u: %u pass(es), %zu texture(s) read, presented %s =====\n",
+            g_cap.automatic ? "timed " : "", g_cap.req, g_cap.passes, g_cap.tex_seen.size(),
+            obj_desc(present_surface).c_str());
     std::string report;
     for (size_t i = 0; i < g_cap.lines.size(); i++) {
         std::string l = g_cap.lines[i];
@@ -1661,7 +1666,7 @@ void cap_finish(u32 present_surface)
     const bool p2 = write_sheet((base + "_textures.png").c_str(), CAP_PASS_TILES, g_cap.tex_tiles, 8);
     fprintf(stderr, "[capture] files: %s_report.txt%s, %s_passes.png%s, %s_textures.png%s\n", base.c_str(),
             f ? "" : " (FAILED)", base.c_str(), p1 ? "" : " (FAILED)", base.c_str(), p2 ? "" : " (FAILED)");
-    if (eu_bridge_capture_done) eu_bridge_capture_done(g_cap.req);
+    if (!g_cap.automatic && eu_bridge_capture_done) eu_bridge_capture_done(g_cap.req);
     g_cap = Capture{};
 }
 
@@ -2372,8 +2377,30 @@ void be_present(void*, u32 surface)
     g_frame_no++;
     if (g_cap.active) {
         cap_finish(surface);
-    } else if (eu_bridge_capture_pending) {
-        const unsigned req = eu_bridge_capture_pending();
+    } else {
+        const unsigned req = eu_bridge_capture_pending ? eu_bridge_capture_pending() : 0u;
+        /* EU_AUTO_CAPTURE=<seconds> (default 25, 0 = off): also capture a frame on a
+         * timer, so a log covers the run without pressing CAP. Counted from the
+         * first frame that draws anything. */
+        static int auto_s = -1;
+        static unsigned auto_n;
+        static uint64_t auto_next;
+        if (auto_s < 0) {
+            const char* e = getenv("EU_AUTO_CAPTURE");
+            auto_s = e ? atoi(e) : 25;
+        }
+        const uint64_t tnow = now_ms();
+        if (auto_s > 0 && !auto_next && g_guest_draws) auto_next = tnow + (uint64_t)auto_s * 1000u;
+        if (!req && auto_s > 0 && auto_next && tnow >= auto_next) {
+            auto_next = tnow + (uint64_t)auto_s * 1000u;
+            if (cap_init()) {
+                g_cap = Capture{};
+                g_cap.active = true;
+                g_cap.automatic = true;
+                g_cap.req = ++auto_n;
+                fprintf(stderr, "[capture] timed capture %u of the next frame (every %d s)\n", auto_n, auto_s);
+            }
+        }
         if (req) {
             if (cap_init()) {
                 g_cap = Capture{};
