@@ -1012,7 +1012,10 @@ change("libs/video/rsx_draw_engine.c",
                                        t.width, t.height, t.mipmaps, t.pitch,
                                        (int)t.cubemap, t.remap & 0xFFFFu);
 #if defined(__ANDROID__)
-        if (t.width >= 320 && t.height >= 180 && !t.cubemap) eu_texmiss_log(&t, textures[u]);
+        /* screen-sized A8R8G8B8 only: ordinary textures filled the log's slots at boot */
+        if (t.width >= 640 && t.height >= 360 && !t.cubemap &&
+            (t.format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM) == RSX_TEX_FMT_A8R8G8B8)
+            eu_texmiss_log(&t, textures[u]);
 #endif
     }
     return mask;""")
@@ -1021,7 +1024,7 @@ change("libs/video/rsx_draw_engine.c",
 """#if defined(__ANDROID__)
 static void eu_texmiss_log(const rsx_dsp_texture* t, u32 handle)
 {
-    enum { MAXA = 24 };
+    enum { MAXA = 32 };
     static struct { u32 loc, off, pitch, seen, last_nz; } a[MAXA];
     static u32 na;
     u32 k = 0;
