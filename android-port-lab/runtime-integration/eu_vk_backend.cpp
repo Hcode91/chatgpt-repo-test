@@ -2186,7 +2186,17 @@ uint64_t g_gpu_wait_us;   /* time the CPU spent blocked on a busy slot */
  * RGBA8 present image and read it back, then submit WITHOUT waiting: the
  * next submission goes to the other slot, and this one is collected (and its
  * picture published) once its fence signals. */
+extern "C" unsigned long long g_eu_prof[16];   /* rsx_draw_engine.c / cellGcmSys.c: FIFO-thread timers */
+void encode_and_submit_inner(u32 present_surface);
 void encode_and_submit(u32 present_surface)
+{
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    encode_and_submit_inner(present_surface);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    g_eu_prof[6] += us_between(t0, t1) * 1000u;
+}
+void encode_and_submit_inner(u32 present_surface)
 {
     if (!g_active) return;
     Obj* src = obj(present_surface);
@@ -2704,6 +2714,21 @@ void be_present(void*, u32 surface)
                 g_gpu_timed, g_gpu_busy_ns / 1e6, g_gpu_timed ? g_gpu_busy_ns / 1e6 / g_gpu_timed : 0.0,
                 g_gpu_busy_max_ns / 1e6, g_up_deferred, g_imm_count, g_imm_wait_us / 1000.0, g_scalar_ok, g_scalar_skip);
         g_gpu_busy_ns = g_gpu_busy_max_ns = 0; g_gpu_timed = 0; g_up_deferred = 0; g_imm_count = 0; g_imm_wait_us = 0;
+        {   /* where the FIFO thread's time went (measurement only) */
+            static uint64_t s_prof_t0;
+            unsigned long long pv[16];
+            for (int k = 0; k < 16; k++) { pv[k] = g_eu_prof[k]; g_eu_prof[k] = 0; }
+            const double wall = s_prof_t0 ? (double)(t - s_prof_t0) : 5000.0;
+            s_prof_t0 = t;
+            auto ms = [](unsigned long long ns) { return ns / 1e6; };
+            const unsigned long long draw_parts = pv[2] + pv[3] + pv[4] + pv[5];
+            fprintf(stderr, "[fifo-prof] %.1fs: FIFO walk %.0f ms (%.0f%% of wall, %llu walks) | draws %.0f ms in %llu draws "
+                    "(%.1f us each): vertex fetch %.0f, textures %.0f, pipeline lookup %.0f, backend draw %.0f, rest %.0f | "
+                    "command parsing outside draws %.0f ms | frame submit %.0f ms\n",
+                    wall / 1000.0, ms(pv[0]), wall > 0 ? ms(pv[0]) * 100.0 / wall : 0.0, pv[9], ms(pv[1]), pv[8],
+                    pv[8] ? pv[1] / 1000.0 / pv[8] : 0.0, ms(pv[2]), ms(pv[3]), ms(pv[4]), ms(pv[5]),
+                    pv[1] > draw_parts ? ms(pv[1] - draw_parts) : 0.0, pv[0] > pv[1] ? ms(pv[0] - pv[1]) : 0.0, ms(pv[6]));
+        }
         fprintf(stderr, "[RSX vulkan] data (5s): staged %.1f MB (vertices %.1f, indices %.1f, rest %.1f) | "
                 "%u texture uploads, %.1f MB\n", g_st_total / 1048576.0, g_st_vb / 1048576.0, g_st_ib / 1048576.0,
                 (double)(g_st_total - (g_st_vb + g_st_ib < g_st_total ? g_st_vb + g_st_ib : g_st_total)) / 1048576.0,

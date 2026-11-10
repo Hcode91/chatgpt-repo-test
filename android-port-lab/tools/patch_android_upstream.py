@@ -1238,4 +1238,291 @@ change("runtime/spu/spu_helpers.h",
 #else
 #define SPU__FSIMD 0
 #endif""")
+# Sound. The audio module only has WASAPI (Windows) and SDL2 outputs; the
+# Android app never starts SDL, so cellAudio "continued silently": the game
+# mixed every block and threw it away. Android output through AAudio (loaded
+# at run time from libaaudio.so, Android 8+), same small interface the mixer
+# already drives: submit / room / queued / wait. A disconnected stream (e.g.
+# headphones pulled) is reopened from the mixer thread, at most once a second.
+change("libs/audio/cellAudio.c",
+"""#elif defined(_WIN32)
+  #define AUDIO_BACKEND_SDL2    0
+  #define AUDIO_BACKEND_WASAPI  1
+#else""",
+"""#elif defined(_WIN32)
+  #define AUDIO_BACKEND_SDL2    0
+  #define AUDIO_BACKEND_WASAPI  1
+#elif defined(__ANDROID__)
+  #define AUDIO_BACKEND_SDL2    0
+  #define AUDIO_BACKEND_WASAPI  0
+  #define AUDIO_BACKEND_AAUDIO  1
+#else""")
+change("libs/audio/cellAudio.c",
+"""#endif /* AUDIO_BACKEND_SDL2 */
+""",
+"""#endif /* AUDIO_BACKEND_SDL2 */
+
+#if defined(AUDIO_BACKEND_AAUDIO) && AUDIO_BACKEND_AAUDIO
+#include <dlfcn.h>
+typedef struct AAudioStreamStruct AAudioStream;
+typedef struct AAudioStreamBuilderStruct AAudioStreamBuilder;
+enum { EU_AA_DIR_OUTPUT = 0, EU_AA_FMT_FLOAT = 2, EU_AA_SHARED = 1, EU_AA_PERF_LOW_LATENCY = 12,
+       EU_AA_USAGE_GAME = 14, EU_AA_STATE_DISCONNECTED = 13, EU_AA_ERR_DISCONNECTED = -899 };
+static struct {
+    int loaded;
+    int32_t (*create_builder)(AAudioStreamBuilder**);
+    void (*set_direction)(AAudioStreamBuilder*, int32_t);
+    void (*set_rate)(AAudioStreamBuilder*, int32_t);
+    void (*set_channels)(AAudioStreamBuilder*, int32_t);
+    void (*set_format)(AAudioStreamBuilder*, int32_t);
+    void (*set_perf)(AAudioStreamBuilder*, int32_t);
+    void (*set_sharing)(AAudioStreamBuilder*, int32_t);
+    void (*set_usage)(AAudioStreamBuilder*, int32_t);
+    int32_t (*open)(AAudioStreamBuilder*, AAudioStream**);
+    int32_t (*delete_builder)(AAudioStreamBuilder*);
+    int32_t (*start)(AAudioStream*);
+    int32_t (*close)(AAudioStream*);
+    int32_t (*write)(AAudioStream*, const void*, int32_t, int64_t);
+    int64_t (*frames_written)(AAudioStream*);
+    int64_t (*frames_read)(AAudioStream*);
+    int32_t (*set_buffer)(AAudioStream*, int32_t);
+    int32_t (*get_buffer)(AAudioStream*);
+    int32_t (*get_capacity)(AAudioStream*);
+    int32_t (*get_rate)(AAudioStream*);
+    int32_t (*get_state)(AAudioStream*);
+    const char* (*text)(int32_t);
+} s_aa;
+static AAudioStream* s_aa_stream = NULL;
+static int32_t s_aa_buf = 0;
+static uint64_t s_aa_retry_ns = 0;
+static unsigned long long s_aa_short_writes = 0, s_aa_reopens = 0;
+
+static uint64_t aa_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static int aa_load(void)
+{
+    if (s_aa.loaded) return s_aa.loaded > 0;
+    void* lib = dlopen("libaaudio.so", RTLD_NOW | RTLD_LOCAL);
+    s_aa.loaded = -1;
+    if (!lib) { fprintf(stderr, "[cellAudio] AAudio not available: %s\\n", dlerror()); return 0; }
+#define EU_AA_SYM(field, name) *(void**)&s_aa.field = dlsym(lib, name)
+    EU_AA_SYM(create_builder, "AAudio_createStreamBuilder");
+    EU_AA_SYM(set_direction, "AAudioStreamBuilder_setDirection");
+    EU_AA_SYM(set_rate, "AAudioStreamBuilder_setSampleRate");
+    EU_AA_SYM(set_channels, "AAudioStreamBuilder_setChannelCount");
+    EU_AA_SYM(set_format, "AAudioStreamBuilder_setFormat");
+    EU_AA_SYM(set_perf, "AAudioStreamBuilder_setPerformanceMode");
+    EU_AA_SYM(set_sharing, "AAudioStreamBuilder_setSharingMode");
+    EU_AA_SYM(set_usage, "AAudioStreamBuilder_setUsage");   /* Android 9+; optional */
+    EU_AA_SYM(open, "AAudioStreamBuilder_openStream");
+    EU_AA_SYM(delete_builder, "AAudioStreamBuilder_delete");
+    EU_AA_SYM(start, "AAudioStream_requestStart");
+    EU_AA_SYM(close, "AAudioStream_close");
+    EU_AA_SYM(write, "AAudioStream_write");
+    EU_AA_SYM(frames_written, "AAudioStream_getFramesWritten");
+    EU_AA_SYM(frames_read, "AAudioStream_getFramesRead");
+    EU_AA_SYM(set_buffer, "AAudioStream_setBufferSizeInFrames");
+    EU_AA_SYM(get_buffer, "AAudioStream_getBufferSizeInFrames");
+    EU_AA_SYM(get_capacity, "AAudioStream_getBufferCapacityInFrames");
+    EU_AA_SYM(get_rate, "AAudioStream_getSampleRate");
+    EU_AA_SYM(get_state, "AAudioStream_getState");
+    EU_AA_SYM(text, "AAudio_convertResultToText");
+#undef EU_AA_SYM
+    if (!s_aa.create_builder || !s_aa.set_direction || !s_aa.set_rate || !s_aa.set_channels || !s_aa.set_format ||
+        !s_aa.set_perf || !s_aa.set_sharing || !s_aa.open || !s_aa.delete_builder || !s_aa.start || !s_aa.close ||
+        !s_aa.write || !s_aa.frames_written || !s_aa.frames_read || !s_aa.set_buffer || !s_aa.get_buffer ||
+        !s_aa.get_capacity || !s_aa.get_rate || !s_aa.get_state) {
+        fprintf(stderr, "[cellAudio] AAudio: missing entry points\\n");
+        return 0;
+    }
+    s_aa.loaded = 1;
+    return 1;
+}
+
+static const char* aa_text(int32_t r) { return s_aa.text ? s_aa.text(r) : "?"; }
+
+static int aa_open(void)
+{
+    AAudioStreamBuilder* b = NULL;
+    int32_t r = s_aa.create_builder(&b);
+    if (r != 0 || !b) { fprintf(stderr, "[cellAudio] AAudio builder failed: %s\\n", aa_text(r)); return -1; }
+    s_aa.set_direction(b, EU_AA_DIR_OUTPUT);
+    s_aa.set_rate(b, CELL_AUDIO_SAMPLE_RATE);
+    s_aa.set_channels(b, 2);
+    s_aa.set_format(b, EU_AA_FMT_FLOAT);
+    s_aa.set_sharing(b, EU_AA_SHARED);
+    s_aa.set_perf(b, EU_AA_PERF_LOW_LATENCY);
+    if (s_aa.set_usage) s_aa.set_usage(b, EU_AA_USAGE_GAME);
+    AAudioStream* st = NULL;
+    r = s_aa.open(b, &st);
+    s_aa.delete_builder(b);
+    if (r != 0 || !st) { fprintf(stderr, "[cellAudio] AAudio open failed: %s\\n", aa_text(r)); return -1; }
+    /* The mixer keeps the device fed a block (256 frames) at a time and its own FIFO absorbs the
+     * game's stalls; a device buffer of 8 blocks (43 ms) rides out a mixer thread held off the CPU. */
+    const int32_t cap = s_aa.get_capacity(st);
+    int32_t want = CELL_AUDIO_BLOCK_SAMPLES * 8;
+    if (cap > 0 && want > cap) want = cap;
+    s_aa.set_buffer(st, want);
+    s_aa_buf = s_aa.get_buffer(st);
+    r = s_aa.start(st);
+    if (r != 0) { fprintf(stderr, "[cellAudio] AAudio start failed: %s\\n", aa_text(r)); s_aa.close(st); return -1; }
+    s_aa_stream = st;
+    fprintf(stderr, "[cellAudio] AAudio output open: %d Hz stereo float, buffer %d frames (capacity %d)\\n",
+            (int)s_aa.get_rate(st), (int)s_aa_buf, (int)cap);
+    return 0;
+}
+
+static int audio_backend_init(void)
+{
+    if (!aa_load()) return -1;
+    return aa_open();
+}
+
+static void audio_backend_shutdown(void)
+{
+    if (s_aa_stream) { s_aa.close(s_aa_stream); s_aa_stream = NULL; }
+}
+
+/* Stream gone (output device changed): close it and try again, at most once a second. */
+static void aa_check(void)
+{
+    if (s_aa_stream && s_aa.get_state(s_aa_stream) == EU_AA_STATE_DISCONNECTED) {
+        s_aa.close(s_aa_stream);
+        s_aa_stream = NULL;
+        fprintf(stderr, "[cellAudio] AAudio stream disconnected; reopening\\n");
+    }
+    if (!s_aa_stream && s_aa.loaded > 0) {
+        const uint64_t now = aa_now_ns();
+        if (now >= s_aa_retry_ns) {
+            s_aa_retry_ns = now + 1000000000ull;
+            if (aa_open() == 0) s_aa_reopens++;
+        }
+    }
+}
+
+static int audio_backend_queued(void)
+{
+    if (!s_aa_stream) return -1;
+    const int64_t q = s_aa.frames_written(s_aa_stream) - s_aa.frames_read(s_aa_stream);
+    return q < 0 ? 0 : (int)q;
+}
+
+static u32 audio_backend_queued_samples(void)
+{
+    const int q = audio_backend_queued();
+    return q > 0 ? (u32)q : 0u;
+}
+
+static int audio_backend_room(void)
+{
+    aa_check();
+    if (!s_aa_stream) return -1;
+    const int q = audio_backend_queued();
+    const int room = (int)s_aa_buf - (q > 0 ? q : 0);
+    return room > 0 ? room : 0;
+}
+
+static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
+{
+    if (!s_aa_stream) return;
+    const int32_t r = s_aa.write(s_aa_stream, stereo_samples, (int32_t)num_samples, 0);
+    if (r == EU_AA_ERR_DISCONNECTED) { aa_check(); return; }
+    if (r >= 0 && (u32)r < num_samples) s_aa_short_writes++;
+}
+
+__attribute__((unused)) static void audio_backend_wait(void) { usleep(1000); }
+#endif /* AUDIO_BACKEND_AAUDIO */
+""")
+# FIFO-thread timers (measurement only, no behaviour change). g_eu_prof[] in
+# nanoseconds: [0] FIFO walk, [1] draws (sink_end), [2] vertex fetch,
+# [3] texture binding, [4] pipeline lookup, [5] backend draw call,
+# [6] frame submit (eu_vk_backend.cpp), [8] draws, [9] walks. The Vulkan
+# backend prints and resets them with its 5 s report ("[fifo-prof]").
+change("libs/video/rsx_draw_engine.c",
+"""/* ---- render state -------------------------------------------------------- */
+""",
+"""#if defined(__ANDROID__)
+#include <time.h>
+unsigned long long g_eu_prof[16];
+static inline unsigned long long eu_prof_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+#endif
+/* ---- render state -------------------------------------------------------- */
+""")
+change("libs/video/rsx_draw_engine.c",
+"""static void sink_end(void* user, const rsx_dispatch* r)
+{
+    EU_DROP(0);""",
+"""#if defined(__ANDROID__)
+static void eu_sink_end_inner(void* user, const rsx_dispatch* r);
+static void sink_end(void* user, const rsx_dispatch* r)
+{
+    const unsigned long long t0 = eu_prof_ns();
+    eu_sink_end_inner(user, r);
+    g_eu_prof[1] += eu_prof_ns() - t0;
+    g_eu_prof[8]++;
+}
+static void eu_sink_end_inner(void* user, const rsx_dispatch* r)
+#else
+static void sink_end(void* user, const rsx_dispatch* r)
+#endif
+{
+    EU_DROP(0);""")
+change("libs/video/rsx_draw_engine.c",
+"""    dc_fetch(&layout, rebuild);
+    if (!dc.n_verts || !dc.fetch_ok) { EU_DROP(3); return; }""",
+"""    { const unsigned long long eu_t = eu_prof_ns(); dc_fetch(&layout, rebuild); g_eu_prof[2] += eu_prof_ns() - eu_t; }
+    if (!dc.n_verts || !dc.fetch_ok) { EU_DROP(3); return; }""")
+change("libs/video/rsx_draw_engine.c",
+"""    const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot,
+                                            textures, samplers);
+    const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
+                                                    vsamplers);""",
+"""    const unsigned long long eu_tt = eu_prof_ns();
+    const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot,
+                                            textures, samplers);
+    const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
+                                                    vsamplers);
+    g_eu_prof[3] += eu_prof_ns() - eu_tt;""")
+change("libs/video/rsx_draw_engine.c",
+"""    int pipeline_is_fixed = 1;
+    const u32 pipeline = eng_pipeline_get(&layout, &rs,
+                                          eng_surface_format(sf.color_format),
+                                          n_targets, &pipeline_is_fixed);""",
+"""    int pipeline_is_fixed = 1;
+    const unsigned long long eu_tp = eu_prof_ns();
+    const u32 pipeline = eng_pipeline_get(&layout, &rs,
+                                          eng_surface_format(sf.color_format),
+                                          n_targets, &pipeline_is_fixed);
+    g_eu_prof[4] += eu_prof_ns() - eu_tp;""")
+change("libs/video/rsx_draw_engine.c",
+"""    g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
+               indexed ? g.indices : NULL, indexed ? n_draw : 0);""",
+"""    { const unsigned long long eu_td = eu_prof_ns();
+      g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
+                 indexed ? g.indices : NULL, indexed ? n_draw : 0);
+      g_eu_prof[5] += eu_prof_ns() - eu_td; }""")
+change("libs/video/cellGcmSys.c",
+"""    AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+    gcm_rsx_process_fifo_unlocked();""",
+"""    AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+#if defined(__ANDROID__)
+    { extern unsigned long long g_eu_prof[16];
+      struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+      gcm_rsx_process_fifo_unlocked();
+      clock_gettime(CLOCK_MONOTONIC, &b);
+      g_eu_prof[0] += (unsigned long long)((long long)(b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec));
+      g_eu_prof[9]++; }
+#else
+    gcm_rsx_process_fifo_unlocked();
+#endif""")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
