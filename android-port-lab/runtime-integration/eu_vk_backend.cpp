@@ -48,6 +48,10 @@
 #include <unistd.h>
 #include <zlib.h>
 #include <string>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <algorithm>
 #include <cctype>
 #include <vector>
@@ -268,8 +272,9 @@ struct Slot {
 };
 Slot g_slot[NUM_SLOTS];
 u32 g_cur;                 /* slot being encoded */
-uint64_t g_serial;         /* submissions made */
-uint64_t g_completed;      /* highest submission known finished */
+std::mutex g_obj_mu;        /* object table slots and the free list */
+uint64_t g_serial;         /* submissions handed over for encoding (FIFO thread) */
+std::atomic<uint64_t> g_completed{0};   /* highest submission known finished */
 #define g_cb (g_slot[g_cur].cb)
 #define g_fence (g_slot[g_cur].fence)
 #define g_dpool (g_slot[g_cur].dpool)
@@ -312,6 +317,7 @@ Obj* obj(u32 h)
 
 u32 obj_add(const Obj& o)
 {
+    std::lock_guard<std::mutex> lk(g_obj_mu);
     u32 slot;
     if (g_obj_free_count) slot = g_obj_free[--g_obj_free_count];
     else {
@@ -334,12 +340,30 @@ void obj_destroy_now(Obj& o)
     o = Obj{};
 }
 
-u32 g_rec_count;   /* forward: records pending (objects can't be recycled while > 0) */
+/* What one submission is built from. The FIFO thread fills the front one; with the encode thread on
+ * (EU_VK_ASYNC) a filled one is handed over and encoded there while the FIFO thread fills the other. The
+ * g_rec / g_stage names below resolve to the calling thread's own data. */
+struct Rec;
+struct FrameData { Rec* rec = nullptr; u32 rec_count = 0; u8* stage = nullptr; u32 stage_used = 0, stage_cap = 0; };
+FrameData g_fd_front, g_fd_back;
+thread_local FrameData* t_fd = nullptr;   /* set on the encode thread only */
+static inline FrameData& fd() { FrameData* f = t_fd; return f ? *f : g_fd_front; }
+#define g_rec (fd().rec)
+#define g_rec_count (fd().rec_count)
+#define g_stage (fd().stage)
+#define g_stage_used (fd().stage_used)
+#define g_stage_cap (fd().stage_cap)
+/* Everything that touches the queue, the slots, pipelines or image layouts runs under this lock: the encode
+ * thread for a whole submission, the FIFO thread for its rare direct GPU work. */
+std::recursive_mutex g_vk_mu;
+
 
 void collect_retired()
 {
+    std::lock_guard<std::mutex> lk(g_obj_mu);
+    const uint64_t done = g_completed.load();
     for (u32 i = 0; i < g_obj_count; i++) {
-        if (!g_obj[i].live || !g_obj[i].retired || g_completed < g_obj[i].retire_after) continue;
+        if (!g_obj[i].live || !g_obj[i].retired || done < g_obj[i].retire_after) continue;
         obj_destroy_now(g_obj[i]);
         g_obj_free[g_obj_free_count++] = i;
     }
@@ -560,6 +584,7 @@ void barrier_all(VkCommandBuffer cb)
 void init_layouts(VkCommandBuffer cb)
 {
     std::vector<VkImageMemoryBarrier> bars;
+    std::lock_guard<std::mutex> lk(g_obj_mu);
     for (u32 i = 0; i < g_obj_count; i++) {
         Obj& o = g_obj[i];
         if (!o.live || !o.owns || o.initialised || !o.img) continue;
@@ -615,6 +640,7 @@ void upload_now(Obj& o, u32 face, u32 mip, u32 w, u32 h, const void* src, u32 ro
     g_up_count++;
     g_up_bytes += bytes;
     if (upload_defer(o, face, mip, w, h, src, row_bytes, rows)) return;
+    std::lock_guard<std::recursive_mutex> vk_lk(g_vk_mu);
     if (!buffer_ensure(g_upload_buf, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return;
     memcpy(g_upload_buf.map, src, bytes);
     VkCommandBuffer cb = imm_begin();
@@ -750,6 +776,7 @@ u32 g_shader_failures;
  * Any non-literal index (or an unexpected declaration) leaves the program untouched.
  * EU_VK_SCALAR_REGS=0 turns it off. */
 int g_scalar_ok, g_scalar_skip;
+u32 g_same_pipe, g_same_tex, g_same_both, g_same_n;
 u32 g_pull_pipe_failures, g_pull_draws, g_cpu_draws;
 uint64_t g_pull_raw_bytes, g_pull_raw_shared;
 std::string scalarize_regs(const char* src, bool vs)
@@ -1318,16 +1345,14 @@ typedef struct eu_pull_draw {
 extern eu_pull_draw g_eu_pull __attribute__((weak));
 }
 extern "C" const char* eu_fifo_tag_name(int id, char* buf, size_t cap);
-Rec* g_rec;   /* MAX_RECORDS, heap */
 u32 g_dropped;
 Rec g_pending;
-u8* g_stage;
-u32 g_stage_used, g_stage_cap;
 u32 g_stage_epoch;          /* bumped whenever the staging data starts over */
 uint64_t g_cb_reused, g_cb_bytes_saved;
 u32 g_guest_draws, g_last_guest_draws, g_skipped_draws;
 
 void encode_and_submit(u32 present_surface);
+void encode_drain();
 
 /* A full record list is flushed to the GPU instead of dropping the rest of the
  * frame (build #20 lost the end of busy frames -- usually the final composite,
@@ -1737,6 +1762,7 @@ std::string obj_desc(u32 h)
 
 bool cap_init()
 {
+    std::lock_guard<std::recursive_mutex> vk_lk(g_vk_mu);
     if (g_cap_ready) return true;
     if (!buffer_create(g_cap_buf, (VkDeviceSize)CAP_TILES * CAP_TW * CAP_TH * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT))
         return false;
@@ -1961,6 +1987,7 @@ void cap_tile_stats(u32 tile, float* avg, u32* maxc)
 void wait_all_slots();
 void cap_finish(u32 present_surface)
 {
+    std::lock_guard<std::recursive_mutex> vk_lk(g_vk_mu);
     wait_all_slots();
     const char* root = getenv("PS3_VFS_ROOT");
     /* timed captures cycle through 12 file names so they cannot fill the phone */
@@ -2309,7 +2336,7 @@ bool slot_finish(u32 k, bool wait)
         }
     }
     sl.timed = false;
-    if (sl.serial > g_completed) g_completed = sl.serial;
+    if (sl.serial > g_completed.load()) g_completed.store(sl.serial);
     vkResetDescriptorPool(g_dev, sl.dpool, 0);
     if (sl.publish && r == VK_SUCCESS)
         eu_bridge_frame_rgba((const uint8_t*)sl.readback.map, sl.pw, sl.ph, sl.pw * 4);
@@ -2330,18 +2357,102 @@ uint64_t g_gpu_wait_us;   /* time the CPU spent blocked on a busy slot */
  * next submission goes to the other slot, and this one is collected (and its
  * picture published) once its fence signals. */
 extern "C" unsigned long long g_eu_prof[16];   /* rsx_draw_engine.c / cellGcmSys.c: FIFO-thread timers */
-void encode_and_submit_inner(u32 present_surface);
+void encode_and_submit_inner(u32 present_surface, uint64_t serial);
+
+/* Encode thread (EU_VK_ASYNC, default 1; 0 = encode on the FIFO thread as before). One job at a time: the
+ * FIFO thread hands over the filled frame data and carries on parsing into the other one; a second
+ * hand-over waits for the first to finish. Capture frames are encoded on the FIFO thread. */
+struct EncodeJob { bool pending = false, busy = false, started = false, quit = false; u32 present = 0; uint64_t serial = 0; };
+EncodeJob g_job;
+std::mutex g_job_mu;
+std::condition_variable g_job_cv, g_job_done_cv;
+uint64_t g_async_jobs, g_sync_jobs;
+
+void encode_thread_main()
+{
+    pthread_setname_np(pthread_self(), "vk encode");
+    for (;;) {
+        u32 present;
+        uint64_t serial;
+        {
+            std::unique_lock<std::mutex> lk(g_job_mu);
+            g_job_cv.wait(lk, [] { return g_job.pending || g_job.quit; });
+            if (g_job.quit) return;
+            g_job.pending = false;
+            g_job.busy = true;
+            present = g_job.present;
+            serial = g_job.serial;
+        }
+        {
+            std::lock_guard<std::recursive_mutex> vk_lk(g_vk_mu);
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            t_fd = &g_fd_back;
+            encode_and_submit_inner(present, serial);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            g_eu_prof[7] += us_between(t0, t1) * 1000u;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_job_mu);
+            g_job.busy = false;
+        }
+        g_job_done_cv.notify_all();
+    }
+}
+
+/* Wait until nothing is being encoded (the frame data handed over last is free again). */
+void encode_drain()
+{
+    std::unique_lock<std::mutex> lk(g_job_mu);
+    g_job_done_cv.wait(lk, [] { return !g_job.pending && !g_job.busy; });
+}
+
+bool encode_async_on()
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("EU_VK_ASYNC");
+        on = (e && *e == '0') ? 0 : 1;
+        fprintf(stderr, "[RSX vulkan] frames encoded on their own thread: %s (EU_VK_ASYNC)\n", on ? "on" : "off");
+    }
+    return on != 0;
+}
+
 void encode_and_submit(u32 present_surface)
 {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    encode_and_submit_inner(present_surface);
+    const uint64_t serial = ++g_serial;
+    if (g_active && encode_async_on() && !g_cap.active && g_fd_back.rec) {
+        encode_drain();
+        std::swap(g_fd_front, g_fd_back);          /* the filled data goes to the encode thread */
+        g_fd_front.rec_count = 0;
+        g_fd_front.stage_used = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_job_mu);
+            if (!g_job.started) {
+                g_job.started = true;
+                std::thread(encode_thread_main).detach();
+            }
+            g_job.present = present_surface;
+            g_job.serial = serial;
+            g_job.pending = true;
+        }
+        g_job_cv.notify_one();
+        g_async_jobs++;
+    } else {
+        encode_drain();
+        std::lock_guard<std::recursive_mutex> vk_lk(g_vk_mu);
+        encode_and_submit_inner(present_surface, serial);
+        g_sync_jobs++;
+    }
+    g_stage_epoch++;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     g_eu_prof[6] += us_between(t0, t1) * 1000u;
 }
-void encode_and_submit_inner(u32 present_surface)
+void encode_and_submit_inner(u32 present_surface, uint64_t serial)
 {
-    if (!g_active) return;
+    if (!g_active) { g_rec_count = 0; g_stage_used = 0; return; }
     Obj* src = obj(present_surface);
     static uint64_t next_publish;
     const bool publish = src && src->view && eu_bridge_frame_rgba && now_ms() >= next_publish;
@@ -2363,7 +2474,6 @@ void encode_and_submit_inner(u32 present_surface)
         fprintf(stderr, "[RSX vulkan] staging allocation failed (%u bytes)\n", g_stage_used);
         g_rec_count = 0;
         g_stage_used = 0;
-        g_stage_epoch++;
         return;
     }
     if (g_stage_used) memcpy(g_stage_buf.map, g_stage, g_stage_used);
@@ -2409,7 +2519,7 @@ void encode_and_submit_inner(u32 present_surface)
     if (qr == VK_SUCCESS) {
         sl.in_flight = true;
         sl.timed = qp != VK_NULL_HANDLE;
-        sl.serial = ++g_serial;
+        sl.serial = serial;
         sl.publish = publish;
         sl.pw = pw;
         sl.ph = ph;
@@ -2421,7 +2531,6 @@ void encode_and_submit_inner(u32 present_surface)
     }
     g_rec_count = 0;
     g_stage_used = 0;
-    g_stage_epoch++;
     g_cur = (g_cur + 1) % NUM_SLOTS;
     for (u32 k = 0; k < NUM_SLOTS; k++) slot_finish(k, false);   /* publish whatever is done */
     collect_retired();
@@ -2467,7 +2576,7 @@ void be_obj_release(void*, u32 handle)
     Obj* o = obj(handle);
     if (!o || o->retired) return;
     o->retired = true;
-    o->retire_after = g_serial + 1;   /* pending records go out in the next submission */
+    o->retire_after = g_serial + 1;   /* pending records go out in the next submission handed over */
     for (u32 i = 0; i < g_view_count; i++)
         if (g_views[i].surface == handle) {
             be_obj_release(nullptr, g_views[i].view);
@@ -2608,6 +2717,7 @@ u32 be_pipeline_create(void*, const char* vs_hlsl, const char* ps_hlsl, const rs
     if (!vs_hlsl || !ps_hlsl || !vertex_stride || g_pipe_count >= MAX_PIPES) return 0;
     if (!rt_count) rt_count = 1;
     if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
+    std::lock_guard<std::recursive_mutex> vk_lk(g_vk_mu);
     const bool pull = &g_eu_pull != nullptr && g_eu_pull.active;
     const Func* vs = function_for(vs_hlsl, true, pull);
     if (!vs) {
@@ -2684,6 +2794,8 @@ u32 be_pipeline_create(void*, const char* vs_hlsl, const char* ps_hlsl, const rs
 
 void be_pipeline_release(void*, u32 pipeline)
 {
+    encode_drain();
+    std::lock_guard<std::recursive_mutex> vk_lk(g_vk_mu);
     if (!pipeline || pipeline > g_pipe_count) return;
     Pipe& p = g_pipe[pipeline - 1];
     if (!p.live) return;
@@ -2986,6 +3098,16 @@ void be_draw(void*, rsx_topology topology, const void* vertices, u32 vertex_coun
     r.raw_off = pulled.raw_off;
     r.raw_bytes = pulled.raw_bytes;
     if (pull) g_pull_draws++; else g_cpu_draws++;
+    {   /* how often a draw repeats the previous draw's program / textures (for the planned lookup shortcuts) */
+        static u32 lp;
+        static u32 lt[RSX_BE_MAX_TEXTURES], lv[RSX_BE_MAX_VERTEX_TEXTURES];
+        const bool sp = r.pipeline == lp;
+        const bool st = memcmp(lt, r.tex, sizeof lt) == 0 && memcmp(lv, r.vtex, sizeof lv) == 0;
+        g_same_pipe += sp; g_same_tex += st; g_same_both += sp && st; g_same_n++;
+        lp = r.pipeline;
+        memcpy(lt, r.tex, sizeof lt);
+        memcpy(lv, r.vtex, sizeof lv);
+    }
     r.kind = REC_DRAW;
     r.tag = g_eu_draw_tag;
     r.topo = topology;
@@ -3071,7 +3193,7 @@ void be_present(void*, u32 surface)
         if (auto_s > 0 && !auto_next && g_guest_draws) auto_next = tnow + (uint64_t)auto_s * 1000u;
         if (!req && auto_s > 0 && auto_next && tnow >= auto_next) {
             auto_next = tnow + (uint64_t)auto_s * 1000u;
-            if (cap_init()) {
+            if ((encode_drain(), cap_init())) {   /* nothing may be mid-encode when a capture is armed */
                 g_cap = Capture{};
                 g_cap.active = true;
                 g_cap.automatic = true;
@@ -3080,7 +3202,7 @@ void be_present(void*, u32 surface)
             }
         }
         if (req) {
-            if (cap_init()) {
+            if ((encode_drain(), cap_init())) {   /* nothing may be mid-encode when a capture is armed */
                 g_cap = Capture{};
                 g_cap.active = true;
                 g_cap.req = req;
@@ -3126,6 +3248,12 @@ void be_present(void*, u32 surface)
                     wall / 1000.0, ms(pv[0]), wall > 0 ? ms(pv[0]) * 100.0 / wall : 0.0, pv[9], ms(pv[1]), pv[8],
                     pv[8] ? pv[1] / 1000.0 / pv[8] : 0.0, ms(pv[2]), ms(pv[3]), ms(pv[4]), ms(pv[5]),
                     pv[1] > draw_parts ? ms(pv[1] - draw_parts) : 0.0, pv[0] > pv[1] ? ms(pv[0] - pv[1]) : 0.0, ms(pv[6]));
+            fprintf(stderr, "[fifo-prof] encode thread busy %.0f ms (%llu frames handed over, %llu encoded on the FIFO thread) | "
+                    "draws repeating the previous draw's program %.0f%%, textures %.0f%%, both %.0f%%\n", ms(pv[7]),
+                    (unsigned long long)g_async_jobs, (unsigned long long)g_sync_jobs,
+                    g_same_n ? g_same_pipe * 100.0 / g_same_n : 0.0, g_same_n ? g_same_tex * 100.0 / g_same_n : 0.0,
+                    g_same_n ? g_same_both * 100.0 / g_same_n : 0.0);
+            g_async_jobs = g_sync_jobs = 0; g_same_pipe = g_same_tex = g_same_both = g_same_n = 0;
         }
         fprintf(stderr, "[RSX vulkan] constant blocks reused instead of copied (5s): %llu (%.1f MB not copied)\n",
                 (unsigned long long)g_cb_reused, g_cb_bytes_saved / 1048576.0);
@@ -3181,6 +3309,8 @@ void be_readback(void*, u32 surface, u32 x, u32 y, u32 w, u32 h, void* out, u32 
     Obj* o = obj(surface);
     if (!o || !out || !out_pitch || !w || !h || x + w > o->w || y + h > o->h || o->depth) return;
     if (g_rec_count) encode_and_submit(0);
+    encode_drain();
+    std::lock_guard<std::recursive_mutex> vk_lk(g_vk_mu);
     wait_all_slots();
     const u32 bpp = bytes_per_pixel(o->fmt);
     if (!buffer_ensure(g_upload_buf, (VkDeviceSize)w * h * bpp, VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -3476,8 +3606,9 @@ extern "C" int eu_vk_rsx_init(u32 width, u32 height)
 {
     const char* sel = getenv("EU_RSX");
     if (sel && *sel && strcmp(sel, "vulkan") != 0) return -1;
-    g_rec = (Rec*)calloc(MAX_RECORDS, sizeof(Rec));
-    if (!g_rec) return -1;
+    g_fd_front.rec = (Rec*)calloc(MAX_RECORDS, sizeof(Rec));
+    g_fd_back.rec = (Rec*)calloc(MAX_RECORDS, sizeof(Rec));
+    if (!g_fd_front.rec || !g_fd_back.rec) return -1;
     if (!init_device()) {
         fprintf(stderr, "[RSX vulkan] device unavailable -- using the CPU software preview\n");
         return -1;
