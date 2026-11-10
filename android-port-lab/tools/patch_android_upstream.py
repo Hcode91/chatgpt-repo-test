@@ -569,4 +569,151 @@ change("libs/video/rsx_draw_engine.c",
 #endif
     dc_fetch(&layout, rebuild);
     if (!dc.n_verts || !dc.fetch_ok) { EU_DROP(3); return; }""")
+# Surface cache: PS3 titles reuse one block of VRAM for render targets of
+# different sizes inside a frame (inFamous: 0x01AB8000 is 1280x720, 512x288 and
+# 1280x180). Upstream keeps one target per address and recreates it -- empty --
+# whenever the size moves, so the lighting and post passes that read a target
+# back as a texture saw nothing (dark/grey frames). On Android keep one target
+# per (address, size, format), stamp the most recently used, and let texture
+# reads and presents pick the best match at that address.
+change("libs/video/rsx_draw_engine.c",
+"""    rsx_be_format fmt;
+    u32 handle;
+} eng_surface;""",
+"""    rsx_be_format fmt;
+    u32 handle;
+    u32 stamp;             /* Android: last use, for picking among aliases */
+} eng_surface;
+#if defined(__ANDROID__)
+static u32 eu_surface_tick;
+#endif""")
+change("libs/video/rsx_draw_engine.c",
+"""    u32 slot = ENG_MAX_SURFACES;
+    for (u32 i = 0; i < g.n_surfaces; i++)
+        if (g.surfaces[i].location == location && g.surfaces[i].offset == offset) {
+            if (g.surfaces[i].w == want_w && g.surfaces[i].h == want_h &&
+                g.surfaces[i].fmt == want_fmt)
+                return i;
+            slot = i;
+            break;
+        }
+""",
+"""    u32 slot = ENG_MAX_SURFACES;
+#if defined(__ANDROID__)
+    u32 eu_any = ENG_INVALID, eu_any_stamp = 0;
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        eng_surface* c = &g.surfaces[i];
+        if (!c->handle || c->location != location || c->offset != offset) continue;
+        if (c->w == want_w && c->h == want_h && c->fmt == want_fmt) {
+            c->stamp = ++eu_surface_tick;
+            return i;
+        }
+        if (eu_any == ENG_INVALID || c->stamp >= eu_any_stamp) { eu_any = i; eu_any_stamp = c->stamp; }
+    }
+    /* a free slot left by an earlier failure is reused */
+    for (u32 i = 0; i < g.n_surfaces && slot == ENG_MAX_SURFACES; i++)
+        if (!g.surfaces[i].handle) slot = i;
+#else
+    for (u32 i = 0; i < g.n_surfaces; i++)
+        if (g.surfaces[i].location == location && g.surfaces[i].offset == offset) {
+            if (g.surfaces[i].w == want_w && g.surfaces[i].h == want_h &&
+                g.surfaces[i].fmt == want_fmt)
+                return i;
+            slot = i;
+            break;
+        }
+#endif
+""")
+change("libs/video/rsx_draw_engine.c",
+"""                    slot < ENG_MAX_SURFACES ? "existing" : "absent");
+        return slot < ENG_MAX_SURFACES ? slot : ENG_INVALID;""",
+"""                    slot < ENG_MAX_SURFACES ? "existing" : "absent");
+#if defined(__ANDROID__)
+        return eu_any;
+#else
+        return slot < ENG_MAX_SURFACES ? slot : ENG_INVALID;
+#endif""")
+change("libs/video/rsx_draw_engine.c",
+"""    if (slot == ENG_MAX_SURFACES) {
+        if (g.n_surfaces >= ENG_MAX_SURFACES) return ENG_INVALID;
+        slot = g.n_surfaces;
+    }
+""",
+"""    if (slot == ENG_MAX_SURFACES) {
+#if defined(__ANDROID__)
+        if (g.n_surfaces >= ENG_MAX_SURFACES) {
+            /* full: recycle the least recently used target */
+            u32 lru = 0;
+            for (u32 i = 1; i < g.n_surfaces; i++)
+                if (g.surfaces[i].stamp < g.surfaces[lru].stamp) lru = i;
+            slot = lru;
+        } else
+            slot = g.n_surfaces;
+#else
+        if (g.n_surfaces >= ENG_MAX_SURFACES) return ENG_INVALID;
+        slot = g.n_surfaces;
+#endif
+    }
+""")
+change("libs/video/rsx_draw_engine.c",
+"""    s->handle = handle;
+    if (slot == g.n_surfaces) g.n_surfaces++;""",
+"""    s->handle = handle;
+#if defined(__ANDROID__)
+    s->stamp = ++eu_surface_tick;
+#endif
+    if (slot == g.n_surfaces) g.n_surfaces++;""")
+change("libs/video/rsx_draw_engine.c",
+"""        int sampled = -1;
+        for (u32 i = 0; i < g.n_surfaces; i++) {
+            if (!g.surfaces[i].handle || g.surfaces[i].location != t.location ||
+                g.surfaces[i].offset != t.offset)
+                continue;""",
+"""        int sampled = -1;
+#if defined(__ANDROID__)
+        /* Several targets can live at this address: take the one of the
+         * texture's size if there is one, else the most recently used, and
+         * never one this draw writes. */
+        {
+            u32 best_score = 0;
+            for (u32 i = 0; i < g.n_surfaces; i++) {
+                const eng_surface* c = &g.surfaces[i];
+                if (!c->handle || c->location != t.location || c->offset != t.offset) continue;
+                int own = 0;
+                for (u32 k = 0; k < n_targets; k++) if (target_slots[k] == i) own = 1;
+                if (own) continue;
+                const u32 score = ((c->w == t.width && c->h == t.height) ? 0x80000000u : 0u) |
+                                  ((c->stamp & 0x7FFFFFFFu) + 1u);
+                if (score > best_score) { best_score = score; sampled = (int)i; }
+            }
+        }
+        for (u32 i = 0; i < g.n_surfaces && sampled < 0 && 0; i++) {
+#else
+        for (u32 i = 0; i < g.n_surfaces; i++) {
+#endif
+            if (!g.surfaces[i].handle || g.surfaces[i].location != t.location ||
+                g.surfaces[i].offset != t.offset)
+                continue;""")
+change("libs/video/rsx_draw_engine.c",
+"""        const eng_display_buffer* d = &g.display_buffers[buffer_id];
+        for (u32 i = 0; i < g.n_surfaces; i++)
+            if (g.surfaces[i].handle && g.surfaces[i].location == d->location &&
+                g.surfaces[i].offset == d->offset)
+                return i;""",
+"""        const eng_display_buffer* d = &g.display_buffers[buffer_id];
+#if defined(__ANDROID__)
+        /* the most recently used target at the display buffer's address */
+        u32 best = ENG_INVALID;
+        for (u32 i = 0; i < g.n_surfaces; i++)
+            if (g.surfaces[i].handle && g.surfaces[i].location == d->location &&
+                g.surfaces[i].offset == d->offset &&
+                (best == ENG_INVALID || g.surfaces[i].stamp > g.surfaces[best].stamp))
+                best = i;
+        if (best != ENG_INVALID) return best;
+#else
+        for (u32 i = 0; i < g.n_surfaces; i++)
+            if (g.surfaces[i].handle && g.surfaces[i].location == d->location &&
+                g.surfaces[i].offset == d->offset)
+                return i;
+#endif""")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
