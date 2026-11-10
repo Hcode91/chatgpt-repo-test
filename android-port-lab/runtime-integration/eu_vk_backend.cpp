@@ -2634,8 +2634,14 @@ u32 be_pipeline_create(void*, const char* vs_hlsl, const char* ps_hlsl, const rs
         }
     }
     if (pull) {
+        /* glslang's reflection lists the raw-bytes buffer among the uniform blocks: it is a storage buffer */
         bool have_raw = false;
-        for (const ResBinding& b : p.bindings) if (b.binding == B_PULL_RAW) have_raw = true;
+        for (ResBinding& b : p.bindings)
+            if (b.binding == B_PULL_RAW) {
+                b.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                b.count = 1;
+                have_raw = true;
+            }
         if (!have_raw)
             p.bindings.push_back({B_PULL_RAW, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, false, 0});
     }
