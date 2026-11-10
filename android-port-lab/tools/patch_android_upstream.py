@@ -1757,4 +1757,225 @@ static int eu_remap_direct(void)
     return 1;
 }
 extern int eu_vk_pull_ok(void) __attribute__((weak));""")
+# Per-draw lookup shortcuts (EU_SHORTCUT=1; default off). The log showed 98% of
+# draws repeat the previous draw's program and ~85% its textures, while the
+# engine re-derives both from scratch every draw. Each shortcut remembers only
+# the immediately previous draw: if every input of the lookup is unchanged, the
+# previous answer is reused. EU_SHORTCUT_CHECK (default on): the first 20000
+# reuses of each kind are also computed the full way and compared; a difference
+# is logged as "[shortcut] MISMATCH" and the full result is used.
+change("libs/video/rsx_draw_engine.c",
+"""static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+                            const rsx_be_render_state* rs,
+                            rsx_be_format rt_fmt, u32 rt_count, int* out_fixed)
+{
+    *out_fixed = 1;""",
+"""#if defined(__ANDROID__)
+static int eu_shortcut_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("EU_SHORTCUT");
+        on = (e && *e == '1') ? 1 : 0;
+        fprintf(stderr, "[shortcut] per-draw lookup shortcuts: %s (EU_SHORTCUT=1 turns them on)\\n", on ? "ON" : "off");
+    }
+    return on;
+}
+static int eu_shortcut_check(unsigned long long n)
+{
+    static int chk = -1;
+    if (chk < 0) { const char* e = getenv("EU_SHORTCUT_CHECK"); chk = (e && *e == '0') ? 0 : 1; }
+    return chk && n < 20000ull;
+}
+static unsigned long long s_sc_pipe_hit, s_sc_pipe_miss, s_sc_pipe_bad, s_sc_tex_hit, s_sc_tex_miss, s_sc_tex_bad,
+                          s_sc_tex_notplain;
+static void eu_shortcut_report(void)
+{
+    static struct timespec t0;
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    if (!t0.tv_sec) { t0 = t; return; }
+    if (t.tv_sec - t0.tv_sec < 10) return;
+    t0 = t;
+    fprintf(stderr, "[shortcut] program lookups reused %llu, done in full %llu, MISMATCHES %llu | texture set-ups reused %llu, "
+            "done in full %llu (%llu of those sample a render target or depth), MISMATCHES %llu (totals)\\n",
+            s_sc_pipe_hit, s_sc_pipe_miss, s_sc_pipe_bad, s_sc_tex_hit, s_sc_tex_miss, s_sc_tex_notplain, s_sc_tex_bad);
+}
+static u32 eng_pipeline_get_full(const rsx_vertex_layout_plan* layout, const rsx_be_render_state* rs,
+                                 rsx_be_format rt_fmt, u32 rt_count, int* out_fixed);
+static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout, const rsx_be_render_state* rs,
+                            rsx_be_format rt_fmt, u32 rt_count, int* out_fixed)
+{
+    if (!eu_shortcut_on()) return eng_pipeline_get_full(layout, rs, rt_fmt, rt_count, out_fixed);
+    /* the previous draw's lookup: every input, and the answer */
+    static struct {
+        int valid, fixed;
+        u8* vp; u32 vp_bytes, vp_cap;
+        u8* fp; u32 fp_bytes, fp_cap;
+        u32 fp_ctrl_key, cube_mask, vtex_mask, layout_mask, layout_stride, pull, rt_count, handle;
+        rsx_be_format rt_fmt;
+        u64 rs_hash;
+    } L;
+    eu_shortcut_report();
+    const u8* vp_uc = NULL;
+    const u8* fp_uc = NULL;
+    u32 vp_instrs = 0, fp_size = 0;
+    const int guest = eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size);
+    const u32 vp_bytes = vp_instrs * 16u;
+    const u32 fp_ctrl_key = rsx_dsp_shader_control(&g.rsx) & 0x40u;
+    const u32 cube_mask = eng_cube_mask(), vtex_mask = eng_vtex_mask();
+    const u64 rs_hash = rsx_draw_engine_hash_render_state(rs, 1469598103934665603ull);
+    const int hit = guest && L.valid && L.handle && vp_uc && fp_uc && vp_bytes && fp_size &&
+        L.vp_bytes == vp_bytes && L.fp_bytes == fp_size && L.fp_ctrl_key == fp_ctrl_key &&
+        L.cube_mask == cube_mask && L.vtex_mask == vtex_mask && L.layout_mask == layout->mask &&
+        L.layout_stride == layout->stride && L.pull == g_eu_pull.active && L.rt_fmt == rt_fmt &&
+        L.rt_count == rt_count && L.rs_hash == rs_hash &&
+        memcmp(L.vp, vp_uc, vp_bytes) == 0 && memcmp(L.fp, fp_uc, fp_size) == 0;
+    if (hit && !eu_shortcut_check(s_sc_pipe_hit)) {
+        /* identical fragment program bytes: g.fp_constants from the previous draw still holds its constants */
+        s_sc_pipe_hit++;
+        *out_fixed = L.fixed;
+        return L.handle;
+    }
+    static rsx_fp_constant_block before;
+    if (hit) before = g.fp_constants;
+    const u32 handle = eng_pipeline_get_full(layout, rs, rt_fmt, rt_count, out_fixed);
+    if (hit) {
+        s_sc_pipe_hit++;
+        if (handle != L.handle || *out_fixed != L.fixed || before.count != g.fp_constants.count ||
+            memcmp(before.values, g.fp_constants.values, (size_t)before.count * 16u) != 0) {
+            if (s_sc_pipe_bad++ < 16)
+                fprintf(stderr, "[shortcut] MISMATCH program: reused handle %u fixed %d constants %u, full lookup %u %d %u\\n",
+                        L.handle, L.fixed, before.count, handle, *out_fixed, g.fp_constants.count);
+        }
+    } else {
+        s_sc_pipe_miss++;
+    }
+    L.valid = 0;
+    if (guest && handle && vp_uc && fp_uc && vp_bytes && fp_size) {
+        if (L.vp_cap < vp_bytes) { u8* n = (u8*)realloc(L.vp, vp_bytes); if (!n) return handle; L.vp = n; L.vp_cap = vp_bytes; }
+        if (L.fp_cap < fp_size) { u8* n = (u8*)realloc(L.fp, fp_size); if (!n) return handle; L.fp = n; L.fp_cap = fp_size; }
+        memcpy(L.vp, vp_uc, vp_bytes);
+        memcpy(L.fp, fp_uc, fp_size);
+        L.vp_bytes = vp_bytes; L.fp_bytes = fp_size; L.fp_ctrl_key = fp_ctrl_key;
+        L.cube_mask = cube_mask; L.vtex_mask = vtex_mask;
+        L.layout_mask = layout->mask; L.layout_stride = layout->stride;
+        L.pull = g_eu_pull.active; L.rt_fmt = rt_fmt; L.rt_count = rt_count; L.rs_hash = rs_hash;
+        L.handle = handle; L.fixed = *out_fixed;
+        L.valid = 1;
+    }
+    return handle;
+}
+static u32 eng_pipeline_get_full(const rsx_vertex_layout_plan* layout,
+                            const rsx_be_render_state* rs,
+                            rsx_be_format rt_fmt, u32 rt_count, int* out_fixed)
+#else
+static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+                            const rsx_be_render_state* rs,
+                            rsx_be_format rt_fmt, u32 rt_count, int* out_fixed)
+#endif
+{
+    *out_fixed = 1;""")
+change("libs/video/rsx_draw_engine.c",
+"""static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+                              u32 current_zslot,
+                              u32 textures[RSX_BE_MAX_TEXTURES],
+                              rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES])
+{
+    u32 mask = 0;""",
+"""#if defined(__ANDROID__)
+static u32 sink_bind_textures_full(const u32* target_slots, u32 n_targets, u32 current_zslot,
+                                   u32 textures[RSX_BE_MAX_TEXTURES],
+                                   rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES]);
+/* Reuse of the previous draw's texture set-up. Only when every enabled unit read an ordinary texture (no render
+ * target or depth buffer lives at any sampled address -- those paths take snapshots and copies that depend on
+ * what was drawn in between), and the texture registers, the bound targets, the frame and the surface and depth
+ * tables are all exactly as they were. */
+static u32 sink_bind_textures(const u32* target_slots, u32 n_targets, u32 current_zslot,
+                              u32 textures[RSX_BE_MAX_TEXTURES],
+                              rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES])
+{
+    if (!eu_shortcut_on()) return sink_bind_textures_full(target_slots, n_targets, current_zslot, textures, samplers);
+    static struct {
+        int valid;
+        rsx_dsp_texture t[RSX_BE_MAX_TEXTURES];
+        u32 targets[RSX_BE_MAX_COLOR_TARGETS], n_targets, zslot, frame, mask;
+        u64 world;
+        u32 textures[RSX_BE_MAX_TEXTURES];
+        rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES];
+    } L;
+    static rsx_dsp_texture cur[RSX_BE_MAX_TEXTURES];
+    memset(cur, 0, sizeof cur);
+    for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) rsx_dsp_get_texture(&g.rsx, u, &cur[u]);
+    u64 world = 1469598103934665603ull ^ ((u64)g.n_surfaces << 32) ^ g.n_zdepths;
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        const eng_surface* c = &g.surfaces[i];
+        world = (world ^ c->handle) * 1099511628211ull;
+        world = (world ^ c->location) * 1099511628211ull;
+        world = (world ^ c->offset) * 1099511628211ull;
+        world = (world ^ (((u64)c->w << 32) | c->h)) * 1099511628211ull;
+    }
+    for (u32 i = 0; i < g.n_zdepths; i++) {
+        world = (world ^ g.zdepths[i].location) * 1099511628211ull;
+        world = (world ^ g.zdepths[i].offset) * 1099511628211ull;
+    }
+    int same_targets = L.n_targets == n_targets && n_targets <= RSX_BE_MAX_COLOR_TARGETS;
+    for (u32 k = 0; same_targets && k < n_targets; k++) if (L.targets[k] != target_slots[k]) same_targets = 0;
+    const int hit = L.valid && same_targets && L.zslot == current_zslot && L.frame == (u32)g.frames &&
+                    L.world == world && memcmp(L.t, cur, sizeof cur) == 0;
+    if (hit && !eu_shortcut_check(s_sc_tex_hit)) {
+        s_sc_tex_hit++;
+        memcpy(textures, L.textures, sizeof L.textures);
+        memcpy(samplers, L.samplers, sizeof L.samplers);
+        return L.mask;
+    }
+    const u32 mask = sink_bind_textures_full(target_slots, n_targets, current_zslot, textures, samplers);
+    if (hit) {
+        s_sc_tex_hit++;
+        if (mask != L.mask || memcmp(textures, L.textures, sizeof L.textures) != 0 ||
+            memcmp(samplers, L.samplers, sizeof L.samplers) != 0) {
+            if (s_sc_tex_bad++ < 16) {
+                u32 unit = 0;
+                for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) if (textures[u] != L.textures[u]) { unit = u; break; }
+                fprintf(stderr, "[shortcut] MISMATCH textures: mask reused %#x full %#x; first differing unit %u reused handle %u "
+                        "full %u (sampler bytes %s)\\n", L.mask, mask, unit, L.textures[unit], textures[unit],
+                        memcmp(samplers, L.samplers, sizeof L.samplers) ? "differ" : "same");
+            }
+        }
+    } else {
+        s_sc_tex_miss++;
+    }
+    /* remember this draw; usable next time only if it read ordinary textures alone */
+    int plain = n_targets <= RSX_BE_MAX_COLOR_TARGETS;
+    for (u32 u = 0; plain && u < RSX_BE_MAX_TEXTURES; u++) {
+        if (!cur[u].enabled) continue;
+        for (u32 i = 0; plain && i < g.n_surfaces; i++)
+            if (g.surfaces[i].handle && g.surfaces[i].location == cur[u].location && g.surfaces[i].offset == cur[u].offset)
+                plain = 0;
+        for (u32 i = 0; plain && i < g.n_zdepths; i++)
+            if (g.zdepths[i].location == cur[u].location && g.zdepths[i].offset == cur[u].offset) plain = 0;
+    }
+    if (!plain && !hit) s_sc_tex_notplain++;
+    L.valid = plain;
+    if (plain) {
+        memcpy(L.t, cur, sizeof cur);
+        for (u32 k = 0; k < n_targets; k++) L.targets[k] = target_slots[k];
+        L.n_targets = n_targets; L.zslot = current_zslot; L.frame = (u32)g.frames; L.world = world; L.mask = mask;
+        memcpy(L.textures, textures, sizeof L.textures);
+        memcpy(L.samplers, samplers, sizeof L.samplers);
+    }
+    return mask;
+}
+static u32 sink_bind_textures_full(const u32* target_slots, u32 n_targets,
+                              u32 current_zslot,
+                              u32 textures[RSX_BE_MAX_TEXTURES],
+                              rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES])
+#else
+static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+                              u32 current_zslot,
+                              u32 textures[RSX_BE_MAX_TEXTURES],
+                              rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES])
+#endif
+{
+    u32 mask = 0;""")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
