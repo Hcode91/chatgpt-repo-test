@@ -1449,6 +1449,16 @@ change("libs/video/rsx_draw_engine.c",
 """#if defined(__ANDROID__)
 #include <time.h>
 unsigned long long g_eu_prof[16];
+/* GPU vertex fetch ("pulling"): instead of decoding every vertex on the FIFO thread, the draw hands the
+ * backend the raw guest bytes of each attribute and one (vertex_id, base_index) pair per vertex; the vertex
+ * shader reads and converts the attributes itself. Same layout in eu_vk_backend.cpp. */
+typedef struct eu_pull_attr {
+    const unsigned char* src;   /* host pointer of element `first` */
+    unsigned int bytes, location, stride, type, size, mod, freq, first, last, valid;
+    float def[4];
+} eu_pull_attr;
+typedef struct eu_pull_draw { unsigned int active, attr_bytes; eu_pull_attr attr[16]; } eu_pull_draw;
+eu_pull_draw g_eu_pull = { 0, (unsigned int)sizeof(eu_pull_attr) };
 static inline unsigned long long eu_prof_ns(void)
 {
     struct timespec ts;
@@ -1467,6 +1477,7 @@ static void eu_sink_end_inner(void* user, const rsx_dispatch* r);
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     const unsigned long long t0 = eu_prof_ns();
+    g_eu_pull.active = 0;
     eu_sink_end_inner(user, r);
     g_eu_prof[1] += eu_prof_ns() - t0;
     g_eu_prof[8]++;
@@ -1508,7 +1519,7 @@ change("libs/video/rsx_draw_engine.c",
 """    g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                indexed ? g.indices : NULL, indexed ? n_draw : 0);""",
 """    { const unsigned long long eu_td = eu_prof_ns();
-      g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
+      g.be->draw(g.be->user, topology, dc.verts, uploaded, g_eu_pull.active ? 8u : layout.stride,
                  indexed ? g.indices : NULL, indexed ? n_draw : 0);
       g_eu_prof[5] += eu_prof_ns() - eu_td; }""")
 change("libs/video/cellGcmSys.c",
@@ -1524,5 +1535,133 @@ change("libs/video/cellGcmSys.c",
       g_eu_prof[9]++; }
 #else
     gcm_rsx_process_fifo_unlocked();
+#endif""")
+# GPU vertex fetch, engine side (see the eu_pull_draw note above): a draw whose
+# attributes each have one readable range and a supported format skips the
+# per-vertex decode loop and passes refs + raw ranges; anything else (inline
+# streams, unreadable ranges, unknown formats) keeps the CPU loop. The pipeline
+# key includes the mode. Off when the backend says so (EU_VK_PULL=0).
+change("libs/video/rsx_draw_engine.c",
+"""    for (u32 i = 0; i < dc.n_refs; i++) {
+        u8* dst = layout->stride ? dc.verts + (u64)i * layout->stride : NULL;
+        if (!rsx_vertex_fetch_one(&dc.fetch_plan, &dc.refs[i], dst)) {""",
+"""#if defined(__ANDROID__)
+    g_eu_pull.active = 0;
+    if (eu_pull_try(&dc.fetch_plan, dc.refs, dc.n_refs)) { dc.n_verts = dc.n_refs; return; }
+#endif
+    for (u32 i = 0; i < dc.n_refs; i++) {
+        u8* dst = layout->stride ? dc.verts + (u64)i * layout->stride : NULL;
+        if (!rsx_vertex_fetch_one(&dc.fetch_plan, &dc.refs[i], dst)) {""")
+change("libs/video/rsx_draw_engine.c",
+"""static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+{""",
+"""#if defined(__ANDROID__)
+extern int eu_vk_pull_ok(void) __attribute__((weak));
+static int eu_pull_try(const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 n)
+{
+    if (!eu_vk_pull_ok || !eu_vk_pull_ok() || !n || !plan->layout.count || plan->inline_data) return 0;
+    eu_pull_draw* d = &g_eu_pull;
+    memset(d->attr, 0, sizeof d->attr);
+    for (u32 slot = 0; slot < plan->layout.count; slot++) {
+        const u32 a = plan->layout.attrs[slot];
+        const rsx_vertex_fetch_attr* f = &plan->attr[a];
+        eu_pull_attr* o = &d->attr[a];
+        memcpy(o->def, f->default_value, 16);
+        if (!f->desc.type || !f->desc.size) continue;          /* the attribute's default */
+        switch (f->desc.type) {
+        case RSX_VTX_TYPE_FLOAT: case RSX_VTX_TYPE_HALF: case RSX_VTX_TYPE_UNORM8: case RSX_VTX_TYPE_UINT8:
+        case RSX_VTX_TYPE_SNORM16: case RSX_VTX_TYPE_SINT16: case RSX_VTX_TYPE_CMP32: break;
+        default: return 0;
+        }
+        if (!f->stable_base || f->stable_last < f->stable_first || !f->elem_size) return 0;
+        const u64 bytes = (u64)(f->stable_last - f->stable_first) * f->stride + f->elem_size;
+        if (bytes > (64u << 20)) return 0;
+        o->src = f->stable_base;
+        o->bytes = (unsigned int)bytes;
+        o->location = f->desc.location;
+        o->stride = f->stride;
+        o->type = f->desc.type;
+        o->size = f->desc.size < 4 ? f->desc.size : 4;
+        o->mod = (plan->divider_mask >> a) & 1u;
+        o->freq = f->desc.frequency;
+        o->first = f->stable_first;
+        o->last = f->stable_last;
+        o->valid = 1;
+    }
+    if (!dc_reserve_verts((u64)n * 8u)) return 0;
+    memcpy(dc.verts, refs, (size_t)n * 8u);   /* rsx_vertex_ref: { vertex_id, base_index } */
+    d->active = 1;
+    return 1;
+}
+#endif
+static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+{""")
+change("libs/video/rsx_draw_engine.c",
+"""    key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);""",
+"""    key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
+#if defined(__ANDROID__)
+    { const unsigned int eu_pk = g_eu_pull.active; key = eng_fnv1a(&eu_pk, sizeof eu_pk, key); }
+#endif""")
+# Audio threads on Android: the game's audio is mixed by the single-SPU SPURS
+# instance (inst 1) and played out by the cellAudio mixer thread. On Windows
+# both get raised priority / P-cores; on Android they ran at default priority
+# wherever the scheduler put them, and under gameplay load the guest audio
+# fell behind (hundreds of late blocks per 5 s = crackle). Raise their priority
+# and keep them on the faster cores. eu_thread_boost() logs what took effect.
+change("libs/audio/cellAudio.c",
+"""#include <time.h>    /* v145 */
+""",
+"""#include <time.h>    /* v145 */
+#if defined(__ANDROID__)
+#include <errno.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+/* Raise this thread's priority (nice value, lower = more CPU) and keep it off the slowest core cluster. */
+void eu_thread_boost(const char* what, int nice_val)
+{
+    const pid_t tid = (pid_t)syscall(SYS_gettid);
+    long ncpu = sysconf(_SC_NPROCESSORS_CONF);
+    if (ncpu > 32) ncpu = 32;
+    unsigned long fmax[32] = {0}, lo = ~0ul;
+    for (long c = 0; c < ncpu; c++) {
+        char path[96];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", c);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+        if (fscanf(f, "%lu", &fmax[c]) != 1) fmax[c] = 0;
+        fclose(f);
+        if (fmax[c] && fmax[c] < lo) lo = fmax[c];
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    int nfast = 0;
+    for (long c = 0; c < ncpu; c++) if (fmax[c] && fmax[c] > lo) { CPU_SET((int)c, &set); nfast++; }
+    const int aff = nfast ? sched_setaffinity(tid, sizeof set, &set) : -1;
+    const int aff_err = aff ? errno : 0;
+    const int pr = setpriority(PRIO_PROCESS, (id_t)tid, nice_val);
+    const int pr_err = pr ? errno : 0;
+    fprintf(stderr, "[boost] %s (tid %d): priority %d %s, %s (%d faster cores)\\n", what, (int)tid, nice_val,
+            pr == 0 ? "set" : strerror(pr_err), aff == 0 ? "kept on the faster cores" : (nfast ? strerror(aff_err) : "no core info"),
+            nfast);
+}
+#endif
+""")
+change("libs/audio/cellAudio.c",
+"""    { const char* e = getenv("AUDIO_PREPAD"); if (e) prime = atoi(e); }""",
+"""#if defined(__ANDROID__)
+    { const char* e = getenv("EU_AUDIO_BOOST"); if (!(e && *e == '0')) eu_thread_boost("audio mixer", -16); }
+#endif
+    { const char* e = getenv("AUDIO_PREPAD"); if (e) prime = atoi(e); }""")
+change("libs/spurs/cellSpurs.c",
+"""      prctl(15 /* PR_SET_NAME */, nm, 0, 0, 0); }
+#endif""",
+"""      prctl(15 /* PR_SET_NAME */, nm, 0, 0, 0); }
+    if ((int)(si - s_inst) == 1 && k_part == 0) {   /* inFamous' audio SPU (w3) */
+        extern void eu_thread_boost(const char*, int);
+        const char* e = getenv("EU_AUDIO_BOOST");
+        if (!(e && *e == '0')) eu_thread_boost("audio SPU kernel (inst 1)", -10);
+    }
 #endif""")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")

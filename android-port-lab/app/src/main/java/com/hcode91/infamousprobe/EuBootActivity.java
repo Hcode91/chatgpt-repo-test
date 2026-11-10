@@ -105,7 +105,7 @@ public final class EuBootActivity extends Activity {
 
     private SharedPreferences prefs;
     private TextView buildInfo, elfStatus, dataStatus, milestones, logView, runState;
-    private EditText pathEdit;
+    private EditText pathEdit, extraEnv;
     private CheckBox verbose, upstreamEnv, lean, lowCpu, openScreen;
     private Button rendererButton;
     private int renderer;
@@ -198,6 +198,12 @@ public final class EuBootActivity extends Activity {
         openScreen.setTextColor(Color.WHITE);
         openScreen.setChecked(true);
         root.addView(openScreen);
+        extraEnv = new EditText(this);
+        extraEnv.setHint("Extra settings (optional), e.g. EU_VK_PULL=0 EU_AUDIO_BOOST=0");
+        extraEnv.setTextColor(Color.WHITE);
+        extraEnv.setHintTextColor(Color.rgb(120, 130, 150));
+        extraEnv.setText(prefs.getString("extra_env", ""));
+        root.addView(extraEnv);
         renderer = prefs.getInt("renderer", 0);
         rendererButton = button("");
         rendererButton.setOnClickListener(v -> {
@@ -606,6 +612,16 @@ public final class EuBootActivity extends Activity {
                 : renderer == 1 ? "Software preview (CPU, no shaders)" : "Speed test: drawing off";
         header.append("# lean=").append(lean.isChecked()).append(" low_cpu=")
                 .append(lowCpu.isChecked()).append('\n');
+        // Extra settings typed by the user: KEY=VALUE pairs separated by spaces or new lines, applied last.
+        String extra = extraEnv.getText().toString().trim();
+        prefs.edit().putString("extra_env", extra).apply();
+        if (!extra.isEmpty()) {
+            for (String kv : extra.split("\\s+")) {
+                int eq = kv.indexOf('=');
+                if (eq > 0) env.put(kv.substring(0, eq), kv.substring(eq + 1));
+            }
+            header.append("# extra settings: ").append(extra).append('\n');
+        }
         try {
             EuBridge.current = EuBridge.create(new File(workDir(), "bridge.bin"));
             env.put("PS3_ANDROID_BRIDGE", EuBridge.current.file.getAbsolutePath());
