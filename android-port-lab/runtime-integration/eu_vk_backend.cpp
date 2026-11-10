@@ -105,7 +105,8 @@ namespace {
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetStencilReference) \
     X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCmdBindDescriptorSets) \
     X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) X(vkCmdDraw) \
-    X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkResetDescriptorPool) X(vkCmdBlitImage)
+    X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkResetDescriptorPool) X(vkCmdBlitImage) \
+    X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 #define EU_VK_DECL(f) PFN_##f f = nullptr;
 EU_VK_GLOBAL(EU_VK_DECL)
 EU_VK_FUNCS(EU_VK_DECL)
@@ -232,6 +233,13 @@ bool buffer_ensure(Buffer& b, VkDeviceSize need, VkBufferUsageFlags usage)
 Buffer g_upload_buf;    /* texture uploads */
 uint64_t g_st_total, g_st_vb, g_st_ib, g_up_bytes;   /* bytes moved, per 5 s report */
 u32 g_up_count;
+/* Per 5 s report: GPU time of the frame submissions (timestamp queries), uploads recorded into the frame
+ * instead of submitted on their own, and the blocking one-off submissions that remain (each waits for
+ * everything already queued on the GPU, i.e. the whole previous frame). */
+uint64_t g_gpu_busy_ns, g_gpu_busy_max_ns, g_imm_wait_us;
+u32 g_gpu_timed, g_imm_count, g_up_deferred;
+double g_ts_period_ns;   /* 0 = no timestamps on this queue */
+uint64_t g_ts_mask;
 
 /* Two submission slots: the CPU records and encodes frame N+1 while the GPU
  * still runs frame N. Each slot owns everything the GPU reads from the host
@@ -244,7 +252,8 @@ struct Slot {
     VkDescriptorPool dpool = VK_NULL_HANDLE;
     Buffer stage;      /* vertex/index/uniform data for one submit */
     Buffer readback;   /* present image copy */
-    bool in_flight = false, publish = false;
+    VkQueryPool qpool = VK_NULL_HANDLE;   /* GPU start/end timestamps of the slot's submission */
+    bool in_flight = false, publish = false, timed = false;
     u32 pw = 0, ph = 0;
     uint64_t serial = 0;
 };
@@ -579,9 +588,16 @@ void imm_end()
     si.commandBufferCount = 1;
     si.pCommandBuffers = &g_cb_imm;
     vkResetFences(g_dev, 1, &g_fence_imm);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     vkQueueSubmit(g_queue, 1, &si, g_fence_imm);
     vkWaitForFences(g_dev, 1, &g_fence_imm, VK_TRUE, UINT64_MAX);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    g_imm_count++;
+    g_imm_wait_us += (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000u + (uint64_t)(t1.tv_nsec - t0.tv_nsec) / 1000u;
 }
+
+bool upload_defer(Obj& o, u32 face, u32 mip, u32 w, u32 h, const void* src, u32 row_bytes, u32 rows);
 
 /* Copy tightly packed rows into one subresource. */
 void upload_now(Obj& o, u32 face, u32 mip, u32 w, u32 h, const void* src, u32 row_bytes, u32 rows)
@@ -589,6 +605,7 @@ void upload_now(Obj& o, u32 face, u32 mip, u32 w, u32 h, const void* src, u32 ro
     const size_t bytes = (size_t)row_bytes * rows;
     g_up_count++;
     g_up_bytes += bytes;
+    if (upload_defer(o, face, mip, w, h, src, row_bytes, rows)) return;
     if (!buffer_ensure(g_upload_buf, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return;
     memcpy(g_upload_buf.map, src, bytes);
     VkCommandBuffer cb = imm_begin();
@@ -1063,7 +1080,7 @@ VkPipeline helper_pipeline(VkShaderModule fs, VkFormat fmt)
 }
 
 /* ------------------------------------------------------------------ records */
-enum RecKind { REC_DRAW, REC_CLEAR_COLOR, REC_CLEAR_DS, REC_DEPTH_RESOLVE, REC_DEPTH_PACK, REC_COPY };
+enum RecKind { REC_DRAW, REC_CLEAR_COLOR, REC_CLEAR_DS, REC_DEPTH_RESOLVE, REC_DEPTH_PACK, REC_COPY, REC_UPLOAD };
 struct Rec {
     RecKind kind;
     u32 rt[RSX_BE_MAX_COLOR_TARGETS];
@@ -1086,7 +1103,7 @@ struct Rec {
     float clear_depth;
     u8 clear_stencil;
     u32 resolve_dst;
-    u32 copy_rect[8];   /* REC_COPY: source x y w h, destination x y w h */
+    u32 copy_rect[8];   /* REC_COPY: source x y w h, destination x y w h; REC_UPLOAD: face mip w h row_length */
     int tag;            /* REC_DRAW: game call chain that issued it (eu_fifo_tag.cpp) */
 };
 extern "C" int g_eu_draw_tag;
@@ -1152,6 +1169,92 @@ bool stage_copy(const void* src, u32 bytes, u32* off)
     if (!stage_reserve(bytes, off)) return false;
     memcpy(g_stage + *off, src, bytes);
     return true;
+}
+
+/* Texture upload as a record of the frame being built (EU_VK_DEFER_UPLOAD, default 1; 0 = old path).
+ * The old path submitted every upload on its own and waited for it; on one queue that wait covers the
+ * whole previous frame still on the GPU, so the FIFO thread -- which writes the fences the game and its
+ * SPU jobs wait on -- sat in the driver's fence poll once per texture upload. Here the bytes go into the
+ * frame's staging data and the copy is encoded with the frame, in record order. Falls back to the old
+ * path whenever taking the record would force a mid-draw flush. */
+bool upload_defer(Obj& o, u32 face, u32 mip, u32 w, u32 h, const void* src, u32 row_bytes, u32 rows)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("EU_VK_DEFER_UPLOAD");
+        on = (e && *e == '0') ? 0 : 1;
+        fprintf(stderr, "[RSX vulkan] texture uploads %s (EU_VK_DEFER_UPLOAD)\n",
+                on ? "recorded into the frame" : "submitted one by one with a GPU wait");
+    }
+    if (!on || !g_active || !g_rec || &o < g_obj || &o >= g_obj + MAX_OBJECTS || !o.img) return false;
+    const size_t bytes = (size_t)row_bytes * rows;
+    if (!bytes || bytes > (64u << 20)) return false;
+    const u64 start = ((u64)g_stage_used + STAGE_ALIGN - 1u) & ~(u64)(STAGE_ALIGN - 1u);
+    if (g_rec_count + 1 >= MAX_RECORDS || start + bytes > STAGE_MAX) return false;   /* would flush mid-draw */
+    u32 off = 0;
+    if (!stage_copy(src, (u32)bytes, &off)) return false;
+    Rec& r = g_rec[g_rec_count++];
+    memset(&r, 0, sizeof r);
+    r.kind = REC_UPLOAD;
+    r.resolve_dst = (u32)(&o - g_obj) + 1u;
+    r.vb_off = off;
+    u32 row_len = 0;
+    if (!is_bc(o.bfmt) || o.bc_decode) {
+        const u32 bpp = bytes_per_pixel(o.fmt);
+        if (bpp && row_bytes % bpp == 0 && row_bytes / bpp > w) row_len = row_bytes / bpp;
+    }
+    const u32 c[5] = {face, mip, w, h, row_len};
+    memcpy(r.copy_rect, c, sizeof c);
+    g_up_deferred++;
+    return true;
+}
+
+void encode_upload(VkCommandBuffer cb, const Rec& r)
+{
+    Obj* o = obj(r.resolve_dst);
+    if (!o || !o->img) return;
+    VkBufferImageCopy c{};
+    c.bufferOffset = r.vb_off;
+    c.bufferRowLength = r.copy_rect[4];
+    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, r.copy_rect[1], r.copy_rect[0], 1};
+    c.imageExtent = {r.copy_rect[2], r.copy_rect[3], 1};
+    vkCmdCopyBufferToImage(cb, g_stage_buf.buf, o->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+}
+
+/* Uploads whose image nothing earlier in this submission touches can run before all of it: move them to
+ * the front of the command buffer so they do not split a render pass. The rest stay in record order. */
+void hoist_uploads(VkCommandBuffer cb)
+{
+    static uint32_t s_seen[MAX_OBJECTS + 1], s_up[MAX_OBJECTS + 1], s_epoch;
+    if (++s_epoch == 0) { memset(s_seen, 0, sizeof s_seen); memset(s_up, 0, sizeof s_up); s_epoch = 1; }
+    auto touch = [](u32 h) {
+        if (!h || h > MAX_OBJECTS) return;
+        s_seen[h] = s_epoch;
+        const Obj& o = g_obj[h - 1];
+        if (o.parent && o.parent <= MAX_OBJECTS) s_seen[o.parent] = s_epoch;
+    };
+    u32 w = 0, hoisted = 0;
+    for (u32 i = 0; i < g_rec_count; i++) {
+        const Rec& r = g_rec[i];
+        if (r.kind == REC_UPLOAD && r.resolve_dst && r.resolve_dst <= MAX_OBJECTS && s_seen[r.resolve_dst] != s_epoch) {
+            /* two uploads into one image back to back: keep them ordered */
+            if (!hoisted) barrier_all(cb);
+            else if (s_up[r.resolve_dst] == s_epoch) barrier_all(cb);
+            s_up[r.resolve_dst] = s_epoch;
+            encode_upload(cb, r);
+            hoisted++;
+            continue;
+        }
+        for (u32 k = 0; k < RSX_BE_MAX_COLOR_TARGETS; k++) touch(r.rt[k]);
+        touch(r.depth);
+        touch(r.resolve_dst);
+        for (u32 k = 0; k < RSX_BE_MAX_TEXTURES; k++) touch(r.tex[k]);
+        for (u32 k = 0; k < RSX_BE_MAX_VERTEX_TEXTURES; k++) touch(r.vtex[k]);
+        if (w != i) g_rec[w] = r;
+        w++;
+    }
+    g_rec_count = w;
+    if (hoisted) barrier_all(cb);
 }
 
 /* Depth images per size, for passes whose guest named no zeta. */
@@ -1688,6 +1791,15 @@ void encode_records(VkCommandBuffer cb)
             }
             continue;
         }
+        if (g_rec[i].kind == REC_UPLOAD) {
+            init_layouts(cb);
+            barrier_all(cb);
+            while (i < g_rec_count && g_rec[i].kind == REC_UPLOAD) {
+                encode_upload(cb, g_rec[i++]);
+                barrier_all(cb);
+            }
+            continue;
+        }
         if (g_rec[i].kind == REC_COPY) {
             const Rec& r = g_rec[i++];
             Obj* src = obj(r.depth);
@@ -1745,7 +1857,7 @@ void encode_records(VkCommandBuffer cb)
         float cdepth = 1.0f;
         u8 cstencil = 0;
         while (i < g_rec_count && g_rec[i].kind != REC_DRAW && g_rec[i].kind != REC_DEPTH_RESOLVE &&
-               g_rec[i].kind != REC_DEPTH_PACK && g_rec[i].kind != REC_COPY) {
+               g_rec[i].kind != REC_DEPTH_PACK && g_rec[i].kind != REC_COPY && g_rec[i].kind != REC_UPLOAD) {
             const Rec& r = g_rec[i];
             if (r.kind == REC_CLEAR_COLOR) {
                 u32 k = 0;
@@ -1904,6 +2016,19 @@ bool slot_finish(u32 k, bool wait)
         if (r == VK_NOT_READY) return false;
     }
     sl.in_flight = false;
+    if (sl.timed && r == VK_SUCCESS) {
+        uint64_t ts[2] = {0, 0};
+        if (vkGetQueryPoolResults(g_dev, sl.qpool, 0, 2, sizeof ts, ts, sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            const uint64_t ns = (uint64_t)((double)((ts[1] - ts[0]) & g_ts_mask) * g_ts_period_ns);
+            if (ns < 10ull * 1000 * 1000 * 1000) {
+                g_gpu_busy_ns += ns;
+                g_gpu_timed++;
+                if (ns > g_gpu_busy_max_ns) g_gpu_busy_max_ns = ns;
+            }
+        }
+    }
+    sl.timed = false;
     if (sl.serial > g_completed) g_completed = sl.serial;
     vkResetDescriptorPool(g_dev, sl.dpool, 0);
     if (sl.publish && r == VK_SUCCESS)
@@ -1943,7 +2068,7 @@ void encode_and_submit(u32 present_surface)
 
     if (g_stage_used && !buffer_ensure(g_stage_buf, (VkDeviceSize)g_stage_used + UBO_PAD,
                                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) {
+                                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) {
         fprintf(stderr, "[RSX vulkan] staging allocation failed (%u bytes)\n", g_stage_used);
         g_rec_count = 0;
         g_stage_used = 0;
@@ -1955,8 +2080,14 @@ void encode_and_submit(u32 present_surface)
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(g_cb, &bi);
+    const VkQueryPool qp = g_slot[g_cur].qpool;
+    if (qp) {
+        vkCmdResetQueryPool(g_cb, qp, 0, 2);
+        vkCmdWriteTimestamp(g_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
+    }
     init_layouts(g_cb);
     barrier_all(g_cb);   /* GPU work stays in order across slots; only the CPU overlaps */
+    hoist_uploads(g_cb);
     encode_records(g_cb);
 
     u32 pw = 0, ph = 0;
@@ -1975,6 +2106,7 @@ void encode_and_submit(u32 present_surface)
         vkCmdPipelineBarrier(g_cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0,
                              nullptr, 0, nullptr);
     }
+    if (qp) vkCmdWriteTimestamp(g_cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
     vkEndCommandBuffer(g_cb);
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
@@ -1984,6 +2116,7 @@ void encode_and_submit(u32 present_surface)
     Slot& sl = g_slot[g_cur];
     if (qr == VK_SUCCESS) {
         sl.in_flight = true;
+        sl.timed = qp != VK_NULL_HANDLE;
         sl.serial = ++g_serial;
         sl.publish = publish;
         sl.pw = pw;
@@ -2428,6 +2561,11 @@ void be_present(void*, u32 surface)
         fprintf(stderr, "[RSX vulkan] frames (5s): %u presented, %u of an undrawn surface, %u of no surface | "
                 "%u mid-frame flushes | CPU waited %.0f ms for the GPU\n", g_pres_total, g_pres_unwritten,
                 g_pres_missing, g_mid_flushes, (double)g_gpu_wait_us / 1000.0);
+        fprintf(stderr, "[RSX vulkan] GPU (5s): %u submissions timed, busy %.0f ms (%.1f ms each, longest %.1f ms) | "
+                "uploads recorded into the frame %u | blocking one-off submissions %u, FIFO thread waited %.0f ms in them\n",
+                g_gpu_timed, g_gpu_busy_ns / 1e6, g_gpu_timed ? g_gpu_busy_ns / 1e6 / g_gpu_timed : 0.0,
+                g_gpu_busy_max_ns / 1e6, g_up_deferred, g_imm_count, g_imm_wait_us / 1000.0);
+        g_gpu_busy_ns = g_gpu_busy_max_ns = 0; g_gpu_timed = 0; g_up_deferred = 0; g_imm_count = 0; g_imm_wait_us = 0;
         fprintf(stderr, "[RSX vulkan] data (5s): staged %.1f MB (vertices %.1f, indices %.1f, rest %.1f) | "
                 "%u texture uploads, %.1f MB\n", g_st_total / 1048576.0, g_st_vb / 1048576.0, g_st_ib / 1048576.0,
                 (double)(g_st_total - (g_st_vb + g_st_ib < g_st_total ? g_st_vb + g_st_ib : g_st_total)) / 1048576.0,
@@ -2636,6 +2774,20 @@ bool init_device()
     for (u32 k = 0; k < NUM_SLOTS; k++) {
         vkAllocateCommandBuffers(g_dev, &cai, &g_slot[k].cb);
         vkCreateFence(g_dev, &fci, nullptr, &g_slot[k].fence);
+    }
+    {   /* GPU time per frame submission, for the 5 s report */
+        const u32 bits = qf[g_qfam].timestampValidBits;
+        if (bits && g_props.limits.timestampPeriod > 0.0f) {
+            g_ts_mask = bits >= 64 ? ~0ull : ((1ull << bits) - 1ull);
+            g_ts_period_ns = g_props.limits.timestampPeriod;
+            VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qpi.queryCount = 2;
+            for (u32 k = 0; k < NUM_SLOTS; k++)
+                if (vkCreateQueryPool(g_dev, &qpi, nullptr, &g_slot[k].qpool) != VK_SUCCESS) g_slot[k].qpool = VK_NULL_HANDLE;
+        }
+        fprintf(stderr, "[RSX vulkan] GPU frame timer %s (%u timestamp bits, %.2f ns per tick)\n",
+                g_slot[0].qpool ? "on" : "unavailable", bits, (double)g_props.limits.timestampPeriod);
     }
 
     VkDescriptorPoolSize sizes[] = {
