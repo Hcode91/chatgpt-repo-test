@@ -722,4 +722,34 @@ change("libs/video/rsx_draw_engine.c",
                 g.surfaces[i].offset == d->offset)
                 return i;
 #endif""")
+# SPU speed 1: shufb on ARM. Upstream's fast path is SSE4.1 only; arm64 fell
+# back to a 32-byte scalar loop and spu_shufb led every hot-spot sample.
+# Same algorithm as the SSE version: tbl2 over {a,b} with the control ^3
+# (SPU byte order), special selectors (>= 0x80) from a 16-entry table on the
+# high nibble. Checked against the reference on 200k random inputs.
+change("runtime/spu/spu_helpers.h",
+"""#else
+static inline u128 spu_shufb(u128 a, u128 b, u128 c) {""",
+"""#elif defined(__aarch64__)
+#include <arm_neon.h>
+static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
+    uint8x16x2_t ab;
+    uint8x16_t C;
+    memcpy(&ab.val[0], &a, 16); memcpy(&ab.val[1], &b, 16); memcpy(&C, &c, 16);
+    uint8x16_t r = vqtbl2q_u8(ab, vandq_u8(veorq_u8(C, vdupq_n_u8(3)), vdupq_n_u8(0x1F)));
+    static const uint8_t eu_shufb_lut[16] = {0,0,0,0, 0,0,0,0, 0,0,0,0, 0xFF,0xFF,0x80,0x80};
+    const uint8x16_t special = vqtbl1q_u8(vld1q_u8(eu_shufb_lut), vshrq_n_u8(C, 4));
+    r = vbslq_u8(vcgeq_u8(C, vdupq_n_u8(0x80)), special, r);
+    u128 out; memcpy(&out, &r, 16); return out;
+}
+#else
+static inline u128 spu_shufb(u128 a, u128 b, u128 c) {""")
+# SPU speed 2: bionic's setjmp() also saves the signal mask -- a
+# rt_sigprocmask syscall on every SPU job/run entry (the "libc.so+0xe916c
+# called from sigprocmask64" hot spot). Nothing here longjmps out of a signal
+# handler, so the mask-free pair is equivalent.
+for _f in ("runtime/spu/spu_drain.c", "runtime/spu/spu_channels.c"):
+    change(_f, "#include <setjmp.h>\n",
+           "#include <setjmp.h>\n#if defined(__ANDROID__)\n#undef setjmp\n#undef longjmp\n"
+           "#define setjmp(e) _setjmp(e)\n#define longjmp(e, v) _longjmp((e), (v))\n#endif\n")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
