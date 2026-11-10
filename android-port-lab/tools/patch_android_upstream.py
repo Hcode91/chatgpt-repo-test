@@ -1692,4 +1692,50 @@ change("libs/spurs/cellSpurs.c",
         if (!(e && *e == '0')) eu_thread_boost("audio SPU kernel (inst 1)", -10);
     }
 #endif""")
+# Indexed draws on the GPU-fetch path: the generic duplicate-vertex pass hashes
+# every index. When the indices cover a dense range with one base index, map
+# them directly (index - lowest) and make the vertex list that range.
+change("libs/video/rsx_draw_engine.c",
+"""    if (allow_remap && dc.n_refs > 1) {
+        u32 unique = dc.n_refs;""",
+"""#if defined(__ANDROID__)
+    int eu_direct = 0;
+    if (allow_remap && dc.n_refs > 1 && !dc.inl && eu_vk_pull_ok && eu_vk_pull_ok()) eu_direct = eu_remap_direct();
+    if (!eu_direct)
+#endif
+    if (allow_remap && dc.n_refs > 1) {
+        u32 unique = dc.n_refs;""")
+change("libs/video/rsx_draw_engine.c",
+"""#if defined(__ANDROID__)
+extern int eu_vk_pull_ok(void) __attribute__((weak));""",
+"""#if defined(__ANDROID__)
+static int eu_remap_direct(void)
+{
+    const u32 n = dc.n_refs;
+    const u32 base = dc.refs[0].base_index;
+    u32 lo = dc.refs[0].vertex_id, hi = lo;
+    int in_order = 1;
+    for (u32 i = 1; i < n; i++) {
+        const u32 v = dc.refs[i].vertex_id;
+        if (dc.refs[i].base_index != base) return 0;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+        if (v != dc.refs[0].vertex_id + i) in_order = 0;
+    }
+    if (in_order) { dc.refs_remapped = 0; return 1; }      /* already one reference per vertex, in order */
+    const u64 span = (u64)hi - lo + 1u;
+    if (span > n) return 0;                                /* sparse: the generic pass shades fewer vertices */
+    if (n > dc.ref_remap.occurrence_capacity) {
+        u32* occ = (u32*)realloc(dc.ref_remap.occurrence_to_unique, (size_t)n * sizeof(u32));
+        if (!occ) return 0;
+        dc.ref_remap.occurrence_to_unique = occ;
+        dc.ref_remap.occurrence_capacity = n;
+    }
+    for (u32 i = 0; i < n; i++) dc.ref_remap.occurrence_to_unique[i] = dc.refs[i].vertex_id - lo;
+    for (u32 k = 0; k < (u32)span; k++) { dc.refs[k].vertex_id = lo + k; dc.refs[k].base_index = base; }
+    dc.refs_remapped = 1;
+    dc.n_refs = (u32)span;
+    return 1;
+}
+extern int eu_vk_pull_ok(void) __attribute__((weak));""")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")

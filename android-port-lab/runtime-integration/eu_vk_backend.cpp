@@ -751,7 +751,7 @@ u32 g_shader_failures;
  * EU_VK_SCALAR_REGS=0 turns it off. */
 int g_scalar_ok, g_scalar_skip;
 u32 g_pull_pipe_failures, g_pull_draws, g_cpu_draws;
-uint64_t g_pull_raw_bytes;
+uint64_t g_pull_raw_bytes, g_pull_raw_shared;
 std::string scalarize_regs(const char* src, bool vs)
 {
     static int on = -1;
@@ -813,16 +813,16 @@ std::string scalarize_regs(const char* src, bool vs)
 static const char kPullHlsl[] = R"EUPULL(struct VSInput { uint2 eu_ref : ATTR0; };
 [[vk::binding(50, 0)]] cbuffer EuPull : register(b7) { uint4 eu_pa[16]; uint4 eu_pb[16]; float4 eu_pd[16]; };
 [[vk::binding(51, 0)]] ByteAddressBuffer eu_raw : register(t30);
-uint eu_b(uint a) { return (eu_raw.Load(a & ~3u) >> ((a & 3u) * 8u)) & 0xFFu; }
-uint eu_be16(uint a) { return (eu_b(a) << 8) | eu_b(a + 1u); }
-uint eu_be32(uint a)
+uint eu_le32(uint a)
 {
-    if ((a & 3u) == 0u) {
-        const uint w = eu_raw.Load(a);
-        return ((w & 0xFFu) << 24) | ((w & 0xFF00u) << 8) | ((w >> 8) & 0xFF00u) | (w >> 24);
-    }
-    return (eu_b(a) << 24) | (eu_b(a + 1u) << 16) | (eu_b(a + 2u) << 8) | eu_b(a + 3u);
+    const uint w0 = eu_raw.Load(a & ~3u);
+    const uint sh = (a & 3u) * 8u;
+    if (sh == 0u) return w0;
+    const uint w1 = eu_raw.Load((a & ~3u) + 4u);
+    return (w0 >> sh) | (w1 << (32u - sh));
 }
+uint eu_swap(uint w) { return ((w & 0xFFu) << 24) | ((w & 0xFF00u) << 8) | ((w >> 8) & 0xFF00u) | (w >> 24); }
+uint eu_be16w(uint w, uint k) { const uint h = (w >> (k * 16u)) & 0xFFFFu; return ((h & 0xFFu) << 8) | (h >> 8); }
 float eu_h2f(uint h)
 {
     const uint sg = (h >> 15) << 31, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
@@ -839,21 +839,33 @@ float4 eu_attr(uint n, uint2 ref)
     const uint p = a.x + (el - b.x) * a.y;
     float4 o = float4(0.0, 0.0, 0.0, 1.0);
     if (type == 6u) {
-        const uint w = eu_be32(p);
+        const uint w = eu_swap(eu_le32(p));
         o.x = float(int(w << 21) >> 21) / 1023.0;
         o.y = float(int(w << 10) >> 21) / 1023.0;
         o.z = float(int(w) >> 22) / 511.0;
         return o;
     }
+    if (type == 2u) {
+        [unroll] for (uint c = 0u; c < 4u; c++)
+            if (c < size) o[c] = asfloat(eu_swap(eu_le32(p + c * 4u)));
+        return o;
+    }
+    if (type == 4u || type == 7u) {
+        const uint w = eu_le32(p);
+        [unroll] for (uint c = 0u; c < 4u; c++)
+            if (c < size) { const float v = float((w >> (c * 8u)) & 0xFFu); o[c] = (type == 4u) ? v / 255.0 : v; }
+        return o;
+    }
+    const uint w0 = eu_le32(p);
+    uint w1 = 0u;
+    if (size > 2u) w1 = eu_le32(p + 4u);
     [unroll] for (uint c = 0u; c < 4u; c++) {
         if (c < size) {
+            const uint h = eu_be16w((c < 2u) ? w0 : w1, c & 1u);
             float v = 0.0;
-            if (type == 2u) v = asfloat(eu_be32(p + c * 4u));
-            else if (type == 3u) v = eu_h2f(eu_be16(p + c * 2u));
-            else if (type == 4u) v = float(eu_b(p + c)) / 255.0;
-            else if (type == 7u) v = float(eu_b(p + c));
-            else if (type == 1u) v = float(int(eu_be16(p + c * 2u) << 16) >> 16) / 32767.0;
-            else if (type == 5u) v = float(int(eu_be16(p + c * 2u) << 16) >> 16);
+            if (type == 3u) v = eu_h2f(h);
+            else if (type == 1u) v = float(int(h << 16) >> 16) / 32767.0;
+            else if (type == 5u) v = float(int(h << 16) >> 16);
             o[c] = v;
         }
     }
@@ -2693,8 +2705,8 @@ void be_bind_targets(void*, const u32* surfaces, u32 count, u32 depth)
 void be_bind_pipeline(void*, u32 pipeline) { g_pending.pipeline = pipeline; }
 /* Constant blocks: the engine hands over the whole vertex-program block (~7.5 KB) on every draw, almost
  * always unchanged. Reuse an identical block already staged in this submission instead of copying it again
- * (the last few distinct blocks per stage are remembered). EU_VK_CB_REUSE=0 turns it off. */
-struct CbSeen { u32 off, bytes, epoch; };
+ * (found through a small hash table per stage, confirmed byte for byte). EU_VK_CB_REUSE=0 turns it off. */
+struct CbSeen { u32 off, bytes, epoch; u64 hash; };
 bool stage_constants(int stage, const void* data, u32 bytes, u32* off)
 {
     static int on = -1;
@@ -2703,24 +2715,27 @@ bool stage_constants(int stage, const void* data, u32 bytes, u32* off)
         on = (e && *e == '0') ? 0 : 1;
         fprintf(stderr, "[RSX vulkan] identical constant blocks staged once per frame: %s (EU_VK_CB_REUSE)\n", on ? "on" : "off");
     }
-    static CbSeen seen[2][4];
-    static u32 next[2];
+    static CbSeen seen[2][512];
+    u64 h = 0;
     if (on && bytes && data) {
-        for (u32 k = 0; k < 4; k++) {
-            const CbSeen& c = seen[stage][k];
-            if (c.epoch == g_stage_epoch && c.bytes == bytes && (u64)c.off + bytes <= g_stage_used &&
-                memcmp(g_stage + c.off, data, bytes) == 0) {
-                *off = c.off;
-                g_cb_reused++;
-                g_cb_bytes_saved += bytes;
-                return true;
-            }
+        const u8* p = (const u8*)data;
+        h = 0x9E3779B97F4A7C15ull ^ bytes;
+        u32 i = 0;
+        for (; i + 8 <= bytes; i += 8) { u64 w; memcpy(&w, p + i, 8); h = (h ^ w) * 0xFF51AFD7ED558CCDull; h ^= h >> 29; }
+        for (; i < bytes; i++) h = (h ^ p[i]) * 0x100000001B3ull;
+        const CbSeen& c = seen[stage][(u32)(h >> 40) & 511u];
+        if (c.epoch == g_stage_epoch && c.hash == h && c.bytes == bytes && (u64)c.off + bytes <= g_stage_used &&
+            memcmp(g_stage + c.off, data, bytes) == 0) {
+            *off = c.off;
+            g_cb_reused++;
+            g_cb_bytes_saved += bytes;
+            return true;
         }
     }
     if (!stage_copy(data, bytes, off)) return false;
-    if (bytes) {
-        CbSeen& c = seen[stage][next[stage]++ & 3u];
-        c.off = *off; c.bytes = bytes; c.epoch = g_stage_epoch;
+    if (on && bytes && data) {
+        CbSeen& c = seen[stage][(u32)(h >> 40) & 511u];
+        c.off = *off; c.bytes = bytes; c.epoch = g_stage_epoch; c.hash = h;
     }
     return true;
 }
@@ -2775,21 +2790,37 @@ bool stage_pull(Rec& r)
                     again = true;
                 }
     }
-    u32 raw0 = 0, raw1 = 0;
+    /* A vertex buffer already staged in this submission (same guest bytes, checked) is shared, not copied
+     * again. Each block is padded so the shader's word reads never leave the bound range. */
+    struct RawSeen { const u8* lo; u32 len, blk, total, epoch; };
+    static RawSeen seen[1024];
+    const u32 epoch0 = g_stage_epoch;
+    u32 raw0 = 0xFFFFFFFFu, raw1 = 0;
     for (u32 k = 0; k < nr; k++) {
         const u32 mis = (u32)((uintptr_t)rng[k].lo & 3u);
         const u64 len = (u64)(rng[k].hi - rng[k].lo);
-        const u32 total = (u32)((mis + len + 3u) & ~(u64)3u);
-        u32 off = 0;
-        if (len > (64u << 20) || !stage_reserve(total, &off)) return false;
-        memset(g_stage + off, 0, total);
-        memcpy(g_stage + off + mis, rng[k].lo, (size_t)len);
-        rng[k].off = off + mis;   /* buffer address of rng[k].lo */
-        if (k == 0) raw0 = off;
-        raw1 = off + total;
-        g_pull_raw_bytes += len;
+        if (len > (64u << 20)) return false;
+        const u32 total = (u32)((mis + len + 3u) & ~(u64)3u) + 8u;
+        RawSeen& e = seen[(((uintptr_t)rng[k].lo >> 4) ^ ((u32)len * 2654435761u)) & 1023u];
+        u32 blk = 0;
+        if (e.epoch == g_stage_epoch && e.lo == rng[k].lo && e.len == (u32)len && (u64)e.blk + e.total <= g_stage_used &&
+            memcmp(g_stage + e.blk + mis, rng[k].lo, (size_t)len) == 0) {
+            blk = e.blk;
+            g_pull_raw_shared += len;
+        } else {
+            if (!stage_reserve(total, &blk)) return false;
+            if (g_stage_epoch != epoch0) return false;   /* the staging data started over mid-draw */
+            memset(g_stage + blk, 0, mis);
+            memcpy(g_stage + blk + mis, rng[k].lo, (size_t)len);
+            memset(g_stage + blk + mis + len, 0, total - mis - (u32)len);
+            e = {rng[k].lo, (u32)len, blk, total, g_stage_epoch};
+            g_pull_raw_bytes += len;
+        }
+        rng[k].off = blk + mis;   /* buffer address of rng[k].lo */
+        if (blk < raw0) raw0 = blk;
+        if (blk + total > raw1) raw1 = blk + total;
     }
-    if (!nr) { raw0 = 0; raw1 = 4; if (!stage_reserve(4, &raw0)) return false; memset(g_stage + raw0, 0, 4); raw1 = raw0 + 4; }
+    if (!nr) { if (!stage_reserve(16, &raw0)) return false; memset(g_stage + raw0, 0, 16); raw1 = raw0 + 16; }
     u32 tab[PULL_TABLE_BYTES / 4];
     memset(tab, 0, sizeof tab);
     for (u32 a = 0; a < 16; a++) {
@@ -3099,10 +3130,10 @@ void be_present(void*, u32 surface)
         fprintf(stderr, "[RSX vulkan] constant blocks reused instead of copied (5s): %llu (%.1f MB not copied)\n",
                 (unsigned long long)g_cb_reused, g_cb_bytes_saved / 1048576.0);
         g_cb_reused = g_cb_bytes_saved = 0;
-        fprintf(stderr, "[RSX vulkan] vertex fetch (5s): %u draws on the GPU (%.1f MB raw vertex data), %u decoded on the CPU | "
-                "GPU-fetch programs that could not be built %u\n", g_pull_draws, g_pull_raw_bytes / 1048576.0, g_cpu_draws,
-                g_pull_pipe_failures);
-        g_pull_draws = g_cpu_draws = 0; g_pull_raw_bytes = 0;
+        fprintf(stderr, "[RSX vulkan] vertex fetch (5s): %u draws on the GPU (%.1f MB raw vertex data copied, %.1f MB shared), "
+                "%u decoded on the CPU | GPU-fetch programs that could not be built %u\n", g_pull_draws,
+                g_pull_raw_bytes / 1048576.0, g_pull_raw_shared / 1048576.0, g_cpu_draws, g_pull_pipe_failures);
+        g_pull_draws = g_cpu_draws = 0; g_pull_raw_bytes = g_pull_raw_shared = 0;
         fprintf(stderr, "[RSX vulkan] data (5s): staged %.1f MB (vertices %.1f, indices %.1f, rest %.1f) | "
                 "%u texture uploads, %.1f MB\n", g_st_total / 1048576.0, g_st_vb / 1048576.0, g_st_ib / 1048576.0,
                 (double)(g_st_total - (g_st_vb + g_st_ib < g_st_total ? g_st_vb + g_st_ib : g_st_total)) / 1048576.0,
