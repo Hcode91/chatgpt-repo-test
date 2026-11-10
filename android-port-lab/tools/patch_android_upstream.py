@@ -876,4 +876,113 @@ change("libs/video/rsx_draw_engine.c",
     z->eu_packed = 0; z->eu_packed_src = 0;
 #endif
     z->location = location; z->offset = offset;""")
+# NV3089 blits out of a live render target. The game copies its lit scene
+# (and G-buffer pieces) into other buffers with the 2D engine and samples
+# those; upstream mirrors such blits only in the Windows live renderer, so on
+# Android the copy happened in guest memory alone, which never holds the
+# GPU-rendered image, and the composite that reads it went black. Mirror the
+# blit on the GPU into a target registered at the destination address, so the
+# texture read finds it like any render-to-texture surface. A later upload
+# from memory into such a target drops it again.
+change("libs/video/rsx_draw_engine.c",
+"""    u32 stamp;             /* Android: last use, for picking among aliases */
+} eng_surface;""",
+"""    u32 stamp;             /* Android: last use, for picking among aliases */
+    u32 eu_blit;           /* Android: created by a mirrored NV3089 blit */
+} eng_surface;""")
+change("libs/video/rsx_draw_engine.c",
+"""    s->stamp = ++eu_surface_tick;
+#endif
+    if (slot == g.n_surfaces) g.n_surfaces++;""",
+"""    s->stamp = ++eu_surface_tick;
+    s->eu_blit = 0;
+#endif
+    if (slot == g.n_surfaces) g.n_surfaces++;""")
+change("libs/video/rsx_draw_engine.c",
+"""void rsx_draw_engine_set_backend(const rsx_draw_backend* backend)""",
+"""#if defined(__ANDROID__)
+extern int eu_vk_copy_surface(u32 src, u32 dst, u32 sx, u32 sy, u32 sw, u32 sh,
+                              u32 dx, u32 dy, u32 dw, u32 dh) __attribute__((weak));
+/* The RGBA8 target whose pitch-linear memory holds addr (newest alias wins). */
+static u32 eu_surface_at(u32 location, u32 addr, u32 pitch, u32* x, u32* y)
+{
+    u32 best = ENG_INVALID, best_stamp = 0;
+    for (u32 i = 0; i < g.n_surfaces; i++) {
+        const eng_surface* s = &g.surfaces[i];
+        if (!s->handle || s->location != location || s->fmt != RSX_BE_FMT_R8G8B8A8 || addr < s->offset)
+            continue;
+        const u32 d = addr - s->offset;
+        if (d / pitch >= s->h || (d % pitch) / 4u >= s->w) continue;
+        if (best == ENG_INVALID || s->stamp >= best_stamp) {
+            best = i; best_stamp = s->stamp;
+            *x = (d % pitch) / 4u; *y = d / pitch;
+        }
+    }
+    return best;
+}
+
+void eu_engine_blit(int src_local, u32 src_off, u32 src_pitch, u32 u0, u32 v0,
+                    int dst_local, u32 dst_off, u32 dst_pitch, u32 out_x, u32 out_y,
+                    u32 out_w, u32 out_h, u32 ds_dx, u32 dt_dy)
+{
+    static u32 logs = 0, gpu = 0, mem = 0, dropped = 0;
+    if (!g.ready || !g.be || !eu_vk_copy_surface || !src_pitch || !dst_pitch || !out_w || !out_h) return;
+    const u32 sloc = src_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+    const u32 dloc = dst_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+    const u32 daddr = dst_off + out_y * dst_pitch + out_x * 4u;
+    u32 sx = 0, sy = 0, dx = 0, dy = 0;
+    const u32 si = eu_surface_at(sloc, src_off, src_pitch, &sx, &sy);
+    u32 di = eu_surface_at(dloc, daddr, dst_pitch, &dx, &dy);
+    if (si == ENG_INVALID) {
+        /* an upload from memory: a blit-made target here would hide it */
+        mem++;
+        if (di != ENG_INVALID && g.surfaces[di].eu_blit && g.surfaces[di].offset == dst_off) {
+            g.be->color_target_release(g.be->user, g.surfaces[di].handle);
+            g.surfaces[di].handle = 0;
+            dropped++;
+        }
+        return;
+    }
+    sx += u0; sy += v0;
+    u32 sw = (u32)(((u64)out_w * ds_dx) >> 20), sh = (u32)(((u64)out_h * dt_dy) >> 20);
+    if (!sw) sw = 1;
+    if (!sh) sh = 1;
+    if (di == ENG_INVALID || di == si) {
+        if (out_x || out_y) return;   /* into the middle of something untracked */
+        di = eng_surface_get(dloc, dst_off, out_w, out_h, RSX_BE_FMT_R8G8B8A8);
+        if (di == ENG_INVALID || di == si) return;
+        g.surfaces[di].eu_blit = 1;
+        dx = dy = 0;
+    }
+    g.surfaces[di].stamp = ++eu_surface_tick;
+    const int ok = eu_vk_copy_surface(g.surfaces[si].handle, g.surfaces[di].handle,
+                                      sx, sy, sw, sh, dx, dy, out_w, out_h);
+    gpu++;
+    if (logs < 32) {
+        logs++;
+        fprintf(stderr, "[blit] %s %u:0x%08X (h%u %ux%u) %ux%u at %u,%u -> %u:0x%08X (h%u %ux%u) %ux%u at %u,%u"
+                        " | so far %u from targets, %u from memory, %u blit targets dropped\\n",
+                ok ? "mirrored" : "NOT mirrored", sloc, g.surfaces[si].offset, g.surfaces[si].handle,
+                g.surfaces[si].w, g.surfaces[si].h, sw, sh, sx, sy, dloc, g.surfaces[di].offset,
+                g.surfaces[di].handle, g.surfaces[di].w, g.surfaces[di].h, out_w, out_h, dx, dy,
+                gpu, mem, dropped);
+    }
+}
+#endif
+
+void rsx_draw_engine_set_backend(const rsx_draw_backend* backend)""")
+change("libs/video/cellGcmSys.c",
+"""    /* Only the 32-bit colour formats are handled; anything else would need a
+     * per-format converter and is better skipped loudly than written wrong. */""",
+"""#if defined(__ANDROID__)
+    { extern void eu_engine_blit(int, u32, u32, u32, u32, int, u32, u32, u32, u32, u32, u32, u32, u32)
+          __attribute__((weak));
+      if (eu_engine_blit && rsx_draw_engine_enabled())
+          eu_engine_blit(s_nv3089.src_dma != 0xFEED0001u, s_nv3089.in_off, in_pitch,
+                         (s_nv3089.in_uv & 0xFFFF) >> 4, (s_nv3089.in_uv >> 16) >> 4,
+                         s_gcm2d.dst_dma != 0xFEED0001u, s_gcm2d.dst_offset, dst_pitch,
+                         out_x, out_y, out_w, out_h, s_nv3089.ds_dx, s_nv3089.dt_dy); }
+#endif
+    /* Only the 32-bit colour formats are handled; anything else would need a
+     * per-format converter and is better skipped loudly than written wrong. */""")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")

@@ -104,7 +104,7 @@ namespace {
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetStencilReference) \
     X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCmdBindDescriptorSets) \
     X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) X(vkCmdDraw) \
-    X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkResetDescriptorPool)
+    X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkResetDescriptorPool) X(vkCmdBlitImage)
 #define EU_VK_DECL(f) PFN_##f f = nullptr;
 EU_VK_GLOBAL(EU_VK_DECL)
 EU_VK_FUNCS(EU_VK_DECL)
@@ -1057,7 +1057,7 @@ VkPipeline helper_pipeline(VkShaderModule fs, VkFormat fmt)
 }
 
 /* ------------------------------------------------------------------ records */
-enum RecKind { REC_DRAW, REC_CLEAR_COLOR, REC_CLEAR_DS, REC_DEPTH_RESOLVE, REC_DEPTH_PACK };
+enum RecKind { REC_DRAW, REC_CLEAR_COLOR, REC_CLEAR_DS, REC_DEPTH_RESOLVE, REC_DEPTH_PACK, REC_COPY };
 struct Rec {
     RecKind kind;
     u32 rt[RSX_BE_MAX_COLOR_TARGETS];
@@ -1080,6 +1080,7 @@ struct Rec {
     float clear_depth;
     u8 clear_stencil;
     u32 resolve_dst;
+    u32 copy_rect[8];   /* REC_COPY: source x y w h, destination x y w h */
 };
 Rec* g_rec;   /* MAX_RECORDS, heap */
 u32 g_dropped;
@@ -1655,6 +1656,33 @@ void encode_records(VkCommandBuffer cb)
             }
             continue;
         }
+        if (g_rec[i].kind == REC_COPY) {
+            const Rec& r = g_rec[i++];
+            Obj* src = obj(r.depth);
+            Obj* dst = obj(r.resolve_dst);
+            if (!src || !dst || !src->img || !dst->img) continue;
+            const u32* c = r.copy_rect;
+            VkImageBlit b{};
+            b.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            b.dstSubresource = b.srcSubresource;
+            b.srcOffsets[0] = {(int32_t)c[0], (int32_t)c[1], 0};
+            b.srcOffsets[1] = {(int32_t)(c[0] + c[2]), (int32_t)(c[1] + c[3]), 1};
+            b.dstOffsets[0] = {(int32_t)c[4], (int32_t)c[5], 0};
+            b.dstOffsets[1] = {(int32_t)(c[4] + c[6]), (int32_t)(c[5] + c[7]), 1};
+            const bool scaled = c[2] != c[6] || c[3] != c[7];
+            init_layouts(cb);   /* the destination may be brand new */
+            barrier_all(cb);
+            vkCmdBlitImage(cb, src->img, VK_IMAGE_LAYOUT_GENERAL, dst->img, VK_IMAGE_LAYOUT_GENERAL, 1, &b,
+                           scaled ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+            barrier_all(cb);
+            if (g_cap.active) {
+                char b2[128];
+                snprintf(b2, sizeof b2, "pass %u: copy %ux%u at %u,%u -> %ux%u at %u,%u: ", g_cap.passes++, c[2], c[3],
+                         c[0], c[1], c[6], c[7], c[4], c[5]);
+                cap_line(std::string(b2) + obj_desc(r.depth) + " -> " + obj_desc(r.resolve_dst), -1);
+            }
+            continue;
+        }
         if (g_rec[i].kind == REC_DEPTH_RESOLVE) {
             const Rec& r = g_rec[i++];
             Obj* src = obj(r.depth);
@@ -1685,7 +1713,7 @@ void encode_records(VkCommandBuffer cb)
         float cdepth = 1.0f;
         u8 cstencil = 0;
         while (i < g_rec_count && g_rec[i].kind != REC_DRAW && g_rec[i].kind != REC_DEPTH_RESOLVE &&
-               g_rec[i].kind != REC_DEPTH_PACK) {
+               g_rec[i].kind != REC_DEPTH_PACK && g_rec[i].kind != REC_COPY) {
             const Rec& r = g_rec[i];
             if (r.kind == REC_CLEAR_COLOR) {
                 u32 k = 0;
@@ -2084,6 +2112,35 @@ extern "C" u32 eu_vk_depth_pack(u32 snapshot, u32 w, u32 h)
     r.depth = snapshot;
     r.resolve_dst = dst;
     return dst;
+}
+
+/* The engine (Android patch) mirrors an NV3089 blit whose source is a live
+ * render target: the game copies its lit scene into another buffer and samples
+ * that, and the guest-memory copy alone is empty because the scene exists only
+ * on the GPU. Same-format RGBA8 copies only (blit + linear filter are
+ * guaranteed for it). Returns 1 when recorded. */
+extern "C" int eu_vk_copy_surface(u32 src, u32 dst, u32 sx, u32 sy, u32 sw, u32 sh, u32 dx, u32 dy, u32 dw,
+                                  u32 dh)
+{
+    if (!g_active || src == dst) return 0;
+    Obj* s = obj(src);
+    Obj* d = obj(dst);
+    if (!s || !d || s->depth || d->depth || s->parent || d->parent || s->cube || d->cube) return 0;
+    if (s->fmt != VK_FORMAT_R8G8B8A8_UNORM || d->fmt != VK_FORMAT_R8G8B8A8_UNORM) return 0;
+    if (!sw || !sh || !dw || !dh || sx >= s->w || sy >= s->h || dx >= d->w || dy >= d->h) return 0;
+    if (sx + sw > s->w) sw = s->w - sx;
+    if (sy + sh > s->h) sh = s->h - sy;
+    if (dx + dw > d->w) dw = d->w - dx;
+    if (dy + dh > d->h) dh = d->h - dy;
+    rec_room();
+    Rec& r = g_rec[g_rec_count++];
+    memset(&r, 0, sizeof r);
+    r.kind = REC_COPY;
+    r.depth = src;
+    r.resolve_dst = dst;
+    const u32 c[8] = {sx, sy, sw, sh, dx, dy, dw, dh};
+    memcpy(r.copy_rect, c, sizeof c);
+    return 1;
 }
 
 u32 be_pipeline_create(void*, const char* vs_hlsl, const char* ps_hlsl, const rsx_be_render_state* rs,
