@@ -1106,6 +1106,86 @@ change("libs/video/cellGcmSys.c",
                         vm_read32(dea)) g_eu_draw_tag = eu_fifo_tag_draw(dea); }
 #endif
                   if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }""")
+# Feedback reads: a pass that samples the very target it is drawing into (the
+# frame's final composite reads the lit scene at its own colour target's
+# address). On the PS3 that reads the pixels already rendered there; here the
+# "never sample a target this draw writes" rule sent it to guest memory, which
+# is all zeros for a GPU-only target -> the black final picture. Give such reads
+# a copy of the target taken when the pass's target set was bound (one copy per
+# pass, not per draw).
+change("libs/video/rsx_draw_engine.c",
+"""    u32 eu_blit;           /* Android: created by a mirrored NV3089 blit */""",
+"""    u32 eu_blit;           /* Android: created by a mirrored NV3089 blit */
+    u32 eu_fb, eu_fb_serial; /* Android: copy of this target for passes that sample it */""")
+change("libs/video/rsx_draw_engine.c",
+"""    if (s->handle) g.be->color_target_release(g.be->user, s->handle);
+    s->location = location;""",
+"""    if (s->handle) g.be->color_target_release(g.be->user, s->handle);
+#if defined(__ANDROID__)
+    if (slot < g.n_surfaces && s->eu_fb) g.be->color_target_release(g.be->user, s->eu_fb);
+    s->eu_fb = 0; s->eu_fb_serial = 0;
+#endif
+    s->location = location;""")
+change("libs/video/rsx_draw_engine.c",
+"""static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,""",
+"""#if defined(__ANDROID__)
+extern int eu_vk_copy_surface(u32 src, u32 dst, u32 sx, u32 sy, u32 sw, u32 sh,
+                              u32 dx, u32 dy, u32 dw, u32 dh) __attribute__((weak));
+static u32 eu_fb_serial_now;
+/* The copy of surface si for this pass (made on first use in the pass). */
+static u32 eu_feedback_copy(u32 si)
+{
+    static u32 made, logs;
+    eng_surface* s = &g.surfaces[si];
+    if (!eu_vk_copy_surface || s->fmt != RSX_BE_FMT_R8G8B8A8 || !s->handle) return 0;
+    if (!s->eu_fb) {
+        s->eu_fb = g.be->color_target_create(g.be->user, s->fmt, s->w, s->h, NULL, 0);
+        s->eu_fb_serial = 0;
+        if (!s->eu_fb) return 0;
+    }
+    if (s->eu_fb_serial != eu_fb_serial_now) {
+        if (!eu_vk_copy_surface(s->handle, s->eu_fb, 0, 0, s->w, s->h, 0, 0, s->w, s->h)) return 0;
+        s->eu_fb_serial = eu_fb_serial_now;
+        made++;
+        if (logs < 8) {
+            logs++;
+            fprintf(stderr, "[feedback] pass samples its own target h%u (%ux%u at %u:0x%08X): reading copy h%u (%u copies so far)\\n",
+                    s->handle, s->w, s->h, s->location, s->offset, s->eu_fb, made);
+        }
+    }
+    return s->eu_fb;
+}
+#endif
+
+static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,""")
+change("libs/video/rsx_draw_engine.c",
+"""        int sampled = -1;
+#if defined(__ANDROID__)""",
+"""        int sampled = -1;
+#if defined(__ANDROID__)
+        int eu_own_match = -1;
+        { static u32 last_key = 0xFFFFFFFFu;
+          u32 key = n_targets * 2654435761u;
+          for (u32 k = 0; k < n_targets; k++) key = key * 31u + target_slots[k] + 1u;
+          if (key != last_key) { last_key = key; eu_fb_serial_now++; } }""")
+change("libs/video/rsx_draw_engine.c",
+"""                if (own) continue;""",
+"""                if (own) {
+                    if (c->w == t.width && c->h == t.height) eu_own_match = (int)i;
+                    continue;
+                }""")
+change("libs/video/rsx_draw_engine.c",
+"""        for (u32 i = 0; i < g.n_surfaces && sampled < 0 && 0; i++) {""",
+"""        if (sampled < 0 && eu_own_match >= 0) {
+            const u32 fb = eu_feedback_copy((u32)eu_own_match);
+            if (fb) {
+                const u32 view = g.be->surface_view
+                    ? g.be->surface_view(g.be->user, fb, t.remap & 0xFFFFu, t.format) : 0;
+                textures[u] = view ? view : fb;
+                continue;
+            }
+        }
+        for (u32 i = 0; i < g.n_surfaces && sampled < 0 && 0; i++) {""")
 # Whole-register SPU integer helpers on ARM64. spu_helpers_vec.h only exists
 # for SSE4.1 hosts, so on ARM64 the register-cached SPU job code ran every
 # integer op lane by lane through the reference helpers. Use the generic-vector
