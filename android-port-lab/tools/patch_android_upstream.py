@@ -1535,6 +1535,14 @@ change("libs/video/cellGcmSys.c",
 """    AcquireSRWLockExclusive(&s_gcm_fifo_lock);
 #if defined(__ANDROID__)
     { extern unsigned long long g_eu_prof[16];
+      /* The FIFO thread is what the game waits on: give it the fastest core (EU_FIFO_PLACE=0 = leave it). */
+      static __thread int eu_placed;
+      if (!eu_placed) {
+          extern void eu_thread_place(const char*, int, int);
+          const char* e = getenv("EU_FIFO_PLACE");
+          eu_placed = 1;
+          if (!(e && *e == '0')) eu_thread_place("RSX FIFO thread", -8, 1);
+      }
       struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
       gcm_rsx_process_fifo_unlocked();
       clock_gettime(CLOCK_MONOTONIC, &b);
@@ -1646,13 +1654,17 @@ change("libs/audio/cellAudio.c",
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-/* Raise this thread's priority (nice value, lower = more CPU) and keep it off the slowest core cluster. */
-void eu_thread_boost(const char* what, int nice_val)
+/* Raise this thread's priority (nice value, lower = more CPU) and choose its cores.
+ * mode 0: any core faster than the slowest cluster; 1: the fastest core(s) only; 2: faster cores except the
+ * fastest (so whatever is given mode 1 has that core to itself). */
+void eu_thread_place(const char* what, int nice_val, int mode);
+void eu_thread_boost(const char* what, int nice_val) { eu_thread_place(what, nice_val, 0); }
+void eu_thread_place(const char* what, int nice_val, int mode)
 {
     const pid_t tid = (pid_t)syscall(SYS_gettid);
     long ncpu = sysconf(_SC_NPROCESSORS_CONF);
     if (ncpu > 32) ncpu = 32;
-    unsigned long fmax[32] = {0}, lo = ~0ul;
+    unsigned long fmax[32] = {0}, lo = ~0ul, top = 0;
     for (long c = 0; c < ncpu; c++) {
         char path[96];
         snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", c);
@@ -1661,25 +1673,32 @@ void eu_thread_boost(const char* what, int nice_val)
         if (fscanf(f, "%lu", &fmax[c]) != 1) fmax[c] = 0;
         fclose(f);
         if (fmax[c] && fmax[c] < lo) lo = fmax[c];
+        if (fmax[c] > top) top = fmax[c];
     }
     cpu_set_t set;
     CPU_ZERO(&set);
     int nfast = 0;
-    for (long c = 0; c < ncpu; c++) if (fmax[c] && fmax[c] > lo) { CPU_SET((int)c, &set); nfast++; }
+    for (long c = 0; c < ncpu; c++) {
+        if (!fmax[c] || fmax[c] <= lo) continue;
+        if (mode == 1 && fmax[c] != top) continue;
+        if (mode == 2 && fmax[c] == top) continue;
+        CPU_SET((int)c, &set);
+        nfast++;
+    }
     const int aff = nfast ? sched_setaffinity(tid, sizeof set, &set) : -1;
     const int aff_err = aff ? errno : 0;
     const int pr = setpriority(PRIO_PROCESS, (id_t)tid, nice_val);
     const int pr_err = pr ? errno : 0;
-    fprintf(stderr, "[boost] %s (tid %d): priority %d %s, %s (%d faster cores)\\n", what, (int)tid, nice_val,
-            pr == 0 ? "set" : strerror(pr_err), aff == 0 ? "kept on the faster cores" : (nfast ? strerror(aff_err) : "no core info"),
-            nfast);
+    fprintf(stderr, "[boost] %s (tid %d): priority %d %s, %s (%d core(s), placement %d)\\n", what, (int)tid, nice_val,
+            pr == 0 ? "set" : strerror(pr_err), aff == 0 ? "cores set" : (nfast ? strerror(aff_err) : "no core info"),
+            nfast, mode);
 }
 #endif
 """)
 change("libs/audio/cellAudio.c",
 """    { const char* e = getenv("AUDIO_PREPAD"); if (e) prime = atoi(e); }""",
 """#if defined(__ANDROID__)
-    { const char* e = getenv("EU_AUDIO_BOOST"); if (!(e && *e == '0')) eu_thread_boost("audio mixer", -16); }
+    { const char* e = getenv("EU_AUDIO_BOOST"); if (!(e && *e == '0')) eu_thread_place("audio mixer", -16, 2); }
 #endif
     { const char* e = getenv("AUDIO_PREPAD"); if (e) prime = atoi(e); }""")
 change("libs/spurs/cellSpurs.c",
@@ -1687,9 +1706,9 @@ change("libs/spurs/cellSpurs.c",
 #endif""",
 """      prctl(15 /* PR_SET_NAME */, nm, 0, 0, 0); }
     if ((int)(si - s_inst) == 1 && k_part == 0) {   /* inFamous' audio SPU (w3) */
-        extern void eu_thread_boost(const char*, int);
+        extern void eu_thread_place(const char*, int, int);
         const char* e = getenv("EU_AUDIO_BOOST");
-        if (!(e && *e == '0')) eu_thread_boost("audio SPU kernel (inst 1)", -10);
+        if (!(e && *e == '0')) eu_thread_place("audio SPU kernel (inst 1)", -10, 2);
     }
 #endif""")
 # Indexed draws on the GPU-fetch path: the generic duplicate-vertex pass hashes
