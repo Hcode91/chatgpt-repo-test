@@ -470,7 +470,42 @@ static const char* eu_basename(const char* p)
     return f ? f + 1 : p;
 }
 
-static void eu_profile_thread(int tid, const char* label)
+/* Whole-run totals for the busiest thread: self time by function, and the
+ * function it was called from, so the rewrite targets are the ones that add
+ * up over minutes rather than the noise of one 40-sample window. */
+enum { EU_TOT_MAX = 256 };
+typedef struct { const void* key; char name[72]; int hits; } eu_tot;
+static eu_tot s_tot_self[EU_TOT_MAX], s_tot_from[EU_TOT_MAX];
+static int s_tot_nself, s_tot_nfrom, s_tot_samples;
+
+static void eu_tot_add(eu_tot* t, int* n, const void* key, const char* name, uintptr_t off, const char* mod)
+{
+    for (int i = 0; i < *n; i++) if (t[i].key == key) { t[i].hits++; return; }
+    if (*n >= EU_TOT_MAX) return;
+    t[*n].key = key;
+    if (off) snprintf(t[*n].name, sizeof t[*n].name, "%s+0x%lx", mod, (unsigned long)off);
+    else snprintf(t[*n].name, sizeof t[*n].name, "%s", name);
+    t[*n].hits = 1;
+    (*n)++;
+}
+
+static void eu_tot_print(const char* tag, eu_tot* t, int n)
+{
+    if (!s_tot_samples) return;
+    int idx[EU_TOT_MAX];
+    for (int i = 0; i < n; i++) idx[i] = i;
+    for (int a = 0; a < n; a++)
+        for (int b = a + 1; b < n; b++)
+            if (t[idx[b]].hits > t[idx[a]].hits) { int x = idx[a]; idx[a] = idx[b]; idx[b] = x; }
+    char line[1400];
+    int o = snprintf(line, sizeof line, "[%s] %d samples so far:", tag, s_tot_samples);
+    for (int k = 0; k < n && k < 15 && o < (int)sizeof line - 100; k++)
+        o += snprintf(line + o, sizeof line - o, " %s %.1f%%", t[idx[k]].name,
+                      100.0 * t[idx[k]].hits / s_tot_samples);
+    fprintf(stderr, "%s\n", line);
+}
+
+static void eu_profile_thread(int tid, const char* label, int total)
 {
     enum { SAMPLES = 40, MAXSYM = 64 };
     eu_hot hot[MAXSYM];
@@ -504,6 +539,17 @@ static void eu_profile_thread(int tid, const char* label)
         while (j < nh && hot[j].sym != key) j++;
         if (j == nh && nh < MAXSYM) { hot[nh].sym = key; hot[nh].name = name; hot[nh].off = off; hot[nh].mod = mod; hot[nh].lr = lr; hot[nh].hits = 0; nh++; }
         if (j < nh) hot[j].hits++;
+        if (total) {
+            s_tot_samples++;
+            eu_tot_add(s_tot_self, &s_tot_nself, key, name, off, mod);
+            uintptr_t lo = 0;
+            const char* caller = eu_own_symbol(lr, &lo);
+            Dl_info ci;
+            memset(&ci, 0, sizeof ci);
+            if (caller) eu_tot_add(s_tot_from, &s_tot_nfrom, (const void*)(lr - lo), caller, 0, "");
+            else if (lr && dladdr((void*)lr, &ci) && ci.dli_sname) eu_tot_add(s_tot_from, &s_tot_nfrom, ci.dli_saddr, ci.dli_sname, 0, "");
+            else eu_tot_add(s_tot_from, &s_tot_nfrom, (const void*)(uintptr_t)1, "(unknown)", 0, "");
+        }
         usleep(5000);
     }
     for (int a = 0; a < nh; a++)
@@ -611,7 +657,13 @@ static void* eu_cpu_thread(void* arg)
             if (dt[idx[k]] * 2 < (uint64_t)(hz * 10)) break;   /* only threads above 50% */
             char label[24];
             snprintf(label, sizeof label, "busiest#%d", k + 1);
-            eu_profile_thread(cur[idx[k]].tid, label);
+            eu_profile_thread(cur[idx[k]].tid, label, k == 0);
+        }
+        /* every minute: the busiest thread's whole-run totals */
+        static int s_cycles;
+        if (++s_cycles % 6 == 0) {
+            eu_tot_print("hot-total", s_tot_self, s_tot_nself);
+            eu_tot_print("hot-callers", s_tot_from, s_tot_nfrom);
         }
         memcpy(prev, cur, sizeof(eu_tsample) * (size_t)nc);
         np = nc;

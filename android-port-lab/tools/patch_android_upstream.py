@@ -925,10 +925,21 @@ void eu_engine_blit(int src_local, u32 src_off, u32 src_pitch, u32 u0, u32 v0,
                     int dst_local, u32 dst_off, u32 dst_pitch, u32 out_x, u32 out_y,
                     u32 out_w, u32 out_h, u32 ds_dx, u32 dt_dy)
 {
-    static u32 logs = 0, gpu = 0, mem = 0, dropped = 0;
-    if (!g.ready || !g.be || !eu_vk_copy_surface || !src_pitch || !dst_pitch || !out_w || !out_h) return;
+    static u32 logs = 0, gpu = 0, mem = 0, dropped = 0, calls = 0, calllogs = 0;
     const u32 sloc = src_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
     const u32 dloc = dst_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+    /* every blit the game issues, whatever happens to it next */
+    calls++;
+    if (calllogs < 48 || (calls & 1023u) == 0) {
+        calllogs++;
+        u32 cx = 0, cy = 0;
+        const u32 csi = (g.ready && src_pitch) ? eu_surface_at(sloc, src_off, src_pitch, &cx, &cy) : ENG_INVALID;
+        fprintf(stderr, "[blit-call] #%u %u:0x%08X pitch %u uv %u,%u -> %u:0x%08X pitch %u at %u,%u size %ux%u"
+                        " scale 0x%X/0x%X | source %s\\n",
+                calls, sloc, src_off, src_pitch, u0, v0, dloc, dst_off, dst_pitch, out_x, out_y,
+                out_w, out_h, ds_dx, dt_dy, csi == ENG_INVALID ? "memory" : "a drawn target");
+    }
+    if (!g.ready || !g.be || !eu_vk_copy_surface || !src_pitch || !dst_pitch || !out_w || !out_h) return;
     const u32 daddr = dst_off + out_y * dst_pitch + out_x * 4u;
     u32 sx = 0, sy = 0, dx = 0, dy = 0;
     const u32 si = eu_surface_at(sloc, src_off, src_pitch, &sx, &sy);
@@ -985,6 +996,90 @@ change("libs/video/cellGcmSys.c",
 #endif
     /* Only the 32-bit colour formats are handled; anything else would need a
      * per-format converter and is better skipped loudly than written wrong. */""")
+# Diagnostic: a large colour texture read straight from guest memory (no drawn
+# target at its address). Say where it lives, what is drawn near it, and
+# whether anything ever writes that memory, so the frame's final composite
+# (reading a 1280x720 image nothing drew) can be traced to its writer.
+change("libs/video/rsx_draw_engine.c",
+"""#endif
+        textures[u] = eng_texture_slot(t.location, t.offset, t.format,
+                                       t.width, t.height, t.mipmaps, t.pitch,
+                                       (int)t.cubemap, t.remap & 0xFFFFu);
+    }
+    return mask;""",
+"""#endif
+        textures[u] = eng_texture_slot(t.location, t.offset, t.format,
+                                       t.width, t.height, t.mipmaps, t.pitch,
+                                       (int)t.cubemap, t.remap & 0xFFFFu);
+#if defined(__ANDROID__)
+        if (t.width >= 320 && t.height >= 180 && !t.cubemap) eu_texmiss_log(&t, textures[u]);
+#endif
+    }
+    return mask;""")
+change("libs/video/rsx_draw_engine.c",
+"""static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,""",
+"""#if defined(__ANDROID__)
+static void eu_texmiss_log(const rsx_dsp_texture* t, u32 handle)
+{
+    enum { MAXA = 24 };
+    static struct { u32 loc, off, pitch, seen, last_nz; } a[MAXA];
+    static u32 na;
+    u32 k = 0;
+    while (k < na && !(a[k].loc == t->location && a[k].off == t->offset && a[k].pitch == t->pitch)) k++;
+    if (k == na) {
+        if (na == MAXA) return;
+        a[na].loc = t->location; a[na].off = t->offset; a[na].pitch = t->pitch;
+        a[na].seen = 0; a[na].last_nz = 0xFFFFFFFFu;
+        na++;
+    }
+    a[k].seen++;
+    /* sample 1024 words spread over the image: how much of it is non-zero */
+    const u32 pitch = t->pitch ? t->pitch : t->width * 4u;
+    const u32 span = pitch * (t->height - 1u) + t->width * 4u;
+    const u8* p = eng_guest_ptr(NULL, t->location, t->offset, span);
+    u32 nz = 0;
+    u64 sum = 0;
+    if (p) {
+        for (u32 i = 0; i < 1024u; i++) {
+            const u32 y = (i / 32u) * t->height / 32u, x = (i % 32u) * t->width / 32u;
+            u32 w;
+            memcpy(&w, p + (u64)y * pitch + x * 4u, 4);
+            if (w) nz++;
+            sum += w;
+        }
+    }
+    /* first sighting, then whenever the memory's fill changes (at most every 64th) */
+    if (a[k].seen != 1 && (nz == a[k].last_nz || (a[k].seen & 63u))) return;
+    a[k].last_nz = nz;
+    char line[1400];
+    int o = snprintf(line, sizeof line,
+        "[texmiss] h%u %ux%u fmt 0x%02X at %u:0x%08X pitch %u (read %u times) | memory %s, %u of 1024 samples non-zero, sum 0x%llX | drawn nearby:",
+        handle, t->width, t->height, t->format & 0xFFu, t->location, t->offset, pitch, a[k].seen,
+        p ? "mapped" : "NOT mapped", nz, (unsigned long long)sum);
+    int shown = 0;
+    for (u32 i = 0; i < g.n_surfaces && shown < 8 && o < (int)sizeof line - 120; i++) {
+        const eng_surface* c = &g.surfaces[i];
+        if (!c->handle || c->location != t->location) continue;
+        const long long d = (long long)c->offset - (long long)t->offset;
+        if (d < -(16ll << 20) || d > (16ll << 20)) continue;
+        o += snprintf(line + o, sizeof line - o, " h%u %ux%u fmt %d at %+lld%s age %u;", c->handle, c->w, c->h,
+                      (int)c->fmt, d, (d >= 0 && (u64)d < span) ? " (inside)" : "",
+                      eu_surface_tick - c->stamp);
+        shown++;
+    }
+    for (u32 i = 0; i < g.n_zdepths && o < (int)sizeof line - 80; i++) {
+        const eng_zdepth* z = &g.zdepths[i];
+        if (!z->handle || z->location != t->location) continue;
+        const long long d = (long long)z->offset - (long long)t->offset;
+        if (d < -(16ll << 20) || d > (16ll << 20)) continue;
+        o += snprintf(line + o, sizeof line - o, " depth h%u %ux%u at %+lld;", z->handle, z->w, z->h, d);
+    }
+    if (!shown) o += snprintf(line + o, sizeof line - o, " nothing within 16 MB");
+    fprintf(stderr, "%s\\n", line);
+}
+#endif
+
+static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,""")
 # Whole-register SPU integer helpers on ARM64. spu_helpers_vec.h only exists
 # for SSE4.1 hosts, so on ARM64 the register-cached SPU job code ran every
 # integer op lane by lane through the reference helpers. Use the generic-vector
