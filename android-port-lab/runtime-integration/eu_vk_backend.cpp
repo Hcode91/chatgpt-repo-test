@@ -1087,7 +1087,10 @@ struct Rec {
     u8 clear_stencil;
     u32 resolve_dst;
     u32 copy_rect[8];   /* REC_COPY: source x y w h, destination x y w h */
+    int tag;            /* REC_DRAW: game call chain that issued it (eu_fifo_tag.cpp) */
 };
+extern "C" int g_eu_draw_tag;
+extern "C" const char* eu_fifo_tag_name(int id, char* buf, size_t cap);
 Rec* g_rec;   /* MAX_RECORDS, heap */
 u32 g_dropped;
 Rec g_pending;
@@ -1503,6 +1506,24 @@ void cap_pass(VkCommandBuffer cb, const u32* rt, u32 nrt, u32 depth, bool fallba
             l += b;
         }
         if (pipes.size() > 10) l += " ...";
+        /* which game code issued these draws */
+        int tags[4];
+        u32 tagn[4], ntag = 0, other = 0;
+        for (u32 i = d0; i < d1; i++) {
+            const int t = g_rec[i].tag;
+            u32 k = 0;
+            while (k < ntag && tags[k] != t) k++;
+            if (k < ntag) tagn[k]++;
+            else if (ntag < 4) { tags[ntag] = t; tagn[ntag++] = 1; }
+            else other++;
+        }
+        l += " | game code";
+        for (u32 k = 0; k < ntag; k++) {
+            char nb[96];
+            snprintf(b, sizeof b, "%s %s x%u", k ? ";" : "", eu_fifo_tag_name(tags[k], nb, sizeof nb), tagn[k]);
+            l += b;
+        }
+        if (other) { snprintf(b, sizeof b, "; +%u more", other); l += b; }
     }
     if (!texs.empty()) {
         l += " | reads";
@@ -2283,6 +2304,7 @@ void be_draw(void*, rsx_topology topology, const void* vertices, u32 vertex_coun
     Rec& r = g_rec[g_rec_count++];
     r = g_pending;
     r.kind = REC_DRAW;
+    r.tag = g_eu_draw_tag;
     r.topo = topology;
     r.vb_off = vb;
     r.stride = stride;
