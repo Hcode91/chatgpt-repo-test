@@ -1457,7 +1457,14 @@ typedef struct eu_pull_attr {
     unsigned int bytes, location, stride, type, size, mod, freq, first, last, valid;
     float def[4];
 } eu_pull_attr;
-typedef struct eu_pull_draw { unsigned int active, attr_bytes; eu_pull_attr attr[16]; } eu_pull_draw;
+typedef struct eu_pull_draw {
+    unsigned int active, attr_bytes;
+    eu_pull_attr attr[16];
+    /* self-check (EU_VK_PULL_CHECK): the CPU decoder's result for the same draw */
+    const unsigned char* check_verts;
+    unsigned int check_stride, nslots;
+    unsigned char slot_attr[16];
+} eu_pull_draw;
 eu_pull_draw g_eu_pull = { 0, (unsigned int)sizeof(eu_pull_attr) };
 static inline unsigned long long eu_prof_ns(void)
 {
@@ -1587,6 +1594,27 @@ static int eu_pull_try(const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* 
         o->first = f->stable_first;
         o->last = f->stable_last;
         o->valid = 1;
+    }
+    d->nslots = plan->layout.count;
+    for (u32 slot = 0; slot < plan->layout.count && slot < 16; slot++) d->slot_attr[slot] = plan->layout.attrs[slot];
+    d->check_verts = NULL;
+    {   /* EU_VK_PULL_CHECK (default 1 while GPU fetch is on): the first 400 pulled draws are also decoded on
+         * the CPU; the backend compares that with what the GPU will read and logs any difference. */
+        static int chk = -1;
+        static unsigned char* cv = NULL;
+        static u64 cv_cap = 0;
+        static unsigned n_chk = 0;
+        if (chk < 0) { const char* e = getenv("EU_VK_PULL_CHECK"); chk = (e && *e == '0') ? 0 : 1; }
+        const u64 need = (u64)n * plan->layout.stride;
+        if (chk && n_chk < 400 && need && need <= (16u << 20)) {
+            if (need > cv_cap) { unsigned char* c = (unsigned char*)realloc(cv, (size_t)need); if (c) { cv = c; cv_cap = need; } }
+            if (need <= cv_cap) {
+                int ok = 1;
+                for (u32 i = 0; i < n && ok; i++)
+                    ok = rsx_vertex_fetch_one(plan, &refs[i], cv + (u64)i * plan->layout.stride);
+                if (ok) { d->check_verts = cv; d->check_stride = plan->layout.stride; n_chk++; }
+            }
+        }
     }
     if (!dc_reserve_verts((u64)n * 8u)) return 0;
     memcpy(dc.verts, refs, (size_t)n * 8u);   /* rsx_vertex_ref: { vertex_id, base_index } */
