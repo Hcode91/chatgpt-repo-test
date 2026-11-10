@@ -1296,7 +1296,13 @@ typedef struct eu_pull_attr {
     unsigned int bytes, location, stride, type, size, mod, freq, first, last, valid;
     float def[4];
 } eu_pull_attr;
-typedef struct eu_pull_draw { unsigned int active, attr_bytes; eu_pull_attr attr[16]; } eu_pull_draw;
+typedef struct eu_pull_draw {
+    unsigned int active, attr_bytes;
+    eu_pull_attr attr[16];
+    const unsigned char* check_verts;
+    unsigned int check_stride, nslots;
+    unsigned char slot_attr[16];
+} eu_pull_draw;
 extern eu_pull_draw g_eu_pull __attribute__((weak));
 }
 extern "C" const char* eu_fifo_tag_name(int id, char* buf, size_t cap);
@@ -2718,8 +2724,8 @@ extern "C" int eu_vk_pull_ok(void)
     static int on = -1;
     if (on < 0) {
         const char* e = getenv("EU_VK_PULL");
-        on = (e && *e == '0') ? 0 : 1;
-        fprintf(stderr, "[RSX vulkan] vertex fetch on the GPU: %s (EU_VK_PULL)\n", on ? "on" : "off");
+        on = (e && *e == '1') ? 1 : 0;   /* default off: the start screen drew wrongly with it (boot-20261110-154129) */
+        fprintf(stderr, "[RSX vulkan] vertex fetch on the GPU: %s (EU_VK_PULL=1 turns it on)\n", on ? "on" : "off");
     }
     return on && g_active;
 }
@@ -2804,6 +2810,84 @@ bool stage_pull(Rec& r)
     return true;
 }
 
+/* EU_VK_PULL_CHECK: decode the staged bytes exactly as the vertex shader's eu_attr does and compare with the
+ * CPU decoder's result for the same draw (supplied by the engine). Logs the first mismatches in detail. */
+static u32 pc_ld(const u8* raw, u32 a) { u32 w; memcpy(&w, raw + a, 4); return w; }
+static u32 pc_b(const u8* raw, u32 a) { return (pc_ld(raw, a & ~3u) >> ((a & 3u) * 8u)) & 0xFFu; }
+static u32 pc_be16(const u8* raw, u32 a) { return (pc_b(raw, a) << 8) | pc_b(raw, a + 1u); }
+static u32 pc_be32(const u8* raw, u32 a)
+{
+    if ((a & 3u) == 0u) { const u32 w = pc_ld(raw, a); return __builtin_bswap32(w); }
+    return (pc_b(raw, a) << 24) | (pc_b(raw, a + 1u) << 16) | (pc_b(raw, a + 2u) << 8) | pc_b(raw, a + 3u);
+}
+static float pc_f(u32 u) { float f; memcpy(&f, &u, 4); return f; }
+static float pc_h2f(u32 h)
+{
+    const u32 sg = (h >> 15) << 31, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
+    return pc_f(e == 0u ? sg : (e == 31u ? (sg | 0x7F800000u | (m << 13)) : (sg | ((e + 112u) << 23) | (m << 13))));
+}
+static void pc_attr(const u8* raw, u32 raw_bytes, const u32* tab, u32 n, u32 rx, u32 ry, float o[4], bool* oob)
+{
+    const u32* a = &tab[n * 4];
+    const u32* b = &tab[64 + n * 4];
+    if (b[2] == 0u) { memcpy(o, &tab[128 + n * 4], 16); return; }
+    const u32 type = a[2] & 0xFFu, size = (a[2] >> 8) & 0xFFu, modu = (a[2] >> 16) & 1u, freq = a[3];
+    const u32 el = freq <= 1u ? ((rx + ry) & 0xFFFFFu) : (modu ? rx % freq : rx / freq);
+    if (el < b[0] || el > b[1]) { memcpy(o, &tab[128 + n * 4], 16); return; }
+    const u32 p = a[0] + (el - b[0]) * a[1];
+    const u32 need = type == 2u ? size * 4u : (type == 3u || type == 1u || type == 5u) ? size * 2u : type == 6u ? 4u : size;
+    if ((u64)p + need > raw_bytes) { *oob = true; o[0] = o[1] = o[2] = 0; o[3] = 1; return; }
+    o[0] = o[1] = o[2] = 0.0f; o[3] = 1.0f;
+    if (type == 6u) {
+        const u32 w = pc_be32(raw, p);
+        o[0] = (float)((int32_t)(w << 21) >> 21) / 1023.0f;
+        o[1] = (float)((int32_t)(w << 10) >> 21) / 1023.0f;
+        o[2] = (float)((int32_t)w >> 22) / 511.0f;
+        return;
+    }
+    for (u32 c = 0; c < 4 && c < size; c++) {
+        float v = 0.0f;
+        if (type == 2u) v = pc_f(pc_be32(raw, p + c * 4u));
+        else if (type == 3u) v = pc_h2f(pc_be16(raw, p + c * 2u));
+        else if (type == 4u) v = (float)pc_b(raw, p + c) / 255.0f;
+        else if (type == 7u) v = (float)pc_b(raw, p + c);
+        else if (type == 1u) v = (float)((int32_t)(pc_be16(raw, p + c * 2u) << 16) >> 16) / 32767.0f;
+        else if (type == 5u) v = (float)((int32_t)(pc_be16(raw, p + c * 2u) << 16) >> 16);
+        o[c] = v;
+    }
+}
+void pull_check(const Rec& r, const u32* refs, u32 n)
+{
+    static u32 s_checked, s_bad_draws, s_logged;
+    const u8* raw = g_stage + r.raw_off;
+    const u32* tab = (const u32*)(g_stage + r.pull_off);
+    const eu_pull_draw& d = g_eu_pull;
+    u32 bad = 0;
+    for (u32 i = 0; i < n; i++)
+        for (u32 sl = 0; sl < d.nslots && sl < 16; sl++) {
+            const u32 at = d.slot_attr[sl];
+            float g[4];
+            bool oob = false;
+            pc_attr(raw, r.raw_bytes, tab, at, refs[i * 2], refs[i * 2 + 1], g, &oob);
+            const float* c = (const float*)(d.check_verts + (u64)i * d.check_stride + sl * 16u);
+            if (memcmp(g, c, 16) != 0 && !(g[0] != g[0] && c[0] != c[0])) {
+                if (!bad && s_logged < 24) {
+                    s_logged++;
+                    const eu_pull_attr& pa = d.attr[at];
+                    fprintf(stderr, "[pull-check] draw %u vertex %u (id %u base %u) attr %u type %u size %u stride %u freq %u "
+                            "first %u last %u%s: GPU path %g %g %g %g, CPU %g %g %g %g\n", s_checked, i, refs[i * 2],
+                            refs[i * 2 + 1], at, pa.type, pa.size, pa.stride, pa.freq, pa.first, pa.last,
+                            oob ? " OUT OF RANGE" : "", g[0], g[1], g[2], g[3], c[0], c[1], c[2], c[3]);
+                }
+                bad++;
+            }
+        }
+    s_checked++;
+    if (bad) s_bad_draws++;
+    if (s_checked == 400 || (bad && s_bad_draws <= 3))
+        fprintf(stderr, "[pull-check] %u pulled draws checked, %u differ from the CPU decoder\n", s_checked, s_bad_draws);
+}
+
 void be_bind_vs_constants(void*, const void* data, u32 bytes)
 {
     if (!stage_constants(0, data, bytes, &g_pending.vs_cb_off)) bytes = 0;
@@ -2857,6 +2941,7 @@ void be_draw(void*, rsx_topology topology, const void* vertices, u32 vertex_coun
     Rec pulled{};
     const bool pull = &g_eu_pull != nullptr && g_eu_pull.active && stride == 8;
     if (pull && !stage_pull(pulled)) return;
+    if (pull && g_eu_pull.check_verts) pull_check(pulled, (const u32*)vertices, vertex_count);
     Rec& r = g_rec[g_rec_count++];
     r = g_pending;
     r.pull = pull;
@@ -3239,7 +3324,7 @@ bool init_device()
     }
 
     VkDescriptorPoolSize sizes[] = {
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_RECORDS * 2 + 64},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_RECORDS * 3 + 64},
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAX_RECORDS * 20 + 64 + CAP_TILES},
         {VK_DESCRIPTOR_TYPE_SAMPLER, MAX_RECORDS * 20 + 64 + CAP_TILES},
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024},
