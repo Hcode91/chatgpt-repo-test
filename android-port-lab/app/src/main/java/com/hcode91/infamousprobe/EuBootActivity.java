@@ -568,6 +568,8 @@ public final class EuBootActivity extends Activity {
         logFile = new File(workDir(), "boot-" + stamp + ".log");
         prefs.edit().putString("last_log", logFile.getAbsolutePath()).apply();
         pruneOldLogs();
+        File pubDir = publicLogDir(vfs);
+        publicLogFile = pubDir == null ? null : new File(pubDir, "boot-" + stamp + ".log");
 
         ProcessBuilder pb = new ProcessBuilder(exe.getAbsolutePath(), elf.getAbsolutePath());
         pb.directory(workDir());
@@ -679,6 +681,14 @@ public final class EuBootActivity extends Activity {
     };
 
     private void pump(Process p, String header) {
+        publicLog = null;
+        if (publicLogFile != null) {
+            try {
+                publicLog = new FileOutputStream(publicLogFile, false);
+            } catch (IOException e) {
+                publicLog = null;
+            }
+        }
         try (FileOutputStream log = new FileOutputStream(logFile, false);
              BufferedReader r = new BufferedReader(
                      new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8), 1 << 16)) {
@@ -707,6 +717,12 @@ public final class EuBootActivity extends Activity {
                 dirty = true;
             }
         } finally {
+            synchronized (lock) {
+                if (publicLog != null) {
+                    try { publicLog.close(); } catch (IOException ignored) { }
+                    publicLog = null;
+                }
+            }
             child = null;
             ui.post(() -> {
                 getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -729,6 +745,13 @@ public final class EuBootActivity extends Activity {
                 return;
             }
             logBytes += b.length;
+            if (publicLog != null) {
+                try {
+                    publicLog.write(b);
+                } catch (IOException e) {
+                    publicLog = null;   // shared storage went away: keep the private log going
+                }
+            }
         }
         log.write(b);
     }
@@ -908,6 +931,31 @@ public final class EuBootActivity extends Activity {
         i.putExtra(Intent.EXTRA_SUBJECT, "inFAMOUS Android boot log");
         i.putExtra(Intent.EXTRA_TEXT, summary() + "\n\n" + readTail(logFile, 192 * 1024));
         startActivity(Intent.createChooser(i, "Share boot log"));
+    }
+
+    /* A copy of every log goes to shared storage as it is written, so nothing has to
+     * be saved by hand: <game folder>/eu_logs, or Download/inFAMOUS-logs when booting
+     * without game data. The captures land in the game folder too. Last 10 kept. */
+    private File publicLogFile;
+    private FileOutputStream publicLog;
+
+    private File publicLogDir(String vfs) {
+        if (!hasFileAccess()) return null;
+        File d = vfs != null ? new File(vfs, "eu_logs")
+                : new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                           "inFAMOUS-logs");
+        //noinspection ResultOfMethodCallIgnored
+        d.mkdirs();
+        if (!d.isDirectory() || !d.canWrite()) return null;
+        File[] logs = d.listFiles((x, n) -> n.startsWith("boot-") && n.endsWith(".log"));
+        if (logs != null && logs.length >= 10) {
+            java.util.Arrays.sort(logs, (a, b) -> Long.compare(a.lastModified(), b.lastModified()));
+            for (int i = 0; i <= logs.length - 10; i++) {
+                //noinspection ResultOfMethodCallIgnored
+                logs[i].delete();
+            }
+        }
+        return d;
     }
 
     private void pruneOldLogs() {
