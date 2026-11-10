@@ -2920,6 +2920,8 @@ bool stage_pull(Rec& r)
         const u32 total = (u32)((mis + len + 3u) & ~(u64)3u) + 8u;
         RawSeen& e = seen[(((uintptr_t)rng[k].lo >> 4) ^ ((u32)len * 2654435761u)) & 1023u];
         u32 blk = 0;
+        struct timespec rt0, rt1;
+        clock_gettime(CLOCK_MONOTONIC, &rt0);
         if (e.epoch == g_stage_epoch && e.lo == rng[k].lo && e.len == (u32)len && (u64)e.blk + e.total <= g_stage_used &&
             memcmp(g_stage + e.blk + mis, rng[k].lo, (size_t)len) == 0) {
             blk = e.blk;
@@ -2933,6 +2935,8 @@ bool stage_pull(Rec& r)
             e = {rng[k].lo, (u32)len, blk, total, g_stage_epoch};
             g_pull_raw_bytes += len;
         }
+        clock_gettime(CLOCK_MONOTONIC, &rt1);
+        g_eu_prof[13] += us_between(rt0, rt1) * 1000u;
         rng[k].off = blk + mis;   /* buffer address of rng[k].lo */
         if (blk < raw0) raw0 = blk;
         if (blk + total > raw1) raw1 = blk + total;
@@ -3094,7 +3098,14 @@ void be_draw(void*, rsx_topology topology, const void* vertices, u32 vertex_coun
     if (indices && index_count && !stage_copy(indices, index_count * (u32)sizeof(u32), &ib)) return;
     Rec pulled{};
     const bool pull = &g_eu_pull != nullptr && g_eu_pull.active && stride == 8;
-    if (pull && !stage_pull(pulled)) return;
+    if (pull) {
+        struct timespec pt0, pt1;
+        clock_gettime(CLOCK_MONOTONIC, &pt0);
+        const bool ok = stage_pull(pulled);
+        clock_gettime(CLOCK_MONOTONIC, &pt1);
+        g_eu_prof[12] += us_between(pt0, pt1) * 1000u;
+        if (!ok) return;
+    }
     if (pull && g_eu_pull.check_verts) pull_check(pulled, (const u32*)vertices, vertex_count);
     Rec& r = g_rec[g_rec_count++];
     r = g_pending;
@@ -3259,6 +3270,10 @@ void be_present(void*, u32 surface)
                     g_same_n ? g_same_pipe * 100.0 / g_same_n : 0.0, g_same_n ? g_same_tex * 100.0 / g_same_n : 0.0,
                     g_same_n ? g_same_both * 100.0 / g_same_n : 0.0);
             g_async_jobs = g_sync_jobs = 0; g_same_pipe = g_same_tex = g_same_both = g_same_n = 0;
+            if (pv[11] || pv[12])
+                fprintf(stderr, "[fifo-prof] GPU vertex fetch on the FIFO thread: index mapping %.0f ms, attribute table %.0f ms, "
+                        "staging %.0f ms (of which comparing/copying vertex bytes %.0f ms)\n", ms(pv[10]), ms(pv[11]),
+                        ms(pv[12]), ms(pv[13]));
         }
         fprintf(stderr, "[RSX vulkan] constant blocks reused instead of copied (5s): %llu (%.1f MB not copied)\n",
                 (unsigned long long)g_cb_reused, g_cb_bytes_saved / 1048576.0);

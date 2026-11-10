@@ -1562,7 +1562,10 @@ change("libs/video/rsx_draw_engine.c",
         if (!rsx_vertex_fetch_one(&dc.fetch_plan, &dc.refs[i], dst)) {""",
 """#if defined(__ANDROID__)
     g_eu_pull.active = 0;
-    if (eu_pull_try(&dc.fetch_plan, dc.refs, dc.n_refs)) { dc.n_verts = dc.n_refs; return; }
+    { const unsigned long long eu_t = eu_prof_ns();
+      const int eu_p = eu_pull_try(&dc.fetch_plan, dc.refs, dc.n_refs);
+      g_eu_prof[11] += eu_prof_ns() - eu_t;
+      if (eu_p) { dc.n_verts = dc.n_refs; return; } }
 #endif
     for (u32 i = 0; i < dc.n_refs; i++) {
         u8* dst = layout->stride ? dc.verts + (u64)i * layout->stride : NULL;
@@ -1719,7 +1722,11 @@ change("libs/video/rsx_draw_engine.c",
         u32 unique = dc.n_refs;""",
 """#if defined(__ANDROID__)
     int eu_direct = 0;
-    if (allow_remap && dc.n_refs > 1 && !dc.inl && eu_vk_pull_ok && eu_vk_pull_ok()) eu_direct = eu_remap_direct();
+    if (allow_remap && dc.n_refs > 1 && !dc.inl && eu_vk_pull_ok && eu_vk_pull_ok()) {
+        const unsigned long long eu_t = eu_prof_ns();
+        eu_direct = eu_remap_direct();
+        g_eu_prof[10] += eu_prof_ns() - eu_t;
+    }
     if (!eu_direct)
 #endif
     if (allow_remap && dc.n_refs > 1) {
@@ -1776,8 +1783,8 @@ static int eu_shortcut_on(void)
     static int on = -1;
     if (on < 0) {
         const char* e = getenv("EU_SHORTCUT");
-        on = (e && *e == '1') ? 1 : 0;
-        fprintf(stderr, "[shortcut] per-draw lookup shortcuts: %s (EU_SHORTCUT=1 turns them on)\\n", on ? "ON" : "off");
+        on = (e && *e == '0') ? 0 : 1;   /* default on since boot-20261110-224451: 20000 checked reuses, 0 mismatches */
+        fprintf(stderr, "[shortcut] per-draw lookup shortcuts: %s (EU_SHORTCUT=0 turns them off)\\n", on ? "ON" : "off");
     }
     return on;
 }
