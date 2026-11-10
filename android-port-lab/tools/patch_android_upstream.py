@@ -985,4 +985,56 @@ change("libs/video/cellGcmSys.c",
 #endif
     /* Only the 32-bit colour formats are handled; anything else would need a
      * per-format converter and is better skipped loudly than written wrong. */""")
+# Whole-register SPU integer helpers on ARM64. spu_helpers_vec.h only exists
+# for SSE4.1 hosts, so on ARM64 the register-cached SPU job code ran every
+# integer op lane by lane through the reference helpers. Use the generic-vector
+# twin (runtime-integration/spu_helpers_vec_arm64.h; checked bit-for-bit against
+# the references by tools/test_spu_vec_arm64.py) instead.
+import shutil as _shutil
+for _h in ("spu_helpers_vec_arm64.h", "spu_fsimd_arm64.h"):
+    _shutil.copyfile(pathlib.Path(__file__).resolve().parent.parent / "runtime-integration" / _h,
+                     root / "runtime" / "spu" / _h)
+change("runtime/spu/spu_helpers_vec.h",
+"""#if defined(__SSE4_1__) && !defined(SPU_HELPERS_VEC_DISABLE)
+#include <smmintrin.h>""",
+"""#if defined(__aarch64__) && !defined(SPU_HELPERS_VEC_DISABLE) && !defined(SPU_VEC_ARM64_DISABLE)
+#include "spu_helpers_vec_arm64.h"
+#elif defined(__SSE4_1__) && !defined(SPU_HELPERS_VEC_DISABLE)
+#include <smmintrin.h>""")
+# Name the SPU host threads so the [cpu] / [hot] lines say which SPURS
+# instance, kernel part and workload lane each busy thread is.
+change("libs/spurs/cellSpurs.c",
+"""    struct SpursKArg* ka = (struct SpursKArg*)p;
+    struct SpursInst* si = ka->si;
+    const u32 k_part = ka->part, k_nparts = ka->nparts;""",
+"""    struct SpursKArg* ka = (struct SpursKArg*)p;
+    struct SpursInst* si = ka->si;
+    const u32 k_part = ka->part, k_nparts = ka->nparts;
+#if defined(__ANDROID__)
+    { extern int prctl(int, ...); char nm[16];
+      snprintf(nm, sizeof nm, "spurs i%d k%u", (int)(si - s_inst), (unsigned)k_part);
+      prctl(15 /* PR_SET_NAME */, nm, 0, 0, 0); }
+#endif""")
+change("libs/spurs/cellSpurs.c",
+"""            CreateThread(NULL, 1u << 20, spurs_lane_worker, wa, 0, NULL);""",
+"""#if defined(__ANDROID__)
+            { HANDLE th = CreateThread(NULL, 1u << 20, spurs_lane_worker, wa, 0, NULL);
+              if (th) { wchar_t nm[16]; swprintf(nm, 16, L"spu w%u lane%u", (unsigned)wid, (unsigned)(i + 1));
+                        SetThreadDescription(th, nm); } }
+#else
+            CreateThread(NULL, 1u << 20, spurs_lane_worker, wa, 0, NULL);
+#endif""")
+# The SPU single-precision ops (fa fs fm fma fms fnms) as one packed operation
+# each on ARM64, as upstream already does with SSE on x86. The hottest job
+# kernels (e.g. the skinning / blend loops) are made of these.
+change("runtime/spu/spu_helpers.h",
+"""#else
+#define SPU__FSIMD 0
+#endif""",
+"""#elif defined(__aarch64__) && !defined(SPU_FSIMD_ARM64_DISABLE)
+#define SPU__FSIMD 1
+#include "spu_fsimd_arm64.h"
+#else
+#define SPU__FSIMD 0
+#endif""")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
