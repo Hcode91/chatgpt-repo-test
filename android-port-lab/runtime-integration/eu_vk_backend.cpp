@@ -3333,7 +3333,7 @@ bool init_device()
     };
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = MAX_RECORDS + 64 + CAP_TILES;
-    dpi.poolSizeCount = 5;
+    dpi.poolSizeCount = (u32)(sizeof sizes / sizeof sizes[0]);
     dpi.pPoolSizes = sizes;
     for (u32 k = 0; k < NUM_SLOTS; k++)
         if (vkCreateDescriptorPool(g_dev, &dpi, nullptr, &g_slot[k].dpool) != VK_SUCCESS) return false;
