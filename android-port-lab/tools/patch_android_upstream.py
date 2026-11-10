@@ -825,7 +825,7 @@ change("libs/video/rsx_draw_engine.c",
         if (base_fmt == RSX_TEX_FMT_A8R8G8B8 && eu_vk_depth_pack) {
             for (u32 i = 0; i < g.n_zdepths; i++) {
                 eng_zdepth* z = &g.zdepths[i];
-                if (z->location != t.location || z->offset != t.offset || current_zslot == i) continue;
+                if (z->location != t.location || z->offset != t.offset) continue;
                 const u32 snap = eng_zdepth_snapshot(i);
                 if (!snap) break;
                 if (!z->eu_packed || z->eu_packed_src != snap) {
@@ -848,4 +848,32 @@ change("libs/video/rsx_draw_engine.c",
         }
 #endif
         textures[u] = eng_texture_slot(t.location, t.offset, t.format,""")
+# Snapshots were never released: every frame's depth clear made the next
+# read create a fresh full-screen R32F copy and the old one leaked (handles
+# climbed steadily across captures; GPU memory and the object table run out
+# a few minutes into the 3D scenes). Release the old copy (the backend defers
+# the free until the GPU is done with it) and force the packed colour copy
+# to be rebuilt, since a recycled handle can equal the old snapshot's.
+change("libs/video/rsx_draw_engine.c",
+"""    if (z->snapshot_valid && z->snapshot) return z->snapshot;
+    if (!g.be->depth_snapshot) return 0;""",
+"""    if (z->snapshot_valid && z->snapshot) return z->snapshot;
+    if (!g.be->depth_snapshot) return 0;
+#if defined(__ANDROID__)
+    if (z->snapshot && g.be->color_target_release) g.be->color_target_release(g.be->user, z->snapshot);
+    z->snapshot = 0;
+    z->eu_packed_src = 0;
+#endif""")
+change("libs/video/rsx_draw_engine.c",
+"""    if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
+    z->location = location; z->offset = offset;""",
+"""    if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
+#if defined(__ANDROID__)
+    if (g.be->color_target_release) {
+        if (z->snapshot) g.be->color_target_release(g.be->user, z->snapshot);
+        if (z->eu_packed) g.be->color_target_release(g.be->user, z->eu_packed);
+    }
+    z->eu_packed = 0; z->eu_packed_src = 0;
+#endif
+    z->location = location; z->offset = offset;""")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")

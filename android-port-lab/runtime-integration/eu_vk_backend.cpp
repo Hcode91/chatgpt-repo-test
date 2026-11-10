@@ -1384,6 +1384,10 @@ std::string obj_desc(u32 h)
     if (!fn) { snprintf(fbuf, sizeof fbuf, "vk%d", (int)o->fmt); fn = fbuf; }
     snprintf(b, sizeof b, "h%u %ux%u %s%s%s(rsx fmt %d)", h, o->w, o->h, fn, o->cube ? " cube" : "",
              o->bc_decode ? " cpu-decoded " : " ", (int)o->bfmt);
+    if (o->parent) {
+        const size_t n = strlen(b);
+        if (n > 0 && n < sizeof b - 24) snprintf(b + n - 1, sizeof b - n + 1, ", view of h%u)", o->parent);
+    }
     return b;
 }
 
@@ -1656,6 +1660,9 @@ void encode_records(VkCommandBuffer cb)
             Obj* src = obj(r.depth);
             Obj* dst = obj(r.resolve_dst);
             if (!src || !dst || !src->view || !dst->att || !g_depth_pipe) continue;
+            /* The zeta may have been an attachment a moment ago, even in the
+             * same guest pass (a game sampling its bound depth buffer). */
+            barrier_all(cb);
             helper_pass(cb, g_depth_pipe, src->view, g_point_sampler, dst->att, dst->w, dst->h);
             if (g_cap.active) {
                 int tile = -1;
