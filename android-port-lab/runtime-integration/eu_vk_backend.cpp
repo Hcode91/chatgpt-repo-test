@@ -48,6 +48,8 @@
 #include <unistd.h>
 #include <zlib.h>
 #include <string>
+#include <algorithm>
+#include <cctype>
 #include <vector>
 #include <deque>
 
@@ -237,6 +239,11 @@ u32 g_up_count;
  * instead of submitted on their own, and the blocking one-off submissions that remain (each waits for
  * everything already queued on the GPU, i.e. the whole previous frame). */
 uint64_t g_gpu_busy_ns, g_gpu_busy_max_ns, g_imm_wait_us;
+static inline uint64_t us_between(const struct timespec& a, const struct timespec& b)
+{
+    const int64_t d = (int64_t)(b.tv_sec - a.tv_sec) * 1000000 + ((int64_t)b.tv_nsec - (int64_t)a.tv_nsec) / 1000;
+    return d > 0 ? (uint64_t)d : 0u;
+}
 u32 g_gpu_timed, g_imm_count, g_up_deferred;
 double g_ts_period_ns;   /* 0 = no timestamps on this queue */
 uint64_t g_ts_mask;
@@ -594,7 +601,7 @@ void imm_end()
     vkWaitForFences(g_dev, 1, &g_fence_imm, VK_TRUE, UINT64_MAX);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     g_imm_count++;
-    g_imm_wait_us += (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000u + (uint64_t)(t1.tv_nsec - t0.tv_nsec) / 1000u;
+    g_imm_wait_us += us_between(t0, t1);
 }
 
 bool upload_defer(Obj& o, u32 face, u32 mip, u32 w, u32 h, const void* src, u32 row_bytes, u32 rows);
@@ -734,13 +741,88 @@ struct Func {
 std::deque<Func> g_funcs;   /* deque: pointers stay valid as it grows */
 u32 g_shader_failures;
 
+/* The decompilers declare the RSX register files as arrays (fragment: float4 r[48], h[48]; vertex:
+ * float4 r[32]) and zero them in a loop, but only ever index them with literal numbers. Unless the
+ * driver's compiler splits such an array up, every register access goes through per-pixel scratch
+ * memory. Rewrite each r[N] / h[N] as its own variable, declaring only the ones the program uses.
+ * Any non-literal index (or an unexpected declaration) leaves the program untouched.
+ * EU_VK_SCALAR_REGS=0 turns it off. */
+int g_scalar_ok, g_scalar_skip;
+std::string scalarize_regs(const char* src, bool vs)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("EU_VK_SCALAR_REGS");
+        on = (e && *e == '0') ? 0 : 1;
+        fprintf(stderr, "[RSX vulkan] shader register files as separate variables: %s (EU_VK_SCALAR_REGS)\n",
+                on ? "on" : "off");
+    }
+    if (!on) return std::string();
+    std::string t(src);
+    const char* decl = vs ? "    float4 r[32]; float4 o[16];\n" : "    float4 r[48]; float4 h[48];\n";
+    const char* keep = vs ? "    float4 o[16];\n" : "";
+    const char* init = vs ? "    [unroll] for (int _i=0;_i<32;_i++) r[_i]=(float4)0;\n"
+                          : "    [unroll] for (int _i = 0; _i < 48; _i++) { r[_i] = (float4)0; h[_i] = (float4)0; }\n";
+    const size_t dp = t.find(decl);
+    if (dp == std::string::npos) { g_scalar_skip++; return std::string(); }
+    t.replace(dp, strlen(decl), std::string(keep) + "@REGS@");
+    const size_t ip = t.find(init);
+    if (ip == std::string::npos) { g_scalar_skip++; return std::string(); }
+    t.erase(ip, strlen(init));
+    std::string out;
+    out.reserve(t.size() + 256);
+    bool used[2][64] = {};
+    const size_t n = t.size();
+    for (size_t i = 0; i < n; i++) {
+        const char c = t[i];
+        if ((c == 'r' || (!vs && c == 'h')) && i + 1 < n && t[i + 1] == '[') {
+            const char pc = i ? t[i - 1] : ' ';
+            const bool ident = isalnum((unsigned char)pc) || pc == '_' || pc == '.';
+            if (!ident) {
+                size_t j = i + 2;
+                u32 idx = 0;
+                while (j < n && isdigit((unsigned char)t[j]) && idx < 1000) idx = idx * 10 + (u32)(t[j++] - '0');
+                if (j == i + 2 || j >= n || t[j] != ']' || idx >= (vs ? 32u : 48u)) { g_scalar_skip++; return std::string(); }
+                const int f = (c == 'h');
+                used[f][idx] = true;
+                out += f ? "_h" : "_r";
+                out += std::to_string(idx);
+                i = j;
+                continue;
+            }
+        }
+        out += c;
+    }
+    std::string regs;
+    for (int f = 0; f < 2; f++)
+        for (u32 k = 0; k < 64; k++)
+            if (used[f][k]) regs += std::string("    float4 ") + (f ? "_h" : "_r") + std::to_string(k) + " = (float4)0;\n";
+    const size_t rp = out.find("@REGS@");
+    if (rp == std::string::npos) { g_scalar_skip++; return std::string(); }
+    out.replace(rp, 6, regs);
+    return out;
+}
+
 const Func* function_for(const char* hlsl, bool vs)
 {
     const u64 h = fnv1a(hlsl) ^ (vs ? 0x5653ull : 0x5053ull);
     for (const Func& f : g_funcs) if (f.hash == h) return f.ok ? &f : nullptr;
     Func f{h, VK_NULL_HANDLE, {}, false};
     std::vector<u32> spv;
-    if (compile_spirv(hlsl, vs ? EShLangVertex : EShLangFragment, true, spv, &f.refl)) {
+    const std::string sc = scalarize_regs(hlsl, vs);
+    if (!sc.empty()) {
+        if (compile_spirv(sc.c_str(), vs ? EShLangVertex : EShLangFragment, true, spv, &f.refl)) {
+            f.mod = make_module(spv);
+            f.ok = f.mod != VK_NULL_HANDLE;
+            if (f.ok) g_scalar_ok++;
+        }
+        if (!f.ok) {
+            g_scalar_skip++;
+            f.refl.clear();
+            spv.clear();
+        }
+    }
+    if (!f.ok && compile_spirv(hlsl, vs ? EShLangVertex : EShLangFragment, true, spv, &f.refl)) {
         f.mod = make_module(spv);
         f.ok = f.mod != VK_NULL_HANDLE;
     }
@@ -1453,8 +1535,13 @@ struct Capture {
     std::vector<std::string> lines;
     std::vector<int> line_tile;       /* tile shown by each line, -1 = none */
     std::vector<u32> tex_seen;
+    u32 ts_n = 0;                     /* GPU timestamps written (one per encode step + one at the end) */
+    std::vector<u32> ts_line;         /* first report line of each encode step */
+    bool ts_done = false;
 };
 Capture g_cap;
+constexpr u32 CAP_TS_MAX = 1024;
+VkQueryPool g_cap_qp = VK_NULL_HANDLE;
 Buffer g_cap_buf;
 Obj g_cap_thumb;
 bool g_cap_ready;
@@ -1741,6 +1828,42 @@ void cap_finish(u32 present_surface)
             g_cap.automatic ? "timed " : "", g_cap.req, g_cap.passes, g_cap.tex_seen.size(),
             obj_desc(present_surface).c_str());
     std::string report;
+    if (g_cap.ts_n >= 2) {   /* GPU time of each pass (includes its capture thumbnail, a small blit) */
+        std::vector<uint64_t> tsv(g_cap.ts_n);
+        if (vkGetQueryPoolResults(g_dev, g_cap_qp, 0, g_cap.ts_n, tsv.size() * sizeof(uint64_t), tsv.data(),
+                                  sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            double total = 0;
+            std::vector<std::pair<double, u32>> by_line;
+            for (u32 k = 0; k + 1 < g_cap.ts_n; k++) {
+                const double ms = (double)((tsv[k + 1] - tsv[k]) & g_ts_mask) * g_ts_period_ns / 1e6;
+                total += ms;
+                const u32 l0 = g_cap.ts_line[k], l1 = g_cap.ts_line[k + 1];
+                for (u32 l = l0; l < l1 && l < g_cap.lines.size(); l++) {
+                    char b[48];
+                    snprintf(b, sizeof b, " | GPU %.2f ms", ms);
+                    std::string& ln = g_cap.lines[l];
+                    const size_t colon = ln.find(':');
+                    if (colon == std::string::npos) ln += b;
+                    else ln.insert(colon, b);
+                    if (l == l0) by_line.push_back({ms, l});
+                }
+            }
+            std::sort(by_line.begin(), by_line.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::string top;
+            for (size_t k = 0; k < by_line.size() && k < 8; k++) {
+                const std::string& l = g_cap.lines[by_line[k].second];
+                char b[64];
+                snprintf(b, sizeof b, "%s%s %.1f ms", k ? ", " : "", l.substr(0, l.find(' ', 5)).c_str(), by_line[k].first);
+                top += b;
+            }
+            char hdr[160];
+            snprintf(hdr, sizeof hdr, "GPU time of the captured frame: %.1f ms over %u steps; heaviest: ", total,
+                     g_cap.ts_n - 1);
+            const std::string line = std::string(hdr) + top;
+            fprintf(stderr, "[capture] %s\n", line.c_str());
+            report += line + "\n";
+        }
+    }
     for (size_t i = 0; i < g_cap.lines.size(); i++) {
         std::string l = g_cap.lines[i];
         if (g_cap.line_tile[i] >= 0) {
@@ -1776,7 +1899,17 @@ void cap_finish(u32 present_surface)
 void encode_records(VkCommandBuffer cb)
 {
     u32 i = 0;
+    /* capture frames: a GPU timestamp between encode steps -> GPU time of every pass in the report */
+    const bool ts = g_cap.active && g_cap_qp && !g_cap.ts_done;
+    if (ts) {
+        g_cap.ts_done = true;
+        vkCmdResetQueryPool(cb, g_cap_qp, 0, CAP_TS_MAX);
+    }
     while (i < g_rec_count) {
+        if (ts && g_cap.ts_n < CAP_TS_MAX - 1) {
+            vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_cap_qp, g_cap.ts_n++);
+            g_cap.ts_line.push_back((u32)g_cap.lines.size());
+        }
         if (g_rec[i].kind == REC_DEPTH_PACK) {
             const Rec& r = g_rec[i++];
             Obj* src = obj(r.depth);
@@ -1989,6 +2122,10 @@ void encode_records(VkCommandBuffer cb)
             cap_pass(cb, rt, attach ? nrt : 0, depth, fallback_z, n_cc, cc_surf, cc_rgba, clear_here, d0, i, drawn,
                      false);
     }
+    if (ts && g_cap.ts_n) {
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_cap_qp, g_cap.ts_n++);
+        g_cap.ts_line.push_back((u32)g_cap.lines.size());
+    }
 }
 
 uint64_t now_ms()
@@ -2062,7 +2199,7 @@ void encode_and_submit(u32 present_surface)
         clock_gettime(CLOCK_MONOTONIC, &t0);
         slot_finish(g_cur, true);
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        g_gpu_wait_us += (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000u + (uint64_t)(t1.tv_nsec - t0.tv_nsec) / 1000u;
+        g_gpu_wait_us += us_between(t0, t1);
         if (!g_active) return;
     }
 
@@ -2562,9 +2699,10 @@ void be_present(void*, u32 surface)
                 "%u mid-frame flushes | CPU waited %.0f ms for the GPU\n", g_pres_total, g_pres_unwritten,
                 g_pres_missing, g_mid_flushes, (double)g_gpu_wait_us / 1000.0);
         fprintf(stderr, "[RSX vulkan] GPU (5s): %u submissions timed, busy %.0f ms (%.1f ms each, longest %.1f ms) | "
-                "uploads recorded into the frame %u | blocking one-off submissions %u, FIFO thread waited %.0f ms in them\n",
+                "uploads recorded into the frame %u | blocking one-off submissions %u, FIFO thread waited %.0f ms in them | "
+                "shaders with split register files %d (left as arrays %d)\n",
                 g_gpu_timed, g_gpu_busy_ns / 1e6, g_gpu_timed ? g_gpu_busy_ns / 1e6 / g_gpu_timed : 0.0,
-                g_gpu_busy_max_ns / 1e6, g_up_deferred, g_imm_count, g_imm_wait_us / 1000.0);
+                g_gpu_busy_max_ns / 1e6, g_up_deferred, g_imm_count, g_imm_wait_us / 1000.0, g_scalar_ok, g_scalar_skip);
         g_gpu_busy_ns = g_gpu_busy_max_ns = 0; g_gpu_timed = 0; g_up_deferred = 0; g_imm_count = 0; g_imm_wait_us = 0;
         fprintf(stderr, "[RSX vulkan] data (5s): staged %.1f MB (vertices %.1f, indices %.1f, rest %.1f) | "
                 "%u texture uploads, %.1f MB\n", g_st_total / 1048576.0, g_st_vb / 1048576.0, g_st_ib / 1048576.0,
@@ -2785,6 +2923,8 @@ bool init_device()
             qpi.queryCount = 2;
             for (u32 k = 0; k < NUM_SLOTS; k++)
                 if (vkCreateQueryPool(g_dev, &qpi, nullptr, &g_slot[k].qpool) != VK_SUCCESS) g_slot[k].qpool = VK_NULL_HANDLE;
+            qpi.queryCount = CAP_TS_MAX;
+            if (vkCreateQueryPool(g_dev, &qpi, nullptr, &g_cap_qp) != VK_SUCCESS) g_cap_qp = VK_NULL_HANDLE;
         }
         fprintf(stderr, "[RSX vulkan] GPU frame timer %s (%u timestamp bits, %.2f ns per tick)\n",
                 g_slot[0].qpool ? "on" : "unavailable", bits, (double)g_props.limits.timestampPeriod);
