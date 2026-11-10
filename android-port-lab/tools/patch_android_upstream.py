@@ -1238,4 +1238,189 @@ change("runtime/spu/spu_helpers.h",
 #else
 #define SPU__FSIMD 0
 #endif""")
+# Faster vertex fetch. The upstream loop decodes vertex by vertex, attribute by
+# attribute, and component by component through a switch on the format, with
+# a byte-by-byte big-endian read for every value. In the last log this was
+# most of the FIFO thread (70-80% of a core), and the game waits on that
+# thread. Same results, computed attribute by attribute with the format choice
+# taken once per attribute. Draws whose attributes are not one readable range
+# in memory keep the old loop. EU_FAST_FETCH=0 = old loop for everything.
+change("libs/video/rsx_draw_engine.c",
+"""static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+{""",
+"""#if defined(__ANDROID__)
+#include <time.h>
+static inline u32 eu_be32(const u8* p) { u32 w; memcpy(&w, p, 4); return __builtin_bswap32(w); }
+static inline u16 eu_be16(const u8* p) { u16 w; memcpy(&w, p, 2); return __builtin_bswap16(w); }
+static inline float eu_u2f(u32 w) { float f; memcpy(&f, &w, 4); return f; }
+static inline float eu_h2f(u16 h)
+{
+    const u32 sign = (u32)(h >> 15) << 31, exp = (h >> 10) & 0x1F, man = h & 0x3FF;
+    u32 o;
+    if (exp == 0) o = sign;
+    else if (exp == 31) o = sign | 0x7F800000u | (man << 13);
+    else o = sign | ((exp + 112) << 23) | (man << 13);
+    return eu_u2f(o);
+}
+static unsigned long long s_eu_ff_fast, s_eu_ff_slow, s_eu_ff_verts;
+/* 1 = done, 0 = the draw fails (as the old loop would), -1 = use the old loop */
+static int eu_fetch_fast(const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 n, u8* out, u32 ostride)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("EU_FAST_FETCH");
+        on = (e && *e == '0') ? 0 : 1;
+        fprintf(stderr, "[fetch] fast vertex fetch %s (EU_FAST_FETCH)\\n", on ? "ON" : "off");
+    }
+    {   /* one line per 10 s */
+        static struct timespec t0;
+        struct timespec t;
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        if (!t0.tv_sec) t0 = t;
+        else if (t.tv_sec - t0.tv_sec >= 10) {
+            fprintf(stderr, "[fetch] 10s: %llu draws fetched fast (%llu vertices), %llu by the old loop\\n",
+                    s_eu_ff_fast, s_eu_ff_verts, s_eu_ff_slow);
+            s_eu_ff_fast = s_eu_ff_slow = s_eu_ff_verts = 0;
+            t0 = t;
+        }
+    }
+    const rsx_vertex_layout_plan* L = &plan->layout;
+    int ok = on && n && out && ostride >= (u32)L->count * 16u;
+    for (u32 slot = 0; ok && slot < L->count; slot++) {
+        const rsx_vertex_fetch_attr* f = &plan->attr[L->attrs[slot]];
+        if (!f->desc.type || !f->desc.size) continue;
+        if (!f->stable_base && !plan->inline_data) ok = 0;
+        switch (f->desc.type) {
+        case RSX_VTX_TYPE_FLOAT: case RSX_VTX_TYPE_HALF: case RSX_VTX_TYPE_UNORM8: case RSX_VTX_TYPE_UINT8:
+        case RSX_VTX_TYPE_SNORM16: case RSX_VTX_TYPE_SINT16: case RSX_VTX_TYPE_CMP32: break;
+        default: ok = 0;
+        }
+    }
+    if (!ok) { s_eu_ff_slow++; return -1; }
+    for (u32 slot = 0; slot < L->count; slot++) {
+        const u32 attr = L->attrs[slot];
+        const rsx_vertex_fetch_attr* f = &plan->attr[attr];
+        u8* col = out + slot * 16u;
+        if (!f->desc.type || !f->desc.size) {
+            for (u32 i = 0; i < n; i++) memcpy(col + (size_t)i * ostride, f->default_value, 16);
+            continue;
+        }
+        const u32 freq = f->desc.frequency, mod = (plan->divider_mask >> attr) & 1u;
+        const u32 sz = f->desc.size < 4 ? f->desc.size : 4;
+        const u8* base = f->stable_base;
+        const u32 first = f->stable_first, last = f->stable_last, stride = f->stride;
+#define EU_FF_LOOP(...) \\
+        for (u32 i = 0; i < n; i++) { \\
+            float* v = (float*)(col + (size_t)i * ostride); \\
+            const u32 el = rsx_vertex_element_index(refs[i].vertex_id, refs[i].base_index, freq, mod); \\
+            if (!base || el < first || el > last) { \\
+                if (attr == 0) return 0; \\
+                memcpy(v, f->default_value, 16); \\
+                continue; \\
+            } \\
+            const u8* s = base + (size_t)(el - first) * stride; \\
+            float o[4] = {0.0f, 0.0f, 0.0f, 1.0f}; \\
+            __VA_ARGS__ \\
+            memcpy(v, o, 16); \\
+        }
+        switch (f->desc.type) {
+        case RSX_VTX_TYPE_FLOAT:
+            if (sz == 3) { EU_FF_LOOP(o[0] = eu_u2f(eu_be32(s)); o[1] = eu_u2f(eu_be32(s + 4)); o[2] = eu_u2f(eu_be32(s + 8));) }
+            else if (sz == 4) { EU_FF_LOOP(o[0] = eu_u2f(eu_be32(s)); o[1] = eu_u2f(eu_be32(s + 4)); o[2] = eu_u2f(eu_be32(s + 8)); o[3] = eu_u2f(eu_be32(s + 12));) }
+            else if (sz == 2) { EU_FF_LOOP(o[0] = eu_u2f(eu_be32(s)); o[1] = eu_u2f(eu_be32(s + 4));) }
+            else { EU_FF_LOOP(o[0] = eu_u2f(eu_be32(s));) }
+            break;
+        case RSX_VTX_TYPE_HALF:
+            EU_FF_LOOP(for (u32 c = 0; c < sz; c++) o[c] = eu_h2f(eu_be16(s + c * 2));)
+            break;
+        case RSX_VTX_TYPE_UNORM8:
+            EU_FF_LOOP(for (u32 c = 0; c < sz; c++) o[c] = s[c] / 255.0f;)
+            break;
+        case RSX_VTX_TYPE_UINT8:
+            EU_FF_LOOP(for (u32 c = 0; c < sz; c++) o[c] = (float)s[c];)
+            break;
+        case RSX_VTX_TYPE_SNORM16:
+            EU_FF_LOOP(for (u32 c = 0; c < sz; c++) o[c] = (s16)eu_be16(s + c * 2) / 32767.0f;)
+            break;
+        case RSX_VTX_TYPE_SINT16:
+            EU_FF_LOOP(for (u32 c = 0; c < sz; c++) o[c] = (float)(s16)eu_be16(s + c * 2);)
+            break;
+        case RSX_VTX_TYPE_CMP32:
+            EU_FF_LOOP(
+                const u32 w = eu_be32(s);
+                s32 x = (s32)(w & 0x7FF), y = (s32)((w >> 11) & 0x7FF), z = (s32)((w >> 22) & 0x3FF);
+                if (x & 0x400) x -= 0x800;
+                if (y & 0x400) y -= 0x800;
+                if (z & 0x200) z -= 0x400;
+                o[0] = (float)x / 1023.0f; o[1] = (float)y / 1023.0f; o[2] = (float)z / 511.0f;)
+            break;
+        }
+#undef EU_FF_LOOP
+    }
+    s_eu_ff_fast++;
+    s_eu_ff_verts += n;
+    return 1;
+}
+#endif
+static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+{""")
+change("libs/video/rsx_draw_engine.c",
+"""    for (u32 i = 0; i < dc.n_refs; i++) {
+        u8* dst = layout->stride ? dc.verts + (u64)i * layout->stride : NULL;
+        if (!rsx_vertex_fetch_one(&dc.fetch_plan, &dc.refs[i], dst)) {""",
+"""#if defined(__ANDROID__)
+    {
+        const int fr = eu_fetch_fast(&dc.fetch_plan, dc.refs, dc.n_refs, dc.verts, layout->stride);
+        if (fr == 0) { dc.fetch_ok = 0; return; }
+        if (fr > 0) { dc.n_verts = dc.n_refs; return; }
+    }
+#endif
+    for (u32 i = 0; i < dc.n_refs; i++) {
+        u8* dst = layout->stride ? dc.verts + (u64)i * layout->stride : NULL;
+        if (!rsx_vertex_fetch_one(&dc.fetch_plan, &dc.refs[i], dst)) {""")
+# Pipeline lookup hashed the whole vertex program and the fragment program
+# byte by byte (FNV, one multiply per byte) on EVERY draw, 2500-7800 draws a
+# frame. Remember the last 32 results with a copy of the bytes they were taken
+# from: an identical program (memcmp, fast) gives the stored hash.
+change("libs/video/rsx_draw_engine.c",
+"""        key = eng_fnv1a(vp_uc, vp_instrs * 16u, key);
+        key = rsx_fp_structural_hash(fp_uc, fp_size, key);""",
+"""#if defined(__ANDROID__)
+        key = eu_hash_memo(vp_uc, vp_instrs * 16u, key, 0);
+        key = eu_hash_memo(fp_uc, fp_size, key, 1);
+#else
+        key = eng_fnv1a(vp_uc, vp_instrs * 16u, key);
+        key = rsx_fp_structural_hash(fp_uc, fp_size, key);
+#endif""")
+change("libs/video/rsx_draw_engine.c",
+"""/* ---- render state -------------------------------------------------------- */
+""",
+"""#if defined(__ANDROID__)
+typedef struct { const u8* p; u32 n, cap; int kind; u64 seed, hash; u8* copy; } eu_hmemo;
+static u64 eu_hash_memo(const u8* p, u32 n, u64 seed, int kind)
+{
+    enum { EU_HM = 32 };
+    static eu_hmemo m[EU_HM];
+    static u32 rr;
+    if (!p || !n) return kind ? rsx_fp_structural_hash(p, n, seed) : eng_fnv1a(p, n, seed);
+    for (u32 i = 0; i < EU_HM; i++) {
+        const eu_hmemo* e = &m[i];
+        if (e->copy && e->kind == kind && e->n == n && e->seed == seed && memcmp(e->copy, p, n) == 0)
+            return e->hash;
+    }
+    const u64 h = kind ? rsx_fp_structural_hash(p, n, seed) : eng_fnv1a(p, n, seed);
+    eu_hmemo* e = &m[rr++ % EU_HM];
+    if (e->cap < n) {
+        u8* c = (u8*)realloc(e->copy, n);
+        if (!c) { free(e->copy); memset(e, 0, sizeof *e); return h; }
+        e->copy = c;
+        e->cap = n;
+    }
+    memcpy(e->copy, p, n);
+    e->p = p; e->n = n; e->kind = kind; e->seed = seed; e->hash = h;
+    return h;
+}
+#endif
+/* ---- render state -------------------------------------------------------- */
+""")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
