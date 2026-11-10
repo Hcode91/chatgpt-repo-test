@@ -209,6 +209,8 @@ if(INFAMOUS_EU_UPSTREAM_TITLE)
         "${CMAKE_CURRENT_SOURCE_DIR}/eu_android_host_bridge.c"
         # Shared-memory screen + controller channel to the Android app.
         "${CMAKE_CURRENT_SOURCE_DIR}/eu_android_bridge.c"
+        # Which game code issued each draw (store observer on the GCM IO window).
+        "${CMAKE_CURRENT_SOURCE_DIR}/eu_fifo_tag.cpp"
         "${EU_TITLE_DIR}/main.cpp"
         "${EU_TITLE_DIR}/stubs.cpp"
         "${EU_TITLE_DIR}/trainer.cpp"

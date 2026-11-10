@@ -1080,6 +1080,29 @@ static void eu_texmiss_log(const rsx_dsp_texture* t, u32 handle)
 #endif
 
 static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,""")
+# Label each draw with the game code that wrote its command
+# (runtime-integration/eu_fifo_tag.cpp): arm the store observer on the IO
+# window at cellGcmInit, and name the draw when the drain reaches BEGIN_END.
+change("libs/video/cellGcmSys.c",
+"""    s_config.ioAddress       = ioAddress;
+    s_config.ioSize          = ioSize;""",
+"""    s_config.ioAddress       = ioAddress;
+    s_config.ioSize          = ioSize;
+#if defined(__ANDROID__)
+    { extern void eu_fifo_tag_arm(u32, u32) __attribute__((weak));
+      if (eu_fifo_tag_arm) eu_fifo_tag_arm(ioAddress, ioSize); }
+#endif""")
+change("libs/video/cellGcmSys.c",
+"""                  if (eng < 0) eng = rsx_draw_engine_enabled();
+                  if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }""",
+"""                  if (eng < 0) eng = rsx_draw_engine_enabled();
+#if defined(__ANDROID__)
+                  { extern int eu_fifo_tag_draw(u32) __attribute__((weak));
+                    extern int g_eu_draw_tag __attribute__((weak));
+                    if (eng && !subch && (m & 0x1FFCu) == 0x1808u && eu_fifo_tag_draw && &g_eu_draw_tag &&
+                        vm_read32(dea)) g_eu_draw_tag = eu_fifo_tag_draw(dea); }
+#endif
+                  if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }""")
 # Whole-register SPU integer helpers on ARM64. spu_helpers_vec.h only exists
 # for SSE4.1 hosts, so on ARM64 the register-cached SPU job code ran every
 # integer op lane by lane through the reference helpers. Use the generic-vector
