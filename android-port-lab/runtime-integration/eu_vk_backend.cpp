@@ -979,8 +979,8 @@ VkPipeline build_variant(Pipe& p, int cls, bool depth_only)
 /* ------------------------------------------------------------------ helpers */
 VkPipelineLayout g_helper_layout;
 VkDescriptorSetLayout g_helper_dsl;
-VkShaderModule g_fullscreen_vs, g_blit_fs, g_depth_fs;
-VkPipeline g_blit_pipe, g_depth_pipe;
+VkShaderModule g_fullscreen_vs, g_blit_fs, g_depth_fs, g_depthpack_fs;
+VkPipeline g_blit_pipe, g_depth_pipe, g_depthpack_pipe;
 Obj g_present;              /* RGBA8 image the presented surface is scaled into */
 u32 g_null2d, g_nullcube;   /* object handles */
 
@@ -994,6 +994,18 @@ const char* kBlitFS =
     "layout(set=0,binding=0) uniform texture2D src; layout(set=0,binding=1) uniform sampler smp;\n"
     "layout(location=0) in vec2 uv; layout(location=0) out vec4 o;\n"
     "void main(){ o = texture(sampler2D(src, smp), uv); }\n";
+/* Depth (R32F snapshot) re-encoded the way a PS3 shader sees a DEPTH24_S8
+ * buffer read through an A8R8G8B8 texture: the 32-bit word is d24 << 8 | s8,
+ * so A = d[23:16], R = d[15:8], G = d[7:0], B = stencil (0). Stored in this
+ * backend's R,G,B,A order, matching how decoded A8R8G8B8 textures are kept. */
+const char* kDepthPackFS =
+    "#version 450\n"
+    "layout(set=0,binding=0) uniform texture2D src; layout(set=0,binding=1) uniform sampler smp;\n"
+    "layout(location=0) in vec2 uv; layout(location=0) out vec4 o;\n"
+    "void main(){ float d = clamp(texture(sampler2D(src, smp), uv).r, 0.0, 1.0);\n"
+    "  uint u = uint(d * 16777215.0 + 0.5);\n"
+    "  o = vec4(float((u >> 8) & 255u), float(u & 255u), 0.0, float((u >> 16) & 255u)) / 255.0; }\n";
+
 const char* kDepthFS =
     "#version 450\n"
     "layout(set=0,binding=0) uniform texture2D src; layout(set=0,binding=1) uniform sampler smp;\n"
@@ -1045,7 +1057,7 @@ VkPipeline helper_pipeline(VkShaderModule fs, VkFormat fmt)
 }
 
 /* ------------------------------------------------------------------ records */
-enum RecKind { REC_DRAW, REC_CLEAR_COLOR, REC_CLEAR_DS, REC_DEPTH_RESOLVE };
+enum RecKind { REC_DRAW, REC_CLEAR_COLOR, REC_CLEAR_DS, REC_DEPTH_RESOLVE, REC_DEPTH_PACK };
 struct Rec {
     RecKind kind;
     u32 rt[RSX_BE_MAX_COLOR_TARGETS];
@@ -1625,6 +1637,20 @@ void encode_records(VkCommandBuffer cb)
 {
     u32 i = 0;
     while (i < g_rec_count) {
+        if (g_rec[i].kind == REC_DEPTH_PACK) {
+            const Rec& r = g_rec[i++];
+            Obj* src = obj(r.depth);
+            Obj* dst = obj(r.resolve_dst);
+            if (!src || !dst || !src->view || !dst->att || !g_depthpack_pipe) continue;
+            barrier_all(cb);
+            helper_pass(cb, g_depthpack_pipe, src->view, g_point_sampler, dst->att, dst->w, dst->h);
+            if (g_cap.active) {
+                char b[64];
+                snprintf(b, sizeof b, "pass %u: depth packed as colour ", g_cap.passes++);
+                cap_line(std::string(b) + obj_desc(r.depth) + " -> " + obj_desc(r.resolve_dst), -1);
+            }
+            continue;
+        }
         if (g_rec[i].kind == REC_DEPTH_RESOLVE) {
             const Rec& r = g_rec[i++];
             Obj* src = obj(r.depth);
@@ -1651,7 +1677,8 @@ void encode_records(VkCommandBuffer cb)
         u32 cd = 0, ds_flags = 0;
         float cdepth = 1.0f;
         u8 cstencil = 0;
-        while (i < g_rec_count && g_rec[i].kind != REC_DRAW && g_rec[i].kind != REC_DEPTH_RESOLVE) {
+        while (i < g_rec_count && g_rec[i].kind != REC_DRAW && g_rec[i].kind != REC_DEPTH_RESOLVE &&
+               g_rec[i].kind != REC_DEPTH_PACK) {
             const Rec& r = g_rec[i];
             if (r.kind == REC_CLEAR_COLOR) {
                 u32 k = 0;
@@ -2030,6 +2057,24 @@ u32 be_depth_snapshot(void*, u32 depth, u32 w, u32 h)
     memset(&r, 0, sizeof r);
     r.kind = REC_DEPTH_RESOLVE;
     r.depth = depth;
+    r.resolve_dst = dst;
+    return dst;
+}
+
+/* The engine (Android patch) asks for a depth snapshot packed into an RGBA8
+ * colour target when the game samples its depth buffer through a colour
+ * texture format. Returns a colour target handle (0 = unavailable). */
+extern "C" u32 eu_vk_depth_pack(u32 snapshot, u32 w, u32 h)
+{
+    if (!g_active || !obj(snapshot) || !g_depthpack_pipe) return 0;
+    rec_room();
+    const u32 dst = be_color_target_create(nullptr, RSX_BE_FMT_R8G8B8A8, w, h, nullptr, 0);
+    if (!dst) return 0;
+    rec_room();
+    Rec& r = g_rec[g_rec_count++];
+    memset(&r, 0, sizeof r);
+    r.kind = REC_DEPTH_PACK;
+    r.depth = snapshot;
     r.resolve_dst = dst;
     return dst;
 }
@@ -2546,8 +2591,12 @@ bool init_resources()
         return false;
     }
     g_depth_fs = make_module(spv);
+    spv.clear();
+    if (compile_spirv(kDepthPackFS, EShLangFragment, false, spv, nullptr)) g_depthpack_fs = make_module(spv);
+    else fprintf(stderr, "[RSX vulkan] helper depth-pack FS: %s\n", g_log);
     g_blit_pipe = helper_pipeline(g_blit_fs, VK_FORMAT_R8G8B8A8_UNORM);
     g_depth_pipe = helper_pipeline(g_depth_fs, VK_FORMAT_R32_SFLOAT);
+    if (g_depthpack_fs) g_depthpack_pipe = helper_pipeline(g_depthpack_fs, VK_FORMAT_R8G8B8A8_UNORM);
     return g_blit_pipe && g_depth_pipe;
 }
 

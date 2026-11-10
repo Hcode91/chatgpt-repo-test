@@ -761,4 +761,91 @@ change("libs/video/rsx_draw_engine.c",
     u64 full_hash;         /* Android: whole-span hash (content_hash is sampled) */
     u32 last_hash_frame;""")
 change("libs/video/rsx_draw_engine.c", 'static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,\n                            u32 levels, u32 pitch, int cube, u32 remap)\n{\n    if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;\n    const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);\n    if (!span) return 0;\n\n    for (u32 i = 0; i < g.n_textures; i++) {\n        eng_texture* e = &g.textures[i];\n        if (e->location != location || e->offset != offset ||\n            e->format != fmt || e->width != w || e->height != h ||\n            e->pitch != pitch || e->remap != remap ||\n            e->cubemap != (u32)(cube != 0))\n            continue;\n        if (e->handle && e->last_hash_frame != g.frames) {\n            int readable = 0;\n            const u64 hash = eng_texture_content_hash(location, offset, span,\n                                                      &readable);\n            e->last_hash_frame = g.frames;\n            if (readable && hash != e->content_hash) {\n                const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,\n                                                     levels, pitch, cube, remap);\n                if (fresh) {\n                    g.be->texture_release(g.be->user, e->handle);\n                    e->handle = fresh;\n                    e->content_hash = hash;\n                }\n            }\n        }\n        e->last_use_serial = ++g.texture_use_serial;\n        return e->handle;\n    }\n\n    u32 index;\n    u32 evicted = 0;\n    if (g.n_textures < ENG_MAX_TEXTURES) {\n        index = g.n_textures++;\n    } else {\n        index = 0;\n        for (u32 i = 1; i < g.n_textures; i++)\n            if (g.textures[i].last_use_serial < g.textures[index].last_use_serial)\n                index = i;\n        evicted = g.textures[index].handle;\n    }\n\n    eng_texture e;\n    memset(&e, 0, sizeof(e));\n    e.location = location; e.offset = offset; e.format = fmt;\n    e.width = w; e.height = h; e.pitch = pitch;\n    e.remap = remap; e.cubemap = (u32)(cube != 0);\n    e.last_hash_frame = g.frames;\n    e.last_use_serial = ++g.texture_use_serial;\n    { int readable = 0;\n      e.content_hash = eng_texture_content_hash(location, offset, span, &readable); }\n    e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,\n                                  cube, remap);\n    if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);\n    if (e.handle || !evicted) g.textures[index] = e;\n    return e.handle;\n}\n\n', "#if defined(__ANDROID__)\n/* Android: the texture cache is looked up for every unit of every draw (tens\n * of thousands of times a frame) and upstream scans all 1024 entries each\n * time, then FNV-hashes each cached texture's whole span once per frame.\n * Here: an open-addressed index over the cache (rebuilt on insert, entries\n * re-validated on lookup), and for spans over 64 KiB a 1024-point sampled\n * hash every frame plus a full hash every 16th frame (staggered per entry),\n * so partial updates are still caught within 16 frames. */\n#define EU_TEX_INDEX 4096u\nstatic u32 eu_tex_index[EU_TEX_INDEX];   /* cache slot + 1; 0 = empty */\nstatic u32 eu_tex_bucket(u32 loc, u32 off, u32 fmt, u32 w, u32 h, u32 pitch, u32 remap, u32 cube)\n{\n    u32 x = off * 0x9E3779B1u ^ loc * 0x85EBCA77u ^ fmt * 0xC2B2AE3Du ^ w * 0x27D4EB2Fu ^\n            h * 0x165667B1u ^ pitch * 0xD3A2646Bu ^ remap * 0xFD7046C5u ^ cube;\n    x ^= x >> 15; x *= 0x2C1B3C6Du; x ^= x >> 12;\n    return x & (EU_TEX_INDEX - 1u);\n}\nstatic int eu_tex_matches(const eng_texture* e, u32 loc, u32 off, u32 fmt, u32 w, u32 h,\n                          u32 pitch, u32 remap, u32 cube)\n{\n    return e->location == loc && e->offset == off && e->format == fmt && e->width == w &&\n           e->height == h && e->pitch == pitch && e->remap == remap && e->cubemap == cube;\n}\nstatic void eu_tex_index_rebuild(void)\n{\n    memset(eu_tex_index, 0, sizeof eu_tex_index);\n    for (u32 i = 0; i < g.n_textures; i++) {\n        const eng_texture* e = &g.textures[i];\n        u32 b = eu_tex_bucket(e->location, e->offset, e->format, e->width, e->height, e->pitch,\n                              e->remap, e->cubemap);\n        while (eu_tex_index[b]) b = (b + 1u) & (EU_TEX_INDEX - 1u);\n        eu_tex_index[b] = i + 1u;\n    }\n}\nstatic u64 eu_fnv(const u8* p, u32 n, u64 hash)\n{\n    u32 i = 0;\n    for (; i + 8 <= n; i += 8) { u64 w; memcpy(&w, p + i, 8); hash ^= w; hash *= 1099511628211ull; }\n    for (; i < n; i++) { hash ^= p[i]; hash *= 1099511628211ull; }\n    return hash;\n}\n#define EU_TEX_SAMPLE_MIN 65536u\nstatic u64 eu_tex_hash_full(const u8* src, u32 span) { return eu_fnv(src, span, 1469598103934665603ull); }\nstatic u64 eu_tex_hash_sampled(const u8* src, u32 span)\n{\n    if (span <= EU_TEX_SAMPLE_MIN) return eu_tex_hash_full(src, span);\n    u64 hash = 1469598103934665603ull;\n    const u32 step = span / 1024u;\n    for (u32 k = 0; k < 1024u; k++) hash = eu_fnv(src + (size_t)k * step, 16u, hash);\n    return eu_fnv(src + span - 16u, 16u, hash);\n}\n\nstatic u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,\n                            u32 levels, u32 pitch, int cube, u32 remap)\n{\n    if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;\n    const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);\n    if (!span) return 0;\n    const u32 cu = (u32)(cube != 0);\n\n    u32 b = eu_tex_bucket(location, offset, fmt, w, h, pitch, remap, cu);\n    for (u32 v; (v = eu_tex_index[b]) != 0; b = (b + 1u) & (EU_TEX_INDEX - 1u)) {\n        const u32 i = v - 1u;\n        if (i >= g.n_textures) continue;\n        eng_texture* e = &g.textures[i];\n        if (!eu_tex_matches(e, location, offset, fmt, w, h, pitch, remap, cu)) continue;\n        if (e->handle && e->last_hash_frame != g.frames) {\n            e->last_hash_frame = g.frames;\n            const u8* src = (const u8*)eng_guest_ptr(NULL, location, offset, span);\n            if (src) {\n                const u64 hs = eu_tex_hash_sampled(src, span);\n                const int full_due = span > EU_TEX_SAMPLE_MIN && ((g.frames + i) & 15u) == 0;\n                const u64 hf = full_due ? eu_tex_hash_full(src, span) : e->full_hash;\n                if (hs != e->content_hash || hf != e->full_hash) {\n                    const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,\n                                                         levels, pitch, cube, remap);\n                    if (fresh) {\n                        g.be->texture_release(g.be->user, e->handle);\n                        e->handle = fresh;\n                        e->content_hash = hs;\n                        e->full_hash = full_due ? hf : eu_tex_hash_full(src, span);\n                    }\n                }\n            }\n        }\n        e->last_use_serial = ++g.texture_use_serial;\n        return e->handle;\n    }\n\n    u32 index;\n    u32 evicted = 0;\n    if (g.n_textures < ENG_MAX_TEXTURES) {\n        index = g.n_textures++;\n    } else {\n        index = 0;\n        for (u32 i = 1; i < g.n_textures; i++)\n            if (g.textures[i].last_use_serial < g.textures[index].last_use_serial)\n                index = i;\n        evicted = g.textures[index].handle;\n    }\n\n    eng_texture e;\n    memset(&e, 0, sizeof(e));\n    e.location = location; e.offset = offset; e.format = fmt;\n    e.width = w; e.height = h; e.pitch = pitch;\n    e.remap = remap; e.cubemap = cu;\n    e.last_hash_frame = g.frames;\n    e.last_use_serial = ++g.texture_use_serial;\n    { const u8* src = (const u8*)eng_guest_ptr(NULL, location, offset, span);\n      if (src) { e.content_hash = eu_tex_hash_sampled(src, span); e.full_hash = eu_tex_hash_full(src, span); } }\n    e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,\n                                  cube, remap);\n    if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);\n    if (e.handle || !evicted) g.textures[index] = e;\n    else if (index == g.n_textures - 1u && !evicted) g.n_textures--;\n    eu_tex_index_rebuild();\n    return e.handle;\n}\n#else\nstatic u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,\n                            u32 levels, u32 pitch, int cube, u32 remap)\n{\n    if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;\n    const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);\n    if (!span) return 0;\n\n    for (u32 i = 0; i < g.n_textures; i++) {\n        eng_texture* e = &g.textures[i];\n        if (e->location != location || e->offset != offset ||\n            e->format != fmt || e->width != w || e->height != h ||\n            e->pitch != pitch || e->remap != remap ||\n            e->cubemap != (u32)(cube != 0))\n            continue;\n        if (e->handle && e->last_hash_frame != g.frames) {\n            int readable = 0;\n            const u64 hash = eng_texture_content_hash(location, offset, span,\n                                                      &readable);\n            e->last_hash_frame = g.frames;\n            if (readable && hash != e->content_hash) {\n                const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,\n                                                     levels, pitch, cube, remap);\n                if (fresh) {\n                    g.be->texture_release(g.be->user, e->handle);\n                    e->handle = fresh;\n                    e->content_hash = hash;\n                }\n            }\n        }\n        e->last_use_serial = ++g.texture_use_serial;\n        return e->handle;\n    }\n\n    u32 index;\n    u32 evicted = 0;\n    if (g.n_textures < ENG_MAX_TEXTURES) {\n        index = g.n_textures++;\n    } else {\n        index = 0;\n        for (u32 i = 1; i < g.n_textures; i++)\n            if (g.textures[i].last_use_serial < g.textures[index].last_use_serial)\n                index = i;\n        evicted = g.textures[index].handle;\n    }\n\n    eng_texture e;\n    memset(&e, 0, sizeof(e));\n    e.location = location; e.offset = offset; e.format = fmt;\n    e.width = w; e.height = h; e.pitch = pitch;\n    e.remap = remap; e.cubemap = (u32)(cube != 0);\n    e.last_hash_frame = g.frames;\n    e.last_use_serial = ++g.texture_use_serial;\n    { int readable = 0;\n      e.content_hash = eng_texture_content_hash(location, offset, span, &readable); }\n    e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,\n                                  cube, remap);\n    if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);\n    if (e.handle || !evicted) g.textures[index] = e;\n    return e.handle;\n}\n\n#endif\n")
+# SPU speed 3: time reads. __kernel_clock_gettime was 10-17% of the busiest
+# SPU thread's samples (decrementer reads, QPC/GetTickCount shims, lockstep
+# clock). Read the arm64 generic timer directly instead.
+_FAST = '\n#if defined(__ANDROID__) && defined(__aarch64__)\n/* Android/arm64: read the generic timer directly (one mrs) instead of a vDSO\n * clock_gettime per call; anchored to CLOCK_MONOTONIC on first use so values\n * stay comparable with the clock_gettime ones elsewhere. */\nstatic inline unsigned long long eu_fast_mono_ns_%(tag)s(void)\n{\n    static unsigned long long s_base_ns, s_base_cnt, s_mult;\n    unsigned long long cnt;\n    __asm__ volatile("mrs %%0, cntvct_el0" : "=r"(cnt));\n    unsigned long long mult = __atomic_load_n(&s_mult, __ATOMIC_ACQUIRE);\n    if (__builtin_expect(!mult, 0)) {\n        struct timespec ts;\n        unsigned long long frq;\n        __asm__ volatile("mrs %%0, cntfrq_el0" : "=r"(frq));\n        if (!frq) frq = 19200000ull;\n        clock_gettime(CLOCK_MONOTONIC, &ts);\n        __asm__ volatile("mrs %%0, cntvct_el0" : "=r"(s_base_cnt));\n        s_base_ns = (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;\n        mult = (1000000000ull << 32) / frq;\n        __atomic_store_n(&s_mult, mult, __ATOMIC_RELEASE);\n        cnt = s_base_cnt;\n    }\n    return s_base_ns + (unsigned long long)(((unsigned __int128)(cnt - s_base_cnt) * mult) >> 32);\n}\n#endif\n'
+change("runtime/platform/win32_compat.h",
+"""static inline unsigned long long ps3__mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}""",
+(_FAST % {"tag": "w32"}) + """static inline unsigned long long ps3__mono_ns(void)
+{
+#if defined(__ANDROID__) && defined(__aarch64__)
+    return eu_fast_mono_ns_w32();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+#endif
+}""")
+change("runtime/spu/spu_channels.c",
+"""static uint64_t spu_host_ns(void)
+{""",
+(_FAST % {"tag": "chan"}) + """static uint64_t spu_host_ns(void)
+{
+#if defined(__ANDROID__) && defined(__aarch64__)
+    return (uint64_t)eu_fast_mono_ns_chan();
+#endif""")
+change("runtime/spu/spu_lockstep.c",
+"""static uint64_t ls_now_ns(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);""",
+(_FAST % {"tag": "ls"}) + """static uint64_t ls_now_ns(void)
+{
+#if defined(__ANDROID__) && defined(__aarch64__)
+    return (uint64_t)eu_fast_mono_ns_ls();
+#endif
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);""")
+# Depth read through a colour format: deferred PS3 renderers sample the zeta
+# buffer as A8R8G8B8 and rebuild depth from its bytes. Upstream only maps
+# DEPTH24_D8 reads onto a tracked zeta, so these reads fell through to
+# (empty) guest memory and inFamous' lighting composite went black. On
+# Android, pack the zeta snapshot into RGBA8 the way the PS3 lays out D24S8
+# (backend: eu_vk_depth_pack) and sample that, with the texture's remap.
+change("libs/video/rsx_draw_engine.c",
+"""    int snapshot_valid;
+} eng_zdepth;""",
+"""    int snapshot_valid;
+    u32 eu_packed, eu_packed_src;   /* Android: snapshot packed as A8R8G8B8 */
+} eng_zdepth;
+#if defined(__ANDROID__)
+extern u32 eu_vk_depth_pack(u32 snapshot, u32 w, u32 h) __attribute__((weak));
+#endif""")
+change("libs/video/rsx_draw_engine.c",
+"""            if (textures[u]) continue;
+        }
+        textures[u] = eng_texture_slot(t.location, t.offset, t.format,""",
+"""            if (textures[u]) continue;
+        }
+#if defined(__ANDROID__)
+        if (base_fmt == RSX_TEX_FMT_A8R8G8B8 && eu_vk_depth_pack) {
+            for (u32 i = 0; i < g.n_zdepths; i++) {
+                eng_zdepth* z = &g.zdepths[i];
+                if (z->location != t.location || z->offset != t.offset || current_zslot == i) continue;
+                const u32 snap = eng_zdepth_snapshot(i);
+                if (!snap) break;
+                if (!z->eu_packed || z->eu_packed_src != snap) {
+                    const u32 packed = eu_vk_depth_pack(snap, z->w, z->h);
+                    if (packed) {
+                        if (z->eu_packed && g.be->color_target_release)
+                            g.be->color_target_release(g.be->user, z->eu_packed);
+                        z->eu_packed = packed;
+                        z->eu_packed_src = snap;
+                    }
+                }
+                if (z->eu_packed) {
+                    const u32 view = g.be->surface_view
+                        ? g.be->surface_view(g.be->user, z->eu_packed, t.remap & 0xFFFFu, t.format) : 0;
+                    textures[u] = view ? view : z->eu_packed;
+                }
+                break;
+            }
+            if (textures[u]) continue;
+        }
+#endif
+        textures[u] = eng_texture_slot(t.location, t.offset, t.format,""")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
