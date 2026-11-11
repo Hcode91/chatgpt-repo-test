@@ -23,6 +23,7 @@
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
+#include <sys/resource.h>
 #include <fcntl.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -745,6 +746,24 @@ static void eu_prime_sweep(void)
         fprintf(stderr, "[boost] fastest core reserved for the RSX FIFO thread: %s (EU_PRIME_EXCLUSIVE), %d such core(s)\n",
                 on && have_prime ? "on" : "off", nprime);
     }
+    {   /* The game's main thread was ready to run but waiting for a core 58-66% of the time while using a
+         * third of one (boot-20261111-100119): everything else is paced by it. Give it priority over the
+         * SPU threads. EU_MAIN_BOOST=0 = leave it; EU_MAIN_NICE sets the value (default -6). */
+        static int done;
+        if (!done) {
+            done = 1;
+            const char* e = getenv("EU_MAIN_BOOST");
+            const char* n = getenv("EU_MAIN_NICE");
+            if (!(e && *e == '0')) {
+                int nv = (n && *n) ? atoi(n) : -6;
+                if (nv < -19) nv = -19;
+                if (nv > 0) nv = 0;
+                const int r = setpriority(PRIO_PROCESS, (id_t)getpid(), nv);
+                fprintf(stderr, "[boost] game main thread (tid %d): priority %d %s (EU_MAIN_BOOST)\n", (int)getpid(), nv,
+                        r == 0 ? "set" : strerror(errno));
+            }
+        }
+    }
     if (!on || !have_prime || !&g_eu_prime_n || g_eu_prime_n <= 0) return;
     DIR* d = opendir("/proc/self/task");
     if (!d) return;
@@ -855,6 +874,21 @@ static void* eu_cpu_thread(void* arg)
             char label[24];
             snprintf(label, sizeof label, "busiest#%d", k + 1);
             eu_profile_thread(cur[idx[k]].tid, label, k == 0);
+        }
+        {   /* The SPU side is ~470% of a core spread over 44 threads, most of them small. Sample two of the
+             * small ones each cycle -- a kernel thread and a lane thread in the 3-20% range, a different one
+             * each time -- to see what a mostly idle one spends its time on. */
+            static int s_pick;
+            int cand_k[64], cand_l[64], nk = 0, nl = 0;
+            for (int i = 0; i < nc; i++) {
+                const double pct = 100.0 * (double)dt[i] / (double)(hz * 10);
+                if (pct < 3.0 || pct > 20.0) continue;
+                if (!strncmp(cur[i].name, "spurs i", 7) && nk < 64) cand_k[nk++] = i;
+                else if (!strncmp(cur[i].name, "spu w", 5) && nl < 64) cand_l[nl++] = i;
+            }
+            s_pick++;
+            if (nk) eu_profile_thread(cur[cand_k[s_pick % nk]].tid, "small-kernel", 0);
+            if (nl) eu_profile_thread(cur[cand_l[s_pick % nl]].tid, "small-lane", 0);
         }
         /* every minute: the busiest thread's whole-run totals */
         static int s_cycles;
