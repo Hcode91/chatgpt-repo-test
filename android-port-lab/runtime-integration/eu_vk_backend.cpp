@@ -2382,7 +2382,7 @@ void encode_thread_main()
     pthread_setname_np(pthread_self(), "vk encode");
     {   /* off the fastest core, which the FIFO thread has */
         const char* e = getenv("EU_FIFO_PLACE");
-        if (!(e && *e == '0') && eu_thread_place) eu_thread_place("frame encode thread", -4, 2);
+        if (!(e && *e == '0') && eu_thread_place) eu_thread_place("frame encode thread", -11, 2);   /* SPU threads run at -10: -4 left it behind all of them */
     }
     for (;;) {
         u32 present;
