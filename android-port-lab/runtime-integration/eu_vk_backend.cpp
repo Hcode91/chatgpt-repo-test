@@ -2459,9 +2459,22 @@ void encode_and_submit(u32 present_surface)
     clock_gettime(CLOCK_MONOTONIC, &t1);
     g_eu_prof[6] += us_between(t0, t1) * 1000u;
 }
+/* Where a submission's time goes (per 5 s report): waiting for a free slot, copying the staged data to the
+ * GPU buffer, encoding the records, the queue submit, the rest. */
+uint64_t g_enc_ns[5], g_enc_records, g_enc_stage_bytes;
+static inline uint64_t enc_now()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 void encode_and_submit_inner(u32 present_surface, uint64_t serial)
 {
     if (!g_active) { g_rec_count = 0; g_stage_used = 0; return; }
+    uint64_t enc_t = enc_now();
+    auto lap = [&enc_t](int i) { const uint64_t n = enc_now(); g_enc_ns[i] += n - enc_t; enc_t = n; };
+    g_enc_records += g_rec_count;
+    g_enc_stage_bytes += g_stage_used;
     Obj* src = obj(present_surface);
     static uint64_t next_publish;
     const bool publish = src && src->view && eu_bridge_frame_rgba && now_ms() >= next_publish;
@@ -2476,6 +2489,7 @@ void encode_and_submit_inner(u32 present_surface, uint64_t serial)
         if (!g_active) return;
     }
 
+    lap(0);
     if (g_stage_used && !buffer_ensure(g_stage_buf, (VkDeviceSize)g_stage_used + UBO_PAD,
                                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                                            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -2486,6 +2500,7 @@ void encode_and_submit_inner(u32 present_surface, uint64_t serial)
         return;
     }
     if (g_stage_used) memcpy(g_stage_buf.map, g_stage, g_stage_used);
+    lap(1);
 
     vkResetCommandBuffer(g_cb, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -2519,11 +2534,13 @@ void encode_and_submit_inner(u32 present_surface, uint64_t serial)
     }
     if (qp) vkCmdWriteTimestamp(g_cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
     vkEndCommandBuffer(g_cb);
+    lap(2);
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &g_cb;
     vkResetFences(g_dev, 1, &g_fence);
     VkResult qr = vkQueueSubmit(g_queue, 1, &si, g_fence);
+    lap(3);
     Slot& sl = g_slot[g_cur];
     if (qr == VK_SUCCESS) {
         sl.in_flight = true;
@@ -2542,6 +2559,7 @@ void encode_and_submit_inner(u32 present_surface, uint64_t serial)
     g_stage_used = 0;
     g_cur = (g_cur + 1) % NUM_SLOTS;
     for (u32 k = 0; k < NUM_SLOTS; k++) slot_finish(k, false);   /* publish whatever is done */
+    lap(4);
     collect_retired();
 }
 
@@ -3375,6 +3393,12 @@ void be_present(void*, u32 surface)
                     g_same_n ? g_same_pipe * 100.0 / g_same_n : 0.0, g_same_n ? g_same_tex * 100.0 / g_same_n : 0.0,
                     g_same_n ? g_same_both * 100.0 / g_same_n : 0.0);
             g_async_jobs = g_sync_jobs = 0; g_same_pipe = g_same_tex = g_same_both = g_same_n = 0;
+            fprintf(stderr, "[fifo-prof] submissions: waiting for a free slot %.0f ms, copying staged data %.0f ms (%.0f MB), "
+                    "encoding %.0f ms (%llu records), queue submit %.0f ms, rest %.0f ms\n", g_enc_ns[0] / 1e6, g_enc_ns[1] / 1e6,
+                    g_enc_stage_bytes / 1048576.0, g_enc_ns[2] / 1e6, (unsigned long long)g_enc_records, g_enc_ns[3] / 1e6,
+                    g_enc_ns[4] / 1e6);
+            for (uint64_t& v : g_enc_ns) v = 0;
+            g_enc_records = g_enc_stage_bytes = 0;
             if (pv[11] || pv[12])
                 fprintf(stderr, "[fifo-prof] GPU vertex fetch on the FIFO thread: index mapping %.0f ms, attribute table %.0f ms, "
                         "staging %.0f ms (timed on 1 draw in 16)\n", ms(pv[10]), ms(pv[11]), ms(pv[12]));
