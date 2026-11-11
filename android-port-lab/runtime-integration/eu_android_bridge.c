@@ -1331,6 +1331,7 @@ static void* eu_cpu_thread(void* arg)
             if (nk) eu_profile_thread(cur[cand_k[s_pick % nk]].tid, "small-kernel", 0);
             if (nl) eu_profile_thread(cur[cand_l[s_pick % nl]].tid, "small-lane", 0);
         }
+        { extern void eu_jobtime_report(double) __attribute__((weak)); if (&eu_jobtime_report) eu_jobtime_report(10.0); }
         /* every minute: the busiest thread's whole-run totals */
         static int s_cycles;
         static uint64_t s_min_all, s_min_spu;

@@ -2252,4 +2252,117 @@ change("libs/spurs/cellSpurs.c",
 """                            fprintf(stderr, "[park] 10s: idle kernel threads parked %ld times, %ld ended by a kick | workload passes: %ld one thread at a time, %ld on lane threads\\n",
                                     InterlockedExchange(&s_eu_park_n, 0), InterlockedExchange(&s_eu_park_kicked, 0),
                                     InterlockedExchange(&s_eu_serial_passes, 0), InterlockedExchange(&s_eu_parallel_passes, 0));""")
+# Processor time per SPU job module, over every SPU thread ([jobs] line every 10 s, printed by the bridge's
+# sampler). The job manager streams one module at a time into LS 0x4000 and branches into it; every dispatch
+# path already calls spu_wws_job_refresh_ovl with the branch target, so "target inside the job code buffer"
+# / "target below it" are the edges of a job. Thread CPU time between the edges goes to the module resident
+# at the exit edge (two clock reads per job). A job that returns to the manager through a plain C return is
+# only closed at the manager's next dispatched branch, so a little manager time lands on the job.
+# This is the list native replacements are chosen from. EU_JOBTIME=0 = off.
+change("runtime/spu/spu_channels.c",
+"""static inline __attribute__((always_inline)) void spu_wws_job_refresh_ovl_fast(spu_context* ctx, uint32_t pc)
+{
+""",
+"""#if defined(__ANDROID__)
+#define EU_JOBTIME_SLOTS 66   /* 0..63 = overlay ids 200..263, 64 = job code that is not a lifted module, 65 = spare */
+static volatile long long s_eu_job_ns[EU_JOBTIME_SLOTS];
+static volatile long s_eu_job_runs[EU_JOBTIME_SLOTS];
+static int s_eu_jobtime = -1;
+static SPU_THREAD_LOCAL int t_eu_in_job;
+static SPU_THREAD_LOCAL long long t_eu_job_t0;
+void eu_jobtime_edge(spu_context* ctx, uint32_t pc)
+{
+    if (__builtin_expect(s_eu_jobtime < 0, 0)) { const char* e = getenv("EU_JOBTIME"); s_eu_jobtime = (e && *e == '0') ? 0 : 1; }
+    if (!s_eu_jobtime || (ctx->image_id != 1 && ctx->image_id != 2)) return;
+    const int in = pc >= 0x4000 && pc < 0x3E000;
+    if (in == t_eu_in_job) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    const long long now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    if (in) t_eu_job_t0 = now;
+    else {
+        const int id = ctx->resident_ovl;
+        const int slot = (id >= 200 && id < 264) ? id - 200 : 64;
+        __atomic_fetch_add(&s_eu_job_ns[slot], now - t_eu_job_t0, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&s_eu_job_runs[slot], 1, __ATOMIC_RELAXED);
+    }
+    t_eu_in_job = in;
+}
+#endif
+static inline __attribute__((always_inline)) void spu_wws_job_refresh_ovl_fast(spu_context* ctx, uint32_t pc)
+{
+#if defined(__ANDROID__)
+    eu_jobtime_edge(ctx, pc);
+#endif
+""")
+change("runtime/spu/spu_channels.c",
+"""void spu_wws_job_refresh_ovl(spu_context* ctx, uint32_t pc)
+{
+    if ((ctx->image_id != 1 && ctx->image_id != 2) || pc < 0x4000 || pc >= 0x3E000) return;
+""",
+"""void spu_wws_job_refresh_ovl(spu_context* ctx, uint32_t pc)
+{
+#if defined(__ANDROID__)
+    eu_jobtime_edge(ctx, pc);
+#endif
+    if ((ctx->image_id != 1 && ctx->image_id != 2) || pc < 0x4000 || pc >= 0x3E000) return;
+""")
+change("runtime/spu/spu_dispatch_mt.c",
+"""          if (pc >= 0x4000) spu_wws_job_refresh_ovl(ctx, pc); }
+        spu_dispatch_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;""",
+"""          if (pc >= 0x4000) spu_wws_job_refresh_ovl(ctx, pc);
+#if defined(__ANDROID__)
+          else { extern void eu_jobtime_edge(spu_context*, uint32_t); eu_jobtime_edge(ctx, pc); }
+#endif
+        }
+        spu_dispatch_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;""")
+change("runtime/spu/spu_drain.c",
+"""              if (pc >= 0x4000) spu_wws_job_refresh_ovl(ctx, pc); }""",
+"""              if (pc >= 0x4000) spu_wws_job_refresh_ovl(ctx, pc);
+#if defined(__ANDROID__)
+              else { extern void eu_jobtime_edge(spu_context*, uint32_t); eu_jobtime_edge(ctx, pc); }
+#endif
+            }""")
+change("runtime/spu/spu_channels.c",
+"""            (g[0] + g[1]) ? 100.0 * g[4] / (double)(g[0] + g[1]) : 0.0, g[5] / s / 1000.0, g[6] / s / 1000.0);
+}
+""",
+"""            (g[0] + g[1]) ? 100.0 * g[4] / (double)(g[0] + g[1]) : 0.0, g[5] / s / 1000.0, g[6] / s / 1000.0);
+}
+
+#if defined(__ANDROID__)
+/* Called every 10 s by the bridge's sampler thread. */
+void eu_jobtime_report(double secs)
+{
+    if (s_eu_jobtime <= 0 || secs <= 0) return;
+    long long ns[EU_JOBTIME_SLOTS]; long runs[EU_JOBTIME_SLOTS]; long long total = 0; long total_runs = 0;
+    for (int i = 0; i < EU_JOBTIME_SLOTS; i++) {
+        ns[i] = __atomic_exchange_n(&s_eu_job_ns[i], 0, __ATOMIC_RELAXED);
+        runs[i] = __atomic_exchange_n(&s_eu_job_runs[i], 0, __ATOMIC_RELAXED);
+        total += ns[i]; total_runs += runs[i];
+    }
+    if (!total_runs) return;
+    char line[1500]; int off = 0;
+    off += snprintf(line + off, sizeof line - off, "[jobs] %.0fs: SPU job code %.0f%% of one core in %ld runs |", secs,
+                    (double)total / (secs * 1e7), total_runs);
+    for (int shown = 0; shown < 14; shown++) {
+        int best = -1;
+        for (int i = 0; i < EU_JOBTIME_SLOTS; i++) if (ns[i] > 0 && (best < 0 || ns[i] > ns[best])) best = i;
+        if (best < 0 || off > (int)sizeof line - 120) break;
+        char name[24] = "unlifted";
+        if (best < 64)
+            for (int k = 0; k < s_ovl_src_count; k++)
+                if (s_ovl_src[k].has_sig && s_ovl_src[k].image_id == 200 + best) {
+                    const uint8_t* g = s_ovl_src[k].sig;
+                    snprintf(name, sizeof name, "%d:%02x%02x%02x%02x%02x%02x", 200 + best, g[0], g[1], g[2], g[3], g[4], g[5]);
+                    break;
+                }
+        off += snprintf(line + off, sizeof line - off, " %s %.1f%% %ldx %.0fus", name, (double)ns[best] / (secs * 1e7),
+                        runs[best], runs[best] ? (double)ns[best] / 1000.0 / (double)runs[best] : 0.0);
+        ns[best] = 0;
+    }
+    fprintf(stderr, "%s\\n", line);
+}
+#endif
+""")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
