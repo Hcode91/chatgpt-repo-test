@@ -9,3 +9,4 @@ app/build/
 *.3ds
 *.cxi
 *.cia
+test-build/

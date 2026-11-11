@@ -17,6 +17,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.ScrollView;
@@ -60,6 +61,9 @@ public class MainActivity extends Activity {
     private static final int PICK_RETRO_PNG = 312;
     private static final int SAVE_RETRO_ROM = 313;
     private static final int PICK_NDS_DIRECTORY = 314;
+    private static final int PICK_NDS_PNG = 315;
+    private static final int SAVE_NDS = 316;
+    private static final int PICK_PALETTE = 317;
     private static final String DIR_MIME = DocumentsContract.Document.MIME_TYPE_DIR;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -72,7 +76,16 @@ public class MainActivity extends Activity {
     private RetroTiles.Mode retroMode;
     private int retroPage = -1;
     private Uri retroPngUri;
-    private List<NdsArchive.Entry> pendingNds;
+    private List<NitroVfs.Node> pendingNds;
+    private final List<NitroVfs.Node> ndsNodes = new ArrayList<>();
+    private final Set<String> expandedNds = new HashSet<>();
+    private NitroVfs.Node ndsImportNode;
+    private int ndsImportBank = 0;
+    private Uri ndsPngUri;
+    /** Display palette for raw tile sheets; null = grayscale indexes (the classic export format). */
+    private int[] viewPalette;
+    private String viewPaletteName = "Grayscale";
+    private int lzScanTileBytes = 0;
     private int nesPage = -1;
     private Uri nesPngUri;
     private final List<Uri> hdPngUris = new ArrayList<>();
@@ -84,7 +97,7 @@ public class MainActivity extends Activity {
     private boolean busy = false;
     private TextView headline, summary, location, detail;
     private Button open, extractAll, extractHere, up, stop, pngToBtex, pngToNes, upscaleHd;
-    private Button pngToRetro, retroFormat;
+    private Button pngToRetro, retroFormat, paletteButton;
     private ListView list;
     private ArrayAdapter<String> adapter;
 
@@ -118,13 +131,13 @@ public class MainActivity extends Activity {
         headline.setBackgroundColor(Color.rgb(35, 45, 91));
         headline.setPadding(dp(18), dp(16), dp(14), dp(16));
         root.addView(headline);
-        summary = text("3DS · DS · NES · SNES · Mega Drive asset tools", 14, Color.DKGRAY);
+        summary = text("3DS · DS · NES · SNES · Mega Drive · Game Boy · GBA asset tools", 14, Color.DKGRAY);
         root.addView(summary);
         LinearLayout controls = new LinearLayout(this);
         controls.setOrientation(LinearLayout.HORIZONTAL);
         controls.setPadding(dp(6), 0, dp(6), 0);
         root.addView(controls);
-        open = button("Open ROM (3DS / DS / NES / SNES / MD)");
+        open = button("Open ROM (3DS / DS / NES / SNES / MD / GB / GBA)");
         extractAll = button("Extract all");
         controls.addView(open, new LinearLayout.LayoutParams(0, dp(54), 1));
         controls.addView(extractAll, new LinearLayout.LayoutParams(0, dp(54), 1));
@@ -141,9 +154,14 @@ public class MainActivity extends Activity {
         root.addView(pngToBtex, new LinearLayout.LayoutParams(-1, dp(50)));
         pngToNes = button("PNG → NES (rebuild CHR-ROM graphics)");
         root.addView(pngToNes, new LinearLayout.LayoutParams(-1, dp(50)));
-        retroFormat = button("SNES tile mode: 4bpp (change format)");
-        root.addView(retroFormat, new LinearLayout.LayoutParams(-1, dp(48)));
-        pngToRetro = button("PNG → SNES / Mega Drive ROM (raw tile page)");
+        LinearLayout tileRow = new LinearLayout(this);
+        tileRow.setPadding(dp(6), 0, dp(6), 0);
+        root.addView(tileRow);
+        retroFormat = button("Tile format");
+        paletteButton = button("Palette: Grayscale");
+        tileRow.addView(retroFormat, new LinearLayout.LayoutParams(0, dp(48), 1));
+        tileRow.addView(paletteButton, new LinearLayout.LayoutParams(0, dp(48), 1));
+        pngToRetro = button("PNG → ROM (patch tile page + fix checksum)");
         root.addView(pngToRetro, new LinearLayout.LayoutParams(-1, dp(50)));
         upscaleHd = button("3DS HD PNG upscale (2× / 4×)");
         root.addView(upscaleHd, new LinearLayout.LayoutParams(-1, dp(50)));
@@ -164,11 +182,12 @@ public class MainActivity extends Activity {
         pngToNes.setOnClickListener(v -> startNesImport());
         pngToRetro.setOnClickListener(v -> startRetroImport());
         retroFormat.setOnClickListener(v -> chooseRetroFormat());
+        paletteButton.setOnClickListener(v -> choosePalette());
         upscaleHd.setOnClickListener(v -> chooseHdUpscale());
         extractAll.setOnClickListener(v -> {
             if (retroInfo != null) beginRetroExport(-1);
             else if (nesInfo != null) beginNesExport(-1);
-            else if (ndsInfo != null) beginNdsExtract(ndsInfo.entries);
+            else if (ndsInfo != null) beginNdsExtract(ndsNodes);
             else beginExtract(archive == null ? null : archive.entries);
         });
         extractHere.setOnClickListener(v -> {
@@ -185,28 +204,8 @@ public class MainActivity extends Activity {
         stop.setOnClickListener(v -> { cancelled.set(true); detail.setText("Cancelling after the current file..."); });
         list.setOnItemClickListener((parent, view, position, id) -> {
             if (busy || position < 0 || position >= displayed.size()) return;
-            if (retroInfo != null) {
-                final int page = position;
-                final RetroTiles.Mode mode = retroMode;
-                new AlertDialog.Builder(this).setTitle(mode.slug + " · page " + page)
-                        .setMessage("Raw ROM tile scan at byte offset 0x" +
-                                Long.toHexString(retroInfo.pageOffset(mode,page)).toUpperCase(Locale.ROOT) +
-                                ". Some data may be code or compressed assets rather than graphics. " +
-                                "Colours are palette indexes, not the game's actual RGB colours.")
-                        .setNegativeButton("Close",null)
-                        .setPositiveButton("Export PNG",(d,w)->beginRetroExport(page)).show();
-                return;
-            }
-            if (nesInfo != null) {
-                final int page = position;
-                String label = nesInfo.usesChrRam() ? "Experimental PRG tile scan" : "CHR-ROM graphics";
-                new AlertDialog.Builder(this).setTitle(label + " page " + page)
-                        .setMessage(nesInfo.usesChrRam() ?
-                                "Preview the program's bytes as 2-bit NES tiles. These may be code or compressed graphics, not real sprites. Re-import is disabled to avoid corrupting this ROM." :
-                                "Export a 128×128 PNG using the four NES colour indexes, then re-import a modified PNG to rebuild a new .nes copy.")
-                        .setNegativeButton("Close", null)
-                        .setPositiveButton("Export PNG", (d,w) -> beginNesExport(page))
-                        .show();
+            if (retroInfo != null || nesInfo != null) {
+                showTilePreview(position);
                 return;
             }
             if (archive == null && ndsInfo == null) return;
@@ -219,13 +218,7 @@ public class MainActivity extends Activity {
                 String filename = row.substring(3);
                 String full = activePath.isEmpty() ? filename : activePath + "/" + filename;
                 if (ndsInfo != null) {
-                    for (NdsArchive.Entry entry : ndsInfo.entries) if (entry.path.equals(full)) {
-                        new AlertDialog.Builder(this).setTitle(filename)
-                                .setMessage("Size: " + human(entry.size) + "\n\nExtract this NitroFS file?")
-                                .setNegativeButton("Cancel",null)
-                                .setPositiveButton("Extract",(d,w)->beginNdsExtract(Collections.singletonList(entry))).show();
-                        return;
-                    }
+                    for (NitroVfs.Node node : ndsNodes) if (node.path.equals(full)) { showNdsNode(node); return; }
                     return;
                 }
                 for (CciArchive.Entry entry : archive.entries) {
@@ -289,6 +282,9 @@ public class MainActivity extends Activity {
             ndsInfo = null;
             retroInfo = null;
             retroMode = null;
+            ndsNodes.clear();
+            expandedNds.clear();
+            lzScanTileBytes = 0;
             activePath = "";
             busy = true;
             render();
@@ -314,22 +310,26 @@ public class MainActivity extends Activity {
                             NdsArchive.Info parsedNds = NdsArchive.parse(channel);
                             runOnUiThread(() -> {
                                 ndsInfo=parsedNds; archive=null; nesInfo=null; retroInfo=null;
+                                ndsNodes.clear(); ndsNodes.addAll(NitroVfs.roots(parsedNds)); expandedNds.clear();
                                 busy=false;
                                 summary.setText(parsedNds.description());
-                                detail.setText("Browse NitroFS folders, select files, or extract everything. " +
-                                        "Recognised Nitro files are preserved in their original form.");
+                                detail.setText("Tap a .narc/.carc to open it, tap an .ncgr to preview or import a PNG. " +
+                                        "Extraction also unpacks NARC archives and LZ-compressed files.");
                                 render();
                             });
-                        } else if (RetroTiles.isMegaDrive(channel) || RetroTiles.isSnes(channel,inputName)) {
-                            RetroTiles.System platform = RetroTiles.isMegaDrive(channel)
-                                    ? RetroTiles.System.MEGADRIVE : RetroTiles.System.SNES;
+                        } else if (RetroTiles.isGba(channel) || RetroTiles.isGameBoy(channel) ||
+                                RetroTiles.isMegaDrive(channel) || RetroTiles.isSnes(channel,inputName)) {
+                            RetroTiles.System platform = RetroTiles.isGba(channel) ? RetroTiles.System.GBA :
+                                    RetroTiles.isGameBoy(channel) ? RetroTiles.System.GB :
+                                    RetroTiles.isMegaDrive(channel) ? RetroTiles.System.MEGADRIVE : RetroTiles.System.SNES;
                             RetroTiles.Info parsedRetro=RetroTiles.parse(channel,platform,inputName);
                             runOnUiThread(() -> {
                                 retroInfo=parsedRetro; retroMode=parsedRetro.defaultMode();
                                 archive=null;nesInfo=null;ndsInfo=null;busy=false;
                                 summary.setText(parsedRetro.description());
-                                detail.setText("Raw tile pages are candidate graphics. No compression or palettes " +
-                                        "are decoded. Do not rebuild pages unless you've identified real graphics.");
+                                detail.setText("Tap a page to preview it. Pages are candidate graphics" +
+                                        (parsedRetro.system==RetroTiles.System.GBA ? "; try Tile format → LZ77 for compressed art. " : ". ") +
+                                        "Only rebuild pages you've identified as real graphics.");
                                 render();
                             });
                         } else {
@@ -383,8 +383,22 @@ public class MainActivity extends Activity {
         } else if (request == PICK_HD_FOLDER && !hdPngUris.isEmpty()) {
             upscaleHdPngs(uri);
         } else if (request == PICK_NDS_DIRECTORY && pendingNds != null) {
-            List<NdsArchive.Entry> selection=pendingNds;
+            List<NitroVfs.Node> selection=pendingNds;
             pendingNds=null; extractNds(selection,uri);
+        } else if (request == PICK_NDS_PNG && ndsImportNode != null) {
+            ndsPngUri = uri;
+            Intent save = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+            save.addCategory(Intent.CATEGORY_OPENABLE);
+            save.setType("application/octet-stream");
+            String base = getFilename(imageUri);
+            if (base.toLowerCase(Locale.ROOT).endsWith(".nds")) base = base.substring(0, base.length() - 4);
+            save.putExtra(Intent.EXTRA_TITLE, base + "_modified.nds");
+            save.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            startActivityForResult(save, SAVE_NDS);
+        } else if (request == SAVE_NDS && ndsImportNode != null && ndsPngUri != null) {
+            rebuildNds(uri);
+        } else if (request == PICK_PALETTE) {
+            loadPaletteFile(uri);
         } else if (request == PICK_RETRO_FOLDER && retroInfo != null) {
             exportRetro(uri);
         } else if (request == PICK_RETRO_PNG && retroInfo != null) {
@@ -414,14 +428,14 @@ public class MainActivity extends Activity {
         return result;
     }
 
-    private List<NdsArchive.Entry> ndsEntriesIn(String prefix) {
+    private List<NitroVfs.Node> ndsEntriesIn(String prefix) {
         if(ndsInfo==null) return null;
-        List<NdsArchive.Entry> result=new ArrayList<>();
+        List<NitroVfs.Node> result=new ArrayList<>();
         String base=prefix.isEmpty()?"":prefix+"/";
-        for(NdsArchive.Entry e:ndsInfo.entries) if(e.path.startsWith(base))result.add(e);
+        for(NitroVfs.Node e:ndsNodes) if(e.path.startsWith(base))result.add(e);
         return result;
     }
-    private void beginNdsExtract(List<NdsArchive.Entry> selection) {
+    private void beginNdsExtract(List<NitroVfs.Node> selection) {
         if(busy || selection==null || selection.isEmpty())return;
         pendingNds=new ArrayList<>(selection);
         Intent intent=new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
@@ -446,7 +460,10 @@ public class MainActivity extends Activity {
         }
         if (retroInfo != null && retroMode != null) {
             for(int i=0;i<retroInfo.pageCount(retroMode);i++)
-                displayed.add(String.format(Locale.ROOT,"📄 %s page %04d",retroMode.slug,i));
+                displayed.add(retroMode.compressed ?
+                        String.format(Locale.ROOT,"📄 LZ77 block %04d @0x%06X · %d tiles",i,
+                                retroInfo.lzBlocks.get(i).offset,retroInfo.lzBlocks.get(i).size/retroMode.tileBytes) :
+                        String.format(Locale.ROOT,"📄 %s page %04d",retroMode.slug,i));
         }
         if (archive != null || ndsInfo != null) {
             String prefix = activePath.isEmpty() ? "" : activePath + "/";
@@ -454,7 +471,7 @@ public class MainActivity extends Activity {
             Set<String> files = new TreeSet<>();
             List<String> paths=new ArrayList<>();
             if(archive!=null)for(CciArchive.Entry e:archive.entries)paths.add(e.path);
-            if(ndsInfo!=null)for(NdsArchive.Entry e:ndsInfo.entries)paths.add(e.path);
+            if(ndsInfo!=null)for(NitroVfs.Node e:ndsNodes)paths.add(e.path);
             for (String filePath : paths) {
                 if (!filePath.startsWith(prefix)) continue;
                 String remainder = filePath.substring(prefix.length());
@@ -477,10 +494,14 @@ public class MainActivity extends Activity {
         upscaleHd.setEnabled(!busy);
         pngToNes.setEnabled(!busy && nesInfo != null && !nesInfo.usesChrRam());
         pngToRetro.setEnabled(!busy && retroInfo != null);
-        retroFormat.setEnabled(!busy && retroInfo != null && retroInfo.system==RetroTiles.System.SNES);
-        retroFormat.setVisibility(retroInfo!=null && retroInfo.system==RetroTiles.System.SNES?View.VISIBLE:View.GONE);
+        boolean multiFormat = retroInfo!=null && RetroTiles.Mode.forSystem(retroInfo.system).size()>1;
+        retroFormat.setEnabled(!busy && multiFormat);
+        retroFormat.setVisibility(multiFormat?View.VISIBLE:View.GONE);
+        paletteButton.setEnabled(!busy);
+        paletteButton.setVisibility(retroInfo!=null || nesInfo!=null?View.VISIBLE:View.GONE);
+        paletteButton.setText("Palette: "+viewPaletteName);
         pngToRetro.setVisibility(retroInfo!=null?View.VISIBLE:View.GONE);
-        if(retroMode!=null)retroFormat.setText("SNES tile format: "+retroMode.slug);
+        if(retroMode!=null)retroFormat.setText("Format: "+retroMode.slug);
         extractAll.setText((nesInfo != null || retroInfo != null) ? "Export all tile PNGs" : "Extract all");
         extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null));
         extractHere.setEnabled(!busy && (archive != null && !entriesIn(activePath).isEmpty() ||
@@ -613,84 +634,84 @@ public class MainActivity extends Activity {
         });
     }
 
-    /** Extract standard NitroFS files, never modifying the selected .nds ROM. */
-    private void extractNds(List<NdsArchive.Entry> selection, Uri tree) {
+    /** Extract NitroFS files, unpacking NARC archives and LZ files; never modifies the selected .nds ROM. */
+    private void extractNds(List<NitroVfs.Node> chosen, Uri tree) {
         if(busy || ndsInfo==null) return;
-        busy=true;cancelled.set(false);render();summary.setText("Extracting DS NitroFS files...");
+        // Skip nodes whose ancestor is also selected: the ancestor's unpacking already covers them.
+        Set<NitroVfs.Node> chosenSet=new HashSet<>(chosen);
+        List<NitroVfs.Node> selection=new ArrayList<>();
+        for(NitroVfs.Node n:chosen) {
+            boolean covered=false;
+            for(NitroVfs.Node p=n.parent;p!=null;p=p.parent) if(chosenSet.contains(p)) {covered=true;break;}
+            if(!covered) selection.add(n);
+        }
+        final List<NitroVfs.Node> known=new ArrayList<>(ndsNodes);
+        busy=true;cancelled.set(false);render();summary.setText("Extracting DS files and unpacking archives...");
         worker.execute(() -> {
-            int done=0, pngs=0, unsupported=0;
-            Map<String,NdsArchive.Entry> allByName=new HashMap<>();
-            for(NdsArchive.Entry e:ndsInfo.entries)
-                allByName.put(e.path.toLowerCase(Locale.ROOT),e);
+            int[] stats=new int[4]; // files, pngs, unpacked children, unconverted graphics
             try (ParcelFileDescriptor descriptor=getContentResolver().openFileDescriptor(imageUri,"r")) {
                 if(descriptor==null)throw new IOException("Cannot open DS ROM");
                 try(FileInputStream source=new FileInputStream(descriptor.getFileDescriptor());
                     FileChannel channel=source.getChannel()) {
+                    NitroVfs.Reader reader=NitroVfs.channelReader(channel);
+                    NitroVfs.Cache cache=new NitroVfs.Cache();
                     Uri root=DocumentsContract.buildDocumentUriUsingTree(tree,DocumentsContract.getTreeDocumentId(tree));
                     String stamp=new SimpleDateFormat("yyyyMMdd_HHmmss",Locale.US).format(new Date());
                     Uri folder=DocumentsContract.createDocument(getContentResolver(),root,DIR_MIME,"NDS_Extract_"+stamp);
                     if(folder==null)throw new IOException("Cannot create DS output folder");
                     Map<String,Uri> folders=new HashMap<>();folders.put("",folder);
                     byte[] buffer=new byte[65536];
-                    for(NdsArchive.Entry e:selection) {
+                    for(NitroVfs.Node node:selection) {
                         if(cancelled.get())break;
-                        String dirName=e.path.substring(0,e.path.lastIndexOf('/'));
-                        String fileName=e.path.substring(e.path.lastIndexOf('/')+1);
-                        Uri dir=ensureFolder(dirName,folders);
-                        Uri file=DocumentsContract.createDocument(getContentResolver(),dir,"application/octet-stream",fileName);
-                        if(file==null)throw new IOException("Cannot create " + e.path);
-                        try(OutputStream out=getContentResolver().openOutputStream(file,"w")) {
-                            if(out==null)throw new IOException("Cannot open file destination");
-                            long left=e.size,offset=e.offset;
-                            while(left>0) {
-                                if(cancelled.get()) break;
-                                int take=(int)Math.min(buffer.length,left);
-                                ByteBuffer dst=ByteBuffer.wrap(buffer,0,take);
-                                int n=channel.read(dst,offset);
-                                if(n<=0)throw new IOException("Unexpected end of DS ROM");
-                                out.write(buffer,0,n);left-=n;offset+=n;
+                        Uri dir=ensureFolder(node.folder(),folders);
+                        byte[] content=null;
+                        if(node.parent==null) {
+                            // Stream the original bytes, then decide whether it's worth unpacking.
+                            NdsArchive.Entry e=node.romEntry;
+                            Uri file=DocumentsContract.createDocument(getContentResolver(),dir,"application/octet-stream",node.name());
+                            if(file==null)throw new IOException("Cannot create " + e.path);
+                            try(OutputStream out=getContentResolver().openOutputStream(file,"w")) {
+                                if(out==null)throw new IOException("Cannot open file destination");
+                                long left=e.size,offset=e.offset;
+                                while(left>0) {
+                                    if(cancelled.get()) break;
+                                    int take=(int)Math.min(buffer.length,left);
+                                    ByteBuffer dst=ByteBuffer.wrap(buffer,0,take);
+                                    int n=channel.read(dst,offset);
+                                    if(n<=0)throw new IOException("Unexpected end of DS ROM");
+                                    out.write(buffer,0,n);left-=n;offset+=n;
+                                }
+                                if(left>0) {DocumentsContract.deleteDocument(getContentResolver(),file);break;}
                             }
-                            if(left>0) {DocumentsContract.deleteDocument(getContentResolver(),file);break;}
-                        }
-                        if(fileName.toLowerCase(Locale.ROOT).endsWith(".ncgr")) {
-                            String stem=e.path.substring(0,e.path.length()-5);
-                            NdsArchive.Entry palette=allByName.get((stem+".nclr").toLowerCase(Locale.ROOT));
-                            if(palette!=null) {
+                            if(worthUnpacking(node,channel)) {
                                 try {
-                                    if(e.size>NdsGraphics.MAX_BYTES || palette.size>NdsGraphics.MAX_BYTES)
-                                        throw new IOException("Nitro 2D image too large");
-                                    NdsGraphics.Image decoded=NdsGraphics.decode(
-                                            readBtex(channel,e.offset,(int)e.size),
-                                            readBtex(channel,palette.offset,(int)palette.size));
-                                    Bitmap bitmap=Bitmap.createBitmap(decoded.width,decoded.height,Bitmap.Config.ARGB_8888);
-                                    bitmap.setPixels(decoded.argb,0,decoded.width,0,0,decoded.width,decoded.height);
-                                    String outputName=fileName.substring(0,fileName.length()-5)+".png";
-                                    Uri preview=DocumentsContract.createDocument(getContentResolver(),dir,"image/png",outputName);
-                                    if(preview==null)throw new IOException("Cannot create Nitro PNG");
-                                    try(OutputStream output=getContentResolver().openOutputStream(preview,"w")) {
-                                        if(output==null||!bitmap.compress(Bitmap.CompressFormat.PNG,100,output))
-                                            throw new IOException("Nitro PNG encoding failed");
-                                    } finally {bitmap.recycle();}
-                                    pngs++;
-                                } catch(Exception conversionFailure) {unsupported++;}
-                            } else unsupported++;
+                                    content=NitroVfs.content(node,reader,cache);
+                                    if(node.compression!=NitroLz.TYPE_NONE && !node.isContainer())
+                                        writeDoc(dir,node.name()+".decompressed","application/octet-stream",content);
+                                } catch(Exception unreadable) { content=null; }
+                            }
+                        } else {
+                            content=NitroVfs.content(node,reader,cache);
+                            writeDoc(dir,node.name(),"application/octet-stream",content);
                         }
-                        done++;
-                        final int progress=done;
-                        if(done%10==0 || done==selection.size())runOnUiThread(() ->
-                                detail.setText(progress+"/"+selection.size()+" NitroFS files"));
+                        stats[0]++;
+                        if(content!=null) unpackExtras(node,content,dir,known,reader,cache,folders,stats);
+                        final int progress=stats[0];
+                        if(stats[0]%10==0 || stats[0]==selection.size())runOnUiThread(() ->
+                                detail.setText(progress+"/"+selection.size()+" files · "+stats[1]+" PNGs · "+stats[2]+" unpacked"));
                     }
                 }
-                final int finished=done, previews=pngs, missed=unsupported;
+                final boolean wasCancelled=cancelled.get();
                 runOnUiThread(() -> {busy=false;render();
-                    summary.setText("Nintendo DS: "+finished+" files, "+previews+" PNG previews"+
-                            (cancelled.get()?" (cancelled)":""));
-                    detail.setText("Original DS ROM preserved. Matching .ncgr/.nclr 2D graphics create PNG previews; " +
-                            "unsupported or compressed images stay untouched.");
+                    summary.setText("Nintendo DS: "+stats[0]+" files, "+stats[2]+" unpacked, "+stats[1]+" PNGs"+
+                            (wasCancelled?" (cancelled)":""));
+                    detail.setText("Original DS ROM preserved. NARC contents go in *_contents folders; LZ files get a " +
+                            ".decompressed copy; .ncgr graphics get PNG previews using the nearest .nclr palette.");
                     new AlertDialog.Builder(this).setTitle("DS extraction complete")
-                            .setMessage(finished+" files copied into NDS_Extract_.../nitrofs. " +
-                                    previews+" Nitro 2D graphics converted to PNG. "+missed+
-                                    " NCGR files skipped (no matching palette or unsupported format). Original ROM unchanged.")
+                            .setMessage(stats[0]+" files copied into NDS_Extract_.../nitrofs.\n"+
+                                    stats[2]+" archive/compressed entries unpacked.\n"+
+                                    stats[1]+" Nitro graphics converted to PNG.\n"+
+                                    stats[3]+" graphics skipped (unsupported format).\n\nOriginal ROM unchanged.")
                             .setPositiveButton("OK",null).show();
                 });
             } catch(Exception e) {
@@ -702,16 +723,438 @@ public class MainActivity extends Activity {
         });
     }
 
+    /** Only read whole files into memory when they look like Nitro containers, graphics or LZ data. */
+    private boolean worthUnpacking(NitroVfs.Node node, FileChannel channel) throws IOException {
+        if(node.rawSize<5 || node.rawSize>NitroVfs.MAX_NODE_BYTES) return false;
+        if(!node.kind.isEmpty()) return true;
+        byte[] head=readBtex(channel,node.romEntry.offset,4);
+        int t=head[0]&255;
+        return t==NitroLz.TYPE_LZ10 || t==NitroLz.TYPE_LZ11 || !NitroVfs.kindFromMagic(head).isEmpty();
+    }
+
+    private void writeDoc(Uri dir,String name,String mime,byte[] data) throws IOException {
+        Uri file=DocumentsContract.createDocument(getContentResolver(),dir,mime,name);
+        if(file==null) throw new IOException("Cannot create "+name);
+        try(OutputStream out=getContentResolver().openOutputStream(file,"w")) {
+            if(out==null) throw new IOException("Cannot write "+name);
+            out.write(data);
+        }
+    }
+
+    private void writePng(Uri dir,String name,int width,int height,int[] argb) throws IOException {
+        Bitmap bitmap=Bitmap.createBitmap(width,height,Bitmap.Config.ARGB_8888);
+        bitmap.setPixels(argb,0,width,0,0,width,height);
+        Uri file=DocumentsContract.createDocument(getContentResolver(),dir,"image/png",name);
+        if(file==null) {bitmap.recycle(); throw new IOException("Cannot create "+name);}
+        try(OutputStream out=getContentResolver().openOutputStream(file,"w")) {
+            if(out==null || !bitmap.compress(Bitmap.CompressFormat.PNG,100,out)) throw new IOException("PNG encoding failed");
+        } finally {bitmap.recycle();}
+    }
+
+    /** PNG previews for graphics and recursive unpacking of NARC contents. */
+    private void unpackExtras(NitroVfs.Node node,byte[] content,Uri dir,List<NitroVfs.Node> siblings,
+                              NitroVfs.Reader reader,NitroVfs.Cache cache,Map<String,Uri> folders,int[] stats) {
+        if(cancelled.get()) return;
+        try {
+            if(node.isGraphic()) {
+                NitroVfs.Node pal=NitroVfs.pairPalette(node,siblings);
+                try {
+                    byte[] palette=pal==null?NdsGraphics.grayNclr(NdsGraphics.layout(content).depth):NitroVfs.content(pal,reader,cache);
+                    NdsGraphics.Image im=NdsGraphics.decode(content,palette,0);
+                    String stem=node.name().contains(".")?node.name().substring(0,node.name().lastIndexOf('.')):node.name();
+                    writePng(dir,stem+(pal==null?"_gray.png":".png"),im.width,im.height,im.argb);
+                    stats[1]++;
+                } catch(Exception unsupported) {stats[3]++;}
+            }
+            if(node.isContainer() && NarcArchive.isNarc(content)) {
+                List<NitroVfs.Node> kids=NitroVfs.expand(node,content);
+                if(kids.isEmpty()) return;
+                Uri sub=ensureFolder(node.path+NitroVfs.CONTENTS_SUFFIX,folders);
+                NarcArchive.Archive archive=NarcArchive.parse(content);
+                for(NitroVfs.Node kid:kids) {
+                    if(cancelled.get()) return;
+                    byte[] raw=archive.file(kid.childIndex);
+                    byte[] kidContent=kid.compression==NitroLz.TYPE_NONE?raw:NitroLz.decompress(raw,0,NitroLz.MAX_OUTPUT).data;
+                    kid.probed=true;
+                    Uri kidDir=kid.folder().equals(node.path+NitroVfs.CONTENTS_SUFFIX)?sub:ensureFolder(kid.folder(),folders);
+                    writeDoc(kidDir,kid.name(),"application/octet-stream",kidContent);
+                    stats[2]++;
+                    unpackExtrasChild(kid,kidContent,kidDir,kids,reader,cache,folders,stats);
+                }
+            }
+        } catch(Exception skipped) {
+            // An unreadable archive never aborts the whole extraction; its raw file is already saved.
+        }
+    }
+    private void unpackExtrasChild(NitroVfs.Node kid,byte[] content,Uri dir,List<NitroVfs.Node> siblings,
+                                   NitroVfs.Reader reader,NitroVfs.Cache cache,Map<String,Uri> folders,int[] stats) {
+        // Children's palettes are their siblings; read them from the parent archive bytes via the cache.
+        unpackExtras(kid,content,dir,siblings,reader,cache,folders,stats);
+    }
+
+    /** Tap on a DS file: describe it and offer unpack / preview / extract. */
+    private void showNdsNode(NitroVfs.Node node) {
+        busy=true;render();detail.setText("Reading "+node.name()+"...");
+        worker.execute(() -> {
+            try(ParcelFileDescriptor descriptor=getContentResolver().openFileDescriptor(imageUri,"r")) {
+                if(descriptor==null) throw new IOException("Cannot open DS ROM");
+                try(FileInputStream source=new FileInputStream(descriptor.getFileDescriptor());
+                    FileChannel channel=source.getChannel()) {
+                    String info;
+                    if(node.rawSize<=NitroVfs.MAX_NODE_BYTES) {
+                        byte[] content=NitroVfs.content(node,NitroVfs.channelReader(channel),new NitroVfs.Cache());
+                        info=node.describe()+"\nStored size: "+human(node.rawSize)+
+                                (content.length!=node.rawSize?"\nUnpacked size: "+human(content.length):"");
+                        if(node.isContainer()) info+="\nFiles inside: "+NarcArchive.parse(content).count();
+                    } else info="Large file · "+human(node.rawSize);
+                    final String message=info;
+                    runOnUiThread(() -> {
+                        busy=false;render();detail.setText(node.path);
+                        AlertDialog.Builder b=new AlertDialog.Builder(this).setTitle(node.name()).setMessage(message)
+                                .setNegativeButton("Extract",(d,w)->beginNdsExtract(Collections.singletonList(node)));
+                        if(node.isContainer()) b.setPositiveButton("Open contents",(d,w)->expandNds(node));
+                        else if(node.isGraphic()) b.setPositiveButton("Preview / import PNG",(d,w)->showNcgrPreview(node,0));
+                        else b.setPositiveButton("Close",null);
+                        b.show();
+                    });
+                }
+            } catch(Exception e) {
+                runOnUiThread(() -> {busy=false;render();detail.setText(message(e));
+                    new AlertDialog.Builder(this).setTitle(node.name()).setMessage("Could not read: "+message(e))
+                            .setPositiveButton("OK",null).show();});
+            }
+        });
+    }
+
+    private void expandNds(NitroVfs.Node node) {
+        String folder=node.path+NitroVfs.CONTENTS_SUFFIX;
+        if(expandedNds.contains(node.path)) {activePath=folder;render();return;}
+        busy=true;render();detail.setText("Unpacking "+node.name()+"...");
+        worker.execute(() -> {
+            try(ParcelFileDescriptor descriptor=getContentResolver().openFileDescriptor(imageUri,"r")) {
+                if(descriptor==null) throw new IOException("Cannot open DS ROM");
+                try(FileInputStream source=new FileInputStream(descriptor.getFileDescriptor());
+                    FileChannel channel=source.getChannel()) {
+                    byte[] content=NitroVfs.content(node,NitroVfs.channelReader(channel),new NitroVfs.Cache());
+                    List<NitroVfs.Node> kids=NitroVfs.expand(node,content);
+                    runOnUiThread(() -> {
+                        busy=false;
+                        if(kids.isEmpty()) {render();detail.setText("Nothing to unpack in "+node.name());return;}
+                        ndsNodes.addAll(kids);expandedNds.add(node.path);
+                        activePath=folder;render();
+                        detail.setText(kids.size()+" files inside "+node.name()+
+                                ". Unnamed files are numbered and given an extension from their contents.");
+                    });
+                }
+            } catch(Exception e) {
+                runOnUiThread(() -> {busy=false;render();detail.setText(message(e));
+                    new AlertDialog.Builder(this).setTitle("Cannot unpack").setMessage(message(e))
+                            .setPositiveButton("OK",null).show();});
+            }
+        });
+    }
+
+    private ImageView previewImage(Bitmap bitmap) {
+        ImageView view=new ImageView(this);
+        int scale=Math.max(1,Math.min(4,(getResources().getDisplayMetrics().widthPixels-dp(64))/Math.max(1,bitmap.getWidth())));
+        Bitmap big=Bitmap.createScaledBitmap(bitmap,bitmap.getWidth()*scale,bitmap.getHeight()*scale,false);
+        view.setImageBitmap(big);
+        view.setAdjustViewBounds(true);
+        view.setPadding(dp(8),dp(8),dp(8),dp(8));
+        return view;
+    }
+
+    /** Preview an NCGR with its paired palette; cycle palette banks; import an edited PNG into a new ROM. */
+    private void showNcgrPreview(NitroVfs.Node node,int bank) {
+        busy=true;render();
+        worker.execute(() -> {
+            try(ParcelFileDescriptor descriptor=getContentResolver().openFileDescriptor(imageUri,"r")) {
+                if(descriptor==null) throw new IOException("Cannot open DS ROM");
+                try(FileInputStream source=new FileInputStream(descriptor.getFileDescriptor());
+                    FileChannel channel=source.getChannel()) {
+                    NitroVfs.Reader reader=NitroVfs.channelReader(channel);
+                    NitroVfs.Cache cache=new NitroVfs.Cache();
+                    byte[] ncgr=NitroVfs.content(node,reader,cache);
+                    NitroVfs.Node palNode=NitroVfs.pairPalette(node,ndsNodes);
+                    NdsGraphics.Layout layout=NdsGraphics.layout(ncgr);
+                    byte[] nclr=palNode==null?NdsGraphics.grayNclr(layout.depth):NitroVfs.content(palNode,reader,cache);
+                    int banks=NdsGraphics.paletteBanks(nclr,layout.depth);
+                    int useBank=bank%Math.max(1,banks);
+                    NdsGraphics.Image im=NdsGraphics.decode(ncgr,nclr,useBank);
+                    Bitmap bitmap=Bitmap.createBitmap(im.width,im.height,Bitmap.Config.ARGB_8888);
+                    bitmap.setPixels(im.argb,0,im.width,0,0,im.width,im.height);
+                    runOnUiThread(() -> {
+                        busy=false;render();
+                        LinearLayout box=new LinearLayout(this);box.setOrientation(LinearLayout.VERTICAL);
+                        box.addView(previewImage(bitmap));
+                        box.addView(text(im.width+"×"+im.height+" · "+(layout.depth==3?"4bpp":"8bpp")+" · palette: "+
+                                (palNode==null?"none found (grayscale)":palNode.name()+(banks>1?" bank "+useBank+"/"+(banks-1):"")),
+                                13,Color.DKGRAY));
+                        box.addView(text("To edit: Extract to get the PNG, edit it keeping the same size and colours, " +
+                                "then Import. The new ROM is a separate copy.",12,Color.GRAY));
+                        ScrollView scroll=new ScrollView(this);scroll.addView(box);
+                        AlertDialog.Builder b=new AlertDialog.Builder(this).setTitle(node.name()).setView(scroll)
+                                .setNegativeButton("Close",null)
+                                .setPositiveButton("Import PNG…",(d,w)->{
+                                    ndsImportNode=node;ndsImportBank=useBank;ndsPngUri=null;
+                                    Intent intent=new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                                    intent.addCategory(Intent.CATEGORY_OPENABLE);intent.setType("image/png");
+                                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                                    startActivityForResult(intent,PICK_NDS_PNG);
+                                });
+                        if(banks>1) b.setNeutralButton("Next palette bank",(d,w)->showNcgrPreview(node,useBank+1));
+                        b.show();
+                    });
+                }
+            } catch(Exception e) {
+                runOnUiThread(() -> {busy=false;render();
+                    new AlertDialog.Builder(this).setTitle(node.name()).setMessage("Cannot preview: "+message(e))
+                            .setPositiveButton("OK",null).show();});
+            }
+        });
+    }
+
+    private int[] readPngPixels(Uri png,int[] size) throws IOException {
+        BitmapFactory.Options opts=new BitmapFactory.Options();
+        opts.inScaled=false;opts.inPremultiplied=false;opts.inPreferredConfig=Bitmap.Config.ARGB_8888;
+        Bitmap bitmap;
+        try(InputStream in=getContentResolver().openInputStream(png)) {
+            if(in==null) throw new IOException("Cannot open PNG");
+            bitmap=BitmapFactory.decodeStream(in,null,opts);
+        }
+        if(bitmap==null) throw new IOException("Could not decode PNG");
+        try {
+            size[0]=bitmap.getWidth();size[1]=bitmap.getHeight();
+            if((long)size[0]*size[1]>16_000_000L) throw new IOException("PNG too large");
+            int[] px=new int[size[0]*size[1]];
+            bitmap.getPixels(px,0,size[0],0,0,size[0],size[1]);
+            return px;
+        } finally {bitmap.recycle();}
+    }
+
+    /** PNG → NCGR → (re-compress, rebuild NARCs) → new .nds copy. */
+    private void rebuildNds(Uri destination) {
+        final NitroVfs.Node node=ndsImportNode;final int bank=ndsImportBank;final Uri png=ndsPngUri;
+        final List<NitroVfs.Node> known=new ArrayList<>(ndsNodes);
+        busy=true;render();summary.setText("Building modified DS ROM...");
+        worker.execute(() -> {
+            try {
+                int[] size=new int[2];
+                int[] pixels=readPngPixels(png,size);
+                String result;int inexact;
+                try(ParcelFileDescriptor descriptor=getContentResolver().openFileDescriptor(imageUri,"r")) {
+                    if(descriptor==null) throw new IOException("Cannot open DS ROM");
+                    try(FileInputStream source=new FileInputStream(descriptor.getFileDescriptor());
+                        FileChannel channel=source.getChannel()) {
+                        NitroVfs.Reader reader=NitroVfs.channelReader(channel);
+                        NitroVfs.Cache cache=new NitroVfs.Cache();
+                        byte[] ncgr=NitroVfs.content(node,reader,cache);
+                        NitroVfs.Node palNode=NitroVfs.pairPalette(node,known);
+                        byte[] nclr=palNode==null?NdsGraphics.grayNclr(NdsGraphics.layout(ncgr).depth):NitroVfs.content(palNode,reader,cache);
+                        NdsGraphics.Encoded enc=NdsGraphics.encode(pixels,size[0],size[1],ncgr,nclr,bank);
+                        inexact=enc.inexact;
+                        NitroVfs.Patch patch=NitroVfs.replace(node,enc.ncgr,reader);
+                        try(OutputStream out=getContentResolver().openOutputStream(destination,"w")) {
+                            if(out==null) throw new IOException("Cannot write new ROM");
+                            result=NitroVfs.writeRom(channel,out,patch);
+                        }
+                    }
+                }
+                final String how=result;final int off=inexact;
+                runOnUiThread(() -> {busy=false;render();summary.setText("Modified DS ROM saved");
+                    detail.setText(node.name()+" imported; "+how+". Original ROM untouched.");
+                    new AlertDialog.Builder(this).setTitle("DS ROM copy saved")
+                            .setMessage(node.name()+" was replaced inside a NEW .nds file ("+how+"). " +
+                                    (node.compression!=NitroLz.TYPE_NONE||node.parent!=null?
+                                            "Compression and archives were rebuilt automatically. ":"") +
+                                    (off>0?off+" pixel(s) weren't exact palette colours and were snapped to the nearest one. ":"") +
+                                    "Test it in an emulator such as melonDS.")
+                            .setPositiveButton("OK",null).show();});
+            } catch(Exception e) {
+                runOnUiThread(() -> {busy=false;render();summary.setText("DS import failed");detail.setText(message(e));
+                    new AlertDialog.Builder(this).setTitle("DS import failed").setMessage(message(e))
+                            .setPositiveButton("OK",null).show();});
+            }
+        });
+    }
+
     private void chooseRetroFormat() {
-        if(retroInfo==null || retroInfo.system!=RetroTiles.System.SNES || busy)return;
-        RetroTiles.Mode[] options={RetroTiles.Mode.SNES_2BPP,RetroTiles.Mode.SNES_3BPP,
-                RetroTiles.Mode.SNES_4BPP,RetroTiles.Mode.SNES_8BPP};
-        String[] labels={"2bpp (4 palette indexes)","3bpp (8 indexes)",
-                "4bpp (16 indexes)","8bpp (256 indexes)"};
-        new AlertDialog.Builder(this).setTitle("Select SNES tile format")
-                .setSingleChoiceItems(labels,java.util.Arrays.asList(options).indexOf(retroMode),
-                        (d,which)->{retroMode=options[which];d.dismiss();render();})
+        if(retroInfo==null || busy)return;
+        List<RetroTiles.Mode> modes=RetroTiles.Mode.forSystem(retroInfo.system);
+        if(modes.size()<2) return;
+        String[] labels=new String[modes.size()];
+        for(int i=0;i<labels.length;i++) labels[i]=modes.get(i).label();
+        new AlertDialog.Builder(this).setTitle("Select "+retroInfo.systemName()+" tile format")
+                .setSingleChoiceItems(labels,modes.indexOf(retroMode),
+                        (d,which)->{d.dismiss();setRetroMode(modes.get(which));})
                 .setNegativeButton("Cancel",null).show();
+    }
+
+    private void setRetroMode(RetroTiles.Mode mode) {
+        if(!mode.compressed) {retroMode=mode;render();return;}
+        if(lzScanTileBytes==mode.tileBytes) {retroMode=mode;render();return;}
+        final RetroTiles.Info info=retroInfo;
+        busy=true;render();summary.setText("Scanning ROM for LZ77-compressed graphics...");
+        worker.execute(() -> {
+            try(ParcelFileDescriptor descriptor=getContentResolver().openFileDescriptor(imageUri,"r")) {
+                if(descriptor==null) throw new IOException("Cannot read ROM");
+                byte[] rom;
+                try(FileInputStream src=new FileInputStream(descriptor.getFileDescriptor());
+                    FileChannel channel=src.getChannel()) {
+                    if(channel.size()>RetroTiles.MAX_REBUILD_BYTES) throw new IOException("ROM too large to scan");
+                    rom=readBtexLarge(channel,(int)channel.size());
+                }
+                List<RetroTiles.LzBlock> blocks=RetroTiles.scanLz77(rom,mode.tileBytes,4096);
+                runOnUiThread(() -> {
+                    busy=false;info.lzBlocks=blocks;lzScanTileBytes=mode.tileBytes;retroMode=mode;
+                    summary.setText(info.description());
+                    detail.setText(blocks.size()+" LZ77 blocks that decompress to whole "+(mode.bpp)+"bpp tiles. " +
+                            "Some may be maps or other data rather than graphics.");
+                    render();
+                });
+            } catch(Exception e) {
+                runOnUiThread(() -> {busy=false;render();summary.setText("LZ77 scan failed");detail.setText(message(e));});
+            }
+        });
+    }
+
+    private static byte[] readBtexLarge(FileChannel channel,int size) throws IOException {
+        ByteBuffer b=ByteBuffer.allocate(size);
+        while(b.hasRemaining()) {
+            int n=channel.read(b,b.position());
+            if(n<=0) throw new IOException("Unexpected end of ROM");
+        }
+        return b.array();
+    }
+
+    private int previewBpp() {
+        if(retroMode!=null) return retroMode.bpp;
+        return 2; // NES
+    }
+
+    private void choosePalette() {
+        if(busy) return;
+        String[] options=new String[Palettes.PRESETS.length+1];
+        System.arraycopy(Palettes.PRESETS,0,options,0,Palettes.PRESETS.length);
+        options[options.length-1]="Load palette file… (.pal / .gpl / .act / .nclr / BGR555)";
+        new AlertDialog.Builder(this).setTitle("Tile palette")
+                .setItems(options,(d,which)->{
+                    if(which==options.length-1) {
+                        Intent intent=new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                        intent.addCategory(Intent.CATEGORY_OPENABLE);intent.setType("*/*");
+                        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                        startActivityForResult(intent,PICK_PALETTE);
+                        return;
+                    }
+                    if(which==0) {viewPalette=null;viewPaletteName="Grayscale";}
+                    else {viewPalette=Palettes.preset(which,8);viewPaletteName=Palettes.PRESETS[which];}
+                    // Presets are generated at 256 entries; re-fit per sheet depth when used.
+                    if(which>0) viewPaletteName=Palettes.PRESETS[which];
+                    presetIndex=which;
+                    render();
+                    detail.setText("Palette changes previews and exported PNGs. Import with the SAME palette selected.");
+                }).setNegativeButton("Cancel",null).show();
+    }
+    private int presetIndex=0;
+
+    /** Palette for a given bit depth: presets are regenerated per depth, loaded files are used as-is. */
+    private int[] paletteFor(int bpp) {
+        if(viewPalette==null) return null;
+        if(presetIndex>0) return Palettes.preset(presetIndex,bpp);
+        return viewPalette;
+    }
+
+    private void loadPaletteFile(Uri uri) {
+        try(InputStream in=getContentResolver().openInputStream(uri)) {
+            if(in==null) throw new IOException("Cannot open palette");
+            byte[] data=readBytes(in,1024*1024);
+            int[] pal=Palettes.parse(data,getFilename(uri));
+            viewPalette=pal;presetIndex=0;
+            String name=getFilename(uri);
+            viewPaletteName=name.length()>18?name.substring(0,18)+"…":name;
+            render();
+            detail.setText("Loaded "+pal.length+" colours from "+name+". Import edited PNGs with this palette still selected.");
+        } catch(Exception e) {
+            new AlertDialog.Builder(this).setTitle("Palette not loaded").setMessage(message(e))
+                    .setPositiveButton("OK",null).show();
+        }
+    }
+
+    /** Decoded, palette-coloured sheet for a retro or NES page: [width, height] in size. */
+    private int[] renderSheet(FileChannel channel,int page,int[] size) throws IOException {
+        if(nesInfo!=null) {
+            int[] gray=NesCodec.decodeTiles(NesCodec.readPage(channel,nesInfo,page));
+            size[0]=128;size[1]=128;
+            return Palettes.recolour(gray,2,paletteFor(2));
+        }
+        byte[] data=RetroTiles.readPage(channel,retroInfo,retroMode,page);
+        int[] gray=RetroTiles.decodeAny(data,retroMode);
+        size[0]=retroMode.width();size[1]=retroMode.heightFor(data.length);
+        return Palettes.recolour(gray,retroMode.bpp,paletteFor(retroMode.bpp));
+    }
+
+    private int previewPageCount() {
+        if(nesInfo!=null) return nesInfo.pageCount();
+        return retroInfo==null||retroMode==null?0:retroInfo.pageCount(retroMode);
+    }
+
+    /** In-app tile sheet viewer with previous/next paging and palette switching. */
+    private void showTilePreview(int startPage) {
+        final int[] page={startPage};
+        LinearLayout box=new LinearLayout(this);box.setOrientation(LinearLayout.VERTICAL);
+        ImageView image=new ImageView(this);
+        image.setAdjustViewBounds(true);image.setPadding(dp(8),dp(8),dp(8),dp(8));
+        TextView caption=text("",13,Color.DKGRAY);
+        LinearLayout nav=new LinearLayout(this);
+        Button prev=button("◀ Prev"),next=button("Next ▶"),pal=button("Palette");
+        nav.addView(prev,new LinearLayout.LayoutParams(0,dp(46),1));
+        nav.addView(pal,new LinearLayout.LayoutParams(0,dp(46),1));
+        nav.addView(next,new LinearLayout.LayoutParams(0,dp(46),1));
+        box.addView(image);box.addView(caption);box.addView(nav);
+        ScrollView scroll=new ScrollView(this);scroll.addView(box);
+        Runnable draw=() -> {
+            int count=previewPageCount();
+            if(count==0) return;
+            page[0]=Math.max(0,Math.min(count-1,page[0]));
+            try(ParcelFileDescriptor descriptor=getContentResolver().openFileDescriptor(imageUri,"r")) {
+                if(descriptor==null) throw new IOException("Cannot read ROM");
+                try(FileInputStream src=new FileInputStream(descriptor.getFileDescriptor());
+                    FileChannel channel=src.getChannel()) {
+                    int[] size=new int[2];
+                    int[] px=renderSheet(channel,page[0],size);
+                    Bitmap bmp=Bitmap.createBitmap(size[0],size[1],Bitmap.Config.ARGB_8888);
+                    bmp.setPixels(px,0,size[0],0,0,size[0],size[1]);
+                    int scale=Math.max(1,Math.min(4,(getResources().getDisplayMetrics().widthPixels-dp(80))/size[0]));
+                    image.setImageBitmap(Bitmap.createScaledBitmap(bmp,size[0]*scale,size[1]*scale,false));
+                    bmp.recycle();
+                    String where;
+                    if(nesInfo!=null) where=(nesInfo.usesChrRam()?"PRG candidate":"CHR")+" page "+page[0];
+                    else where=retroMode.slug+" page "+page[0]+" @0x"+
+                            Long.toHexString(retroInfo.pageOffset(retroMode,page[0])).toUpperCase(Locale.ROOT);
+                    caption.setText(where+" of "+(count-1)+" · palette: "+viewPaletteName+
+                            "\nRaw ROM bytes shown as tiles: may be code or data rather than graphics.");
+                }
+            } catch(Exception e) {caption.setText("Cannot draw page: "+message(e));}
+            prev.setEnabled(page[0]>0);next.setEnabled(page[0]<count-1);
+        };
+        prev.setOnClickListener(v->{page[0]--;draw.run();});
+        next.setOnClickListener(v->{page[0]++;draw.run();});
+        pal.setOnClickListener(v->{
+            String[] options=Palettes.PRESETS;
+            new AlertDialog.Builder(this).setTitle("Preview palette").setItems(options,(d,which)->{
+                presetIndex=which;
+                viewPalette=which==0?null:Palettes.preset(which,8);
+                viewPaletteName=which==0?"Grayscale":Palettes.PRESETS[which];
+                render();draw.run();
+            }).show();
+        });
+        draw.run();
+        new AlertDialog.Builder(this).setTitle(nesInfo!=null?"NES tile viewer":retroInfo.systemName()+" tile viewer")
+                .setView(scroll)
+                .setNegativeButton("Close",null)
+                .setPositiveButton("Export this page",(d,w)->{
+                    if(nesInfo!=null) beginNesExport(page[0]); else beginRetroExport(page[0]);
+                }).show();
     }
 
     private void beginRetroExport(int selected) {
@@ -736,7 +1179,9 @@ public class MainActivity extends Activity {
         final RetroTiles.Info info=retroInfo;
         final RetroTiles.Mode mode=retroMode;
         final int single=retroPage;
-        busy=true;cancelled.set(false);render();summary.setText("Exporting raw "+mode.slug+" tiles...");
+        final int[] exportPalette=paletteFor(mode.bpp);
+        final String exportPaletteName=viewPaletteName;
+        busy=true;cancelled.set(false);render();summary.setText("Exporting "+mode.slug+" tiles...");
         worker.execute(() -> {
             int done=0;
             try(ParcelFileDescriptor descriptor=getContentResolver().openFileDescriptor(imageUri,"r")) {
@@ -746,15 +1191,16 @@ public class MainActivity extends Activity {
                     Uri root=DocumentsContract.buildDocumentUriUsingTree(tree,DocumentsContract.getTreeDocumentId(tree));
                     String stamp=new SimpleDateFormat("yyyyMMdd_HHmmss",Locale.US).format(new Date());
                     Uri folder=DocumentsContract.createDocument(getContentResolver(),root,DIR_MIME,
-                            (info.system==RetroTiles.System.SNES?"SNES":"MegaDrive")+"_TileScans_"+stamp);
+                            info.system.name()+"_TileScans_"+stamp);
                     if(folder==null)throw new IOException("Cannot create scan output folder");
                     for(int page=0;page<info.pageCount(mode);page++) {
                         if(single>=0 && single!=page)continue;
                         if(cancelled.get())break;
                         byte[] data=RetroTiles.readPage(channel,info,mode,page);
-                        int[] pixels=RetroTiles.decode(data,mode);
-                        Bitmap image=Bitmap.createBitmap(mode.width(),mode.height(),Bitmap.Config.ARGB_8888);
-                        image.setPixels(pixels,0,mode.width(),0,0,mode.width(),mode.height());
+                        int sheetHeight=mode.heightFor(data.length);
+                        int[] pixels=Palettes.recolour(RetroTiles.decodeAny(data,mode),mode.bpp,exportPalette);
+                        Bitmap image=Bitmap.createBitmap(mode.width(),sheetHeight,Bitmap.Config.ARGB_8888);
+                        image.setPixels(pixels,0,mode.width(),0,0,mode.width(),sheetHeight);
                         String name=String.format(Locale.ROOT,"%s_page_%04d.png",mode.slug,page);
                         Uri file=DocumentsContract.createDocument(getContentResolver(),folder,"image/png",name);
                         if(file==null)throw new IOException("Could not create " + name);
@@ -772,9 +1218,11 @@ public class MainActivity extends Activity {
                             String message="Game Asset Extractor · Raw tile scan\n"+
                                 "ROM system: "+info.system+"\nFormat: "+mode.slug+"\n"+
                                 "WARNING: These tiles are raw interpretations of ROM bytes. They may not be graphics.\n"+
-                                "ROM graphics palettes are NOT included. PNG gray levels preserve tile indexes.\n"+
-                                "Re-import requires exactly " + mode.width()+" x "+mode.height()+
-                                " pixels, opaque, and exact gray-level indices.\n"+
+                                "Display palette: "+exportPaletteName+" (not the game's own colours).\n"+
+                                "Re-import with the SAME palette selected in the app, at the same size\n"+
+                                "(128 px wide; "+(mode.compressed?"height varies per LZ77 block":mode.height()+" px tall")+").\n"+
+                                "Off-palette colours are snapped to the nearest palette entry"+
+                                (exportPalette==null?"; with Grayscale, exact gray levels are required":"")+".\n"+
                                 "The PNG's filename encodes its page and format. Preserve it.\n"+
                                 "The original ROM is never overwritten.\n";
                             out.write(message.getBytes(java.nio.charset.StandardCharsets.UTF_8));
@@ -816,11 +1264,12 @@ public class MainActivity extends Activity {
         String prefix=retroMode.slug+"_page_";
         if(!name.startsWith(prefix)||!name.endsWith(".png"))
             throw new IOException("PNG must be an exported "+prefix+"NNNN.png sheet. " +
-                    "Select the same SNES tile format used for export.");
+                    "Select the same tile format used for export.");
         String number=name.substring(prefix.length(),name.length()-4);
         if(!number.matches("[0-9]{1,6}"))throw new IOException("Invalid page number in PNG filename");
         int index=Integer.parseInt(number);
-        if(index>=retroInfo.pageCount(retroMode))throw new IOException("Sheet page is outside selected ROM");
+        if(index>=retroInfo.pageCount(retroMode))throw new IOException("Sheet page is outside selected ROM" +
+                (retroMode.compressed?" (re-run the LZ77 scan in the same format)":""));
         return index;
     }
     private void selectRetroOutput() {
@@ -840,24 +1289,15 @@ public class MainActivity extends Activity {
         if(busy || retroInfo==null || retroMode==null || retroPngUri==null)return;
         final RetroTiles.Info old=retroInfo;
         final RetroTiles.Mode mode=retroMode;
+        final int[] importPalette=paletteFor(mode.bpp);
         busy=true;render();summary.setText("Rebuilding raw tile ROM copy...");
         worker.execute(() -> {
             try {
                 int page=selectedRetroPage();
-                Bitmap png;
-                try(InputStream in=getContentResolver().openInputStream(retroPngUri)) {
-                    if(in==null)throw new IOException("Cannot open PNG");
-                    BitmapFactory.Options opts=new BitmapFactory.Options();
-                    opts.inScaled=false;
-                    png=BitmapFactory.decodeStream(in,null,opts);
-                    if(png==null)throw new IOException("Unsupported PNG");
-                }
-                int width=png.getWidth(),height=png.getHeight();
-                if(width!=mode.width()||height!=mode.height()) {
-                    png.recycle(); throw new IOException("Wrong PNG size for "+mode.slug);
-                }
-                int[] pixels=new int[width*height];png.getPixels(pixels,0,width,0,0,width,height);png.recycle();
-                byte[] replacement=RetroTiles.encode(pixels,width,height,mode);
+                int[] size=new int[2];
+                int[] pixels=readPngPixels(retroPngUri,size);
+                Palettes.Mapped mapped=Palettes.toGray(pixels,mode.bpp,importPalette);
+                RetroTiles.Rebuilt rebuilt;
                 try(ParcelFileDescriptor descriptor=getContentResolver().openFileDescriptor(imageUri,"r")) {
                     if(descriptor==null)throw new IOException("Could not reopen original ROM");
                     try(FileInputStream src=new FileInputStream(descriptor.getFileDescriptor());
@@ -866,17 +1306,25 @@ public class MainActivity extends Activity {
                         if(latest.length!=old.length || latest.dataOffset!=old.dataOffset ||
                                 !latest.title.equals(old.title))
                             throw new IOException("ROM changed since selection; reopen it first");
-                        try(OutputStream out=getContentResolver().openOutputStream(destination,"w")) {
-                            if(out==null)throw new IOException("Cannot create modified ROM");
-                            RetroTiles.rebuild(channel,out,latest,mode,page,replacement);
-                        }
+                        latest.lzBlocks=old.lzBlocks;
+                        int byteLength=mode.compressed?latest.lzBlocks.get(page).size:mode.pageBytes();
+                        if(size[0]!=mode.width()||size[1]!=mode.heightFor(byteLength))
+                            throw new IOException("PNG is "+size[0]+"×"+size[1]+"; this page needs "+
+                                    mode.width()+"×"+mode.heightFor(byteLength));
+                        byte[] replacement=RetroTiles.encodeAny(mapped.gray,size[0],size[1],mode,byteLength);
+                        rebuilt=RetroTiles.rebuildFixed(channel,latest,mode,page,replacement);
                     }
                 }
+                try(OutputStream out=getContentResolver().openOutputStream(destination,"w")) {
+                    if(out==null)throw new IOException("Cannot create modified ROM");
+                    out.write(rebuilt.rom);
+                }
+                final String notes=rebuilt.notes+(mapped.inexact>0?" "+mapped.inexact+" pixel(s) snapped to the nearest palette colour.":"");
                 runOnUiThread(()->{busy=false;render();summary.setText("Modified ROM saved");
                     detail.setText(mode.slug+" page "+page+" patched in a NEW ROM. Original untouched.");
                     new AlertDialog.Builder(this).setTitle("ROM copy saved")
-                        .setMessage("Replaced raw tile page "+page+" in a new ROM. " +
-                                "Try it in an emulator. If those bytes weren't uncompressed graphics, the ROM may malfunction.")
+                        .setMessage("Replaced tile page "+page+" in a new ROM. "+notes+
+                                "\n\nTry it in an emulator. If those bytes weren't graphics, the ROM may malfunction.")
                         .setPositiveButton("OK",null).show();
                 });
             } catch(Exception e) {
@@ -901,6 +1349,7 @@ public class MainActivity extends Activity {
         if (busy || nesInfo == null || imageUri == null) return;
         NesCodec.Info info = nesInfo;
         int selectedPage = nesPage;
+        final int[] nesPalette = paletteFor(2);
         busy = true; cancelled.set(false); render();
         summary.setText("Exporting " + (info.usesChrRam() ? "experimental PRG scans" : "NES CHR graphics") + "...");
         worker.execute(() -> {
@@ -919,7 +1368,7 @@ public class MainActivity extends Activity {
                         if (selectedPage >= 0 && i != selectedPage) continue;
                         if (cancelled.get()) break;
                         byte[] raw = NesCodec.readPage(channel, info, i);
-                        int[] pixels = NesCodec.decodeTiles(raw);
+                        int[] pixels = Palettes.recolour(NesCodec.decodeTiles(raw), 2, nesPalette);
                         Bitmap image = Bitmap.createBitmap(128, 128, Bitmap.Config.ARGB_8888);
                         image.setPixels(pixels, 0, 128, 0, 0, 128, 128);
                         String filename = String.format(Locale.ROOT, "%s_%02d.png",
@@ -939,7 +1388,8 @@ public class MainActivity extends Activity {
                     if (doc != null) try (OutputStream dst = getContentResolver().openOutputStream(doc, "w")) {
                         if (dst != null) {
                             String explanation = "NES 2bpp tile sheets: 16x16 tiles, each tile 8x8 pixels.\n" +
-                                    "Use opaque #000000, #555555, #AAAAAA, #FFFFFF only.\n" +
+                                    (nesPalette == null ? "Use opaque #000000, #555555, #AAAAAA, #FFFFFF only.\n" :
+                                        "Exported with display palette " + viewPaletteName + ": re-import with it selected.\n") +
                                     "The game's actual palette colours are stored elsewhere.\n" +
                                     "Mapper: " + info.mapper + "; PRG KiB: " + info.prgBytes/1024 +
                                     "; CHR KiB: " + info.chrBytes/1024 + ".\n" +
@@ -1010,6 +1460,7 @@ public class MainActivity extends Activity {
         NesCodec.Info sourceInfo = nesInfo;
         Uri source = imageUri, png = nesPngUri;
         int page = nesPage;
+        final int[] nesPalette = paletteFor(2);
         busy = true; cancelled.set(false); render();
         summary.setText("Rebuilding a separate NES ROM...");
         worker.execute(() -> {
@@ -1032,7 +1483,7 @@ public class MainActivity extends Activity {
                 if (bitmap == null) throw new IOException("PNG decoding failed");
                 int[] pixels = new int[128*128];
                 try {bitmap.getPixels(pixels,0,128,0,0,128,128);} finally {bitmap.recycle();}
-                byte[] patched = NesCodec.encodeTiles(pixels,128,128);
+                byte[] patched = NesCodec.encodeTiles(Palettes.toGray(pixels, 2, nesPalette).gray,128,128);
                 if (cancelled.get()) throw new IOException("Cancelled");
                 try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(source,"r")) {
                     if (descriptor == null) throw new IOException("Cannot read original NES ROM");
@@ -1129,7 +1580,7 @@ public class MainActivity extends Activity {
         int n;
         while ((n = in.read(chunk)) >= 0) {
             if (n == 0) continue;
-            if (buffer.size() > maxBytes - n) throw new IOException("Original BTEX is too large");
+            if (buffer.size() > maxBytes - n) throw new IOException("File is too large");
             buffer.write(chunk, 0, n);
         }
         return buffer.toByteArray();

@@ -1,4 +1,25 @@
-# Game Asset Extractor (Android v0.5.0)
+# Game Asset Extractor (Android v0.6.0)
+
+## New in v0.6
+
+**Nintendo DS archives and compression**
+- Tap a `.narc`/`.carc` (or any file that turns out to be one) and choose **Open contents** to browse inside it. Unnamed archive files are numbered and given an extension from their contents (`0003.ncgr`, `0004.nclr` …).
+- LZ10 and LZ11 compressed files are detected and decompressed automatically.
+- **Extract** now unpacks archives into `*_contents` folders, saves a `.decompressed` copy of compressed files and converts every `.ncgr` it finds to PNG. It uses the same-named `.nclr` or, failing that, the nearest palette in the same folder/archive. Graphics without a palette are exported as `_gray.png`.
+
+**DS PNG → NCGR import**
+- Tap an `.ncgr` → **Preview / import PNG** shows it with its palette (use **Next palette bank** for multi-bank palettes).
+- **Import PNG…** takes your edited PNG (same size), matches each pixel to the nearest palette colour, re-compresses and rebuilds any archives it sits in, and saves a **new** `.nds`. Files that grow are moved to the end of the ROM and the FAT, ROM size and header CRC are updated. The original ROM is never touched.
+
+**Game Boy, Game Boy Color and Game Boy Advance**
+- GB/GBC: 2bpp tile pages. GBA: raw 4bpp/8bpp pages, plus **LZ77 compressed blocks** (Tile format → LZ77). This scans the ROM for BIOS-LZ77 data that decompresses to whole tiles.
+- Edited LZ77 blocks are re-compressed. If they no longer fit, they're moved to the end of the ROM and every pointer to them is updated.
+
+**Tile viewer, palettes and checksums**
+- Tap any NES/SNES/MD/GB/GBA page to open the viewer with ◀ / ▶ paging.
+- **Palette** button: grayscale (classic), inverted, Game Boy green, warm/cool ramps, rainbow, or load a `.pal` (JASC/RIFF), `.gpl`, `.act`, `.nclr` or raw BGR555 file. Exports use the palette, and imports map colours back to indexes, so keep the same palette selected when importing.
+- PNG → ROM now repairs checksums automatically: SNES (including mirrored sizes), Mega Drive, Game Boy header + global, and the GBA header complement.
+
 
 A native Android app (API 26+) for extracting **decrypted Nintendo 3DS CCI/NCSD** images and converting STXC `.btex` textures to editable PNGs. No root, keys, firmware or network access required. Original CCI remains untouched.
 
