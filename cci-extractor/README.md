@@ -1,4 +1,19 @@
-# Game Asset Extractor (Android v0.6.0)
+# Game Asset Extractor (Android v0.7.0)
+
+## New in v0.7: Extract and Convert tabs
+
+The app now has two tabs. **Extract** holds everything from earlier versions. **Convert** adds:
+
+**3DS containers**
+- **CIA → CCI (.3ds):** repacks a *decrypted* CIA into a cartridge image. Content 0 becomes the game partition, 1 the manual, 2 Download Play. Title-key encrypted CIAs are refused; nothing is decrypted.
+- **CCI → CIA:** builds an unsigned CIA (contents unencrypted, SHA-256 hashes in the TMD). Install it with signature patches (e.g. Luma3DS + FBI). Update partitions are dropped.
+- The standard 3DS certificate chain that every CIA needs isn't bundled. **Save certificate chain from a CIA** copies it from any CIA you own (encrypted ones work for this step), and converting a CIA → CCI saves it automatically.
+
+**Textures (batch)**
+- Inputs: PNG/JPG/WebP, DDS (uncompressed, BC1/DXT1, BC2, BC3/DXT5, BC4, BC5), KTX 1 (RGBA8, RGB8, ETC1), 3DS BTEX, and DS NCGR (uses an `.nclr` selected in the same batch as its palette). BC6H/BC7 DDS aren't supported yet.
+- Outputs: PNG, DDS (RGBA8 / BC1 / BC3), KTX (RGBA8 / ETC1), or a new DS NCGR + NCLR pair (4bpp/8bpp, colours reduced automatically).
+- Optional resize: half, 2×/4× sharp pixels, 2× smooth, or pad up to a power of two.
+
 
 ## New in v0.6
 

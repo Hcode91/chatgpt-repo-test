@@ -31,6 +31,8 @@ jobs:
         run: bash cci-extractor/tests/run-retro-smoke-test.sh
       - name: Test LZ10/LZ11, NARC, DS PNG import, GB/GBA checksums and palettes
         run: bash cci-extractor/tests/run-containers-test.sh
+      - name: Test CIA/CCI repackaging and texture conversions
+        run: bash cci-extractor/tests/run-converters-test.sh
       - name: Install Android SDK 35 components
         shell: bash
         run: |
@@ -53,6 +55,6 @@ jobs:
         run: gradle --no-daemon -p cci-extractor :app:assembleDebug
       - uses: actions/upload-artifact@v4
         with:
-          name: game-asset-extractor-v0.6-debug-apk
+          name: game-asset-extractor-v0.7-debug-apk
           path: cci-extractor/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
