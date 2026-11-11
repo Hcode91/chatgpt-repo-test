@@ -808,6 +808,155 @@ static void eu_prime_sweep(void)
         fprintf(stderr, "[boost] kept %llu more thread(s) off the fastest core (%llu so far)\n", now_moved, moved);
 }
 
+/* ---- what the game's main thread waits for ----
+ * The main thread is busy only about a third of the time; for the rest it is ready but waiting for a core
+ * (17-29%) or blocked (about 40%), and nothing so far shows what on. About 10 times a second: read whether
+ * it is asleep, interrupt it, and walk its call chain (frame pointers, read with process_vm_readv so a bad
+ * pointer is an error and not a crash). [main-wait] every 10 s: share of samples asleep, and the call
+ * chains it was asleep in, most frequent first; [main-wait-total] every minute for the whole run.
+ * EU_MAIN_WAIT=0 = off. */
+#include <sys/uio.h>
+#define EU_WAIT_SIG (SIGRTMIN + 10)
+#define EU_WAIT_FRAMES 14
+static volatile uintptr_t s_wait_pcs[EU_WAIT_FRAMES];
+static volatile int s_wait_n, s_wait_done;
+static int eu_wait_peek(uintptr_t addr, uintptr_t* out2)
+{
+    struct iovec l = { out2, 2 * sizeof(uintptr_t) }, r = { (void*)addr, 2 * sizeof(uintptr_t) };
+    return syscall(SYS_process_vm_readv, getpid(), &l, 1, &r, 1, 0) == (long)(2 * sizeof(uintptr_t));
+}
+static void eu_wait_handler(int sig, siginfo_t* si, void* uctx)
+{
+    (void)sig; (void)si;
+    int n = 0;
+#if defined(__aarch64__)
+    const int saved = errno;
+    const ucontext_t* uc = (const ucontext_t*)uctx;
+    s_wait_pcs[n++] = (uintptr_t)uc->uc_mcontext.pc;
+    s_wait_pcs[n++] = (uintptr_t)uc->uc_mcontext.regs[30];
+    uintptr_t fp = (uintptr_t)uc->uc_mcontext.regs[29];
+    const uintptr_t sp = (uintptr_t)uc->uc_mcontext.sp;
+    while (n < EU_WAIT_FRAMES && fp >= sp && fp - sp < (64u << 20) && !(fp & 15)) {
+        uintptr_t w[2];
+        if (!eu_wait_peek(fp, w)) break;
+        if (w[1] && w[1] != s_wait_pcs[n - 1]) s_wait_pcs[n++] = w[1];
+        if (w[0] <= fp) break;
+        fp = w[0];
+    }
+    errno = saved;
+#elif defined(__x86_64__)   /* desktop test builds only */
+    const ucontext_t* uc = (const ucontext_t*)uctx;
+    s_wait_pcs[n++] = (uintptr_t)uc->uc_mcontext.gregs[16 /* REG_RIP */];
+    uintptr_t fp = (uintptr_t)uc->uc_mcontext.gregs[10 /* REG_RBP */];
+    const uintptr_t sp = (uintptr_t)uc->uc_mcontext.gregs[15 /* REG_RSP */];
+    while (n < EU_WAIT_FRAMES && fp >= sp && fp - sp < (64u << 20) && !(fp & 7)) {
+        uintptr_t w[2];
+        if (!eu_wait_peek(fp, w)) break;
+        if (w[1]) s_wait_pcs[n++] = w[1];
+        if (w[0] <= fp) break;
+        fp = w[0];
+    }
+#else
+    (void)uctx;
+#endif
+    s_wait_n = n;
+    __atomic_store_n(&s_wait_done, 1, __ATOMIC_RELEASE);
+}
+typedef struct { char chain[300]; int hits, hits_total; } eu_wait_site;
+enum { EU_WAIT_SITES = 96 };
+static eu_wait_site s_wait_asleep[EU_WAIT_SITES], s_wait_awake[EU_WAIT_SITES];
+static void eu_wait_add(eu_wait_site* t, const char* chain)
+{
+    int free_slot = -1;
+    for (int i = 0; i < EU_WAIT_SITES; i++) {
+        if (!t[i].chain[0]) { if (free_slot < 0) free_slot = i; continue; }
+        if (!strcmp(t[i].chain, chain)) { t[i].hits++; t[i].hits_total++; return; }
+    }
+    if (free_slot < 0) free_slot = EU_WAIT_SITES - 1;   /* table full: the last slot collects the rest */
+    snprintf(t[free_slot].chain, sizeof t[free_slot].chain, "%s", free_slot == EU_WAIT_SITES - 1 ? "(other)" : chain);
+    t[free_slot].hits++; t[free_slot].hits_total++;
+}
+static void eu_wait_print(const char* tag, eu_wait_site* t, int total_mode, int denom, int top)
+{
+    if (denom <= 0) return;
+    for (int shown = 0; shown < top; shown++) {
+        int best = -1;
+        for (int i = 0; i < EU_WAIT_SITES; i++) {
+            const int h = total_mode ? t[i].hits_total : t[i].hits;
+            if (h > 0 && (best < 0 || h > (total_mode ? t[best].hits_total : t[best].hits))) best = i;
+        }
+        if (best < 0) break;
+        const int h = total_mode ? t[best].hits_total : t[best].hits;
+        fprintf(stderr, "[%s]   %4.1f%%  %s\n", tag, 100.0 * h / denom, t[best].chain);
+        if (total_mode) t[best].hits_total = -t[best].hits_total; else t[best].hits = 0;
+    }
+    for (int i = 0; i < EU_WAIT_SITES; i++) { if (total_mode) { if (t[i].hits_total < 0) t[i].hits_total = -t[i].hits_total; } else t[i].hits = 0; }
+}
+static void* eu_wait_thread(void* arg)
+{
+    (void)arg;
+    prctl(PR_SET_NAME, "eu-wait-prof", 0, 0, 0);
+    const int tid = (int)getpid();
+    sleep(20);
+    fprintf(stderr, "[main-wait] sampling what the game's main thread waits for, about 10 times a second (EU_MAIN_WAIT)\n");
+    int n = 0, asleep = 0, lost = 0, n_total = 0, asleep_total = 0, rounds = 0;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        usleep(97000);
+        char path[64], line[256] = "";
+        snprintf(path, sizeof path, "/proc/self/task/%d/stat", tid);
+        FILE* f = fopen(path, "r");
+        if (!f) break;
+        if (!fgets(line, sizeof line, f)) line[0] = 0;
+        fclose(f);
+        const char* rp = strrchr(line, ')');
+        const char state = (rp && rp[1] == ' ') ? rp[2] : '?';
+        __atomic_store_n(&s_wait_done, 0, __ATOMIC_RELEASE);
+        if (syscall(SYS_tgkill, getpid(), tid, EU_WAIT_SIG) != 0) break;
+        for (int w = 0; w < 400 && !__atomic_load_n(&s_wait_done, __ATOMIC_ACQUIRE); w++) usleep(50);
+        if (!__atomic_load_n(&s_wait_done, __ATOMIC_ACQUIRE)) { lost++; continue; }
+        /* the chain, innermost first: a libc name for the first frame if there is one, then up to five of
+         * this program's own functions (and up to three named ones of other libraries) */
+        char chain[300]; int o = 0, own_frames = 0, lib_frames = 0;
+        const int np = s_wait_n;
+        for (int k = 0; k < np && own_frames < 5 && o < (int)sizeof chain - 80; k++) {
+            const uintptr_t pc = s_wait_pcs[k] - (k ? 4 : 0);
+            uintptr_t off = 0;
+            const char* own = eu_own_symbol(pc, &off);
+            if (own) { o += snprintf(chain + o, sizeof chain - o, "%s%.56s", o ? " < " : "", own); own_frames++; continue; }
+            /* other libraries: by name where they have one; the innermost frame always shows something */
+            Dl_info di; memset(&di, 0, sizeof di);
+            if (lib_frames >= 3 || !dladdr((void*)pc, &di)) continue;
+            if (di.dli_sname) { o += snprintf(chain + o, sizeof chain - o, "%s%.40s", o ? " < " : "", di.dli_sname); lib_frames++; }
+            else if (!o) { o += snprintf(chain + o, sizeof chain - o, "%.24s+0x%lx", eu_basename(di.dli_fname), (unsigned long)(pc - (uintptr_t)di.dli_fbase)); lib_frames++; }
+        }
+        if (!o) snprintf(chain, sizeof chain, "(no names)");
+        const int is_asleep = state == 'S' || state == 'D';
+        n++; n_total++;
+        if (is_asleep) { asleep++; asleep_total++; eu_wait_add(s_wait_asleep, chain); }
+        else eu_wait_add(s_wait_awake, chain);
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        if (t1.tv_sec - t0.tv_sec >= 10) {
+            t0 = t1; rounds++;
+            fprintf(stderr, "[main-wait] 10s: %d samples of the main thread: asleep (blocked) %d%%, awake %d%% (%d not answered) | asleep in:\n",
+                    n, n ? 100 * asleep / n : 0, n ? 100 - 100 * asleep / n : 0, lost);
+            eu_wait_print("main-wait", s_wait_asleep, 0, n, 6);
+            fprintf(stderr, "[main-wait] awake in:\n");
+            eu_wait_print("main-wait", s_wait_awake, 0, n, 4);
+            if (rounds % 6 == 0) {
+                fprintf(stderr, "[main-wait-total] whole run, %d samples: asleep (blocked) %d%% | asleep in:\n", n_total, 100 * asleep_total / n_total);
+                eu_wait_print("main-wait-total", s_wait_asleep, 1, n_total, 12);
+                fprintf(stderr, "[main-wait-total] awake in:\n");
+                eu_wait_print("main-wait-total", s_wait_awake, 1, n_total, 8);
+            }
+            n = asleep = lost = 0;
+        }
+    }
+    return NULL;
+}
+
 /* 44 SPU threads share 8 cores with the game's main thread, which was ready but waiting for a core 63-66%
  * of the time (boot-20261111-100119). Only about six of the 44 do real work; the rest wake up, find
  * nothing and sleep again, ~6% of a core each -- and the runtime runs all of them at priority -10
@@ -1370,4 +1519,17 @@ __attribute__((constructor)) static void eu_diagnostics_init(void)
     sigaction(EU_PROF_SIG, &pa, NULL);
     pthread_t t;
     if (pthread_create(&t, NULL, eu_cpu_thread, NULL) == 0) pthread_detach(t);
+    {
+        const char* e = getenv("EU_MAIN_WAIT");
+        if (!(e && *e == '0')) {
+            struct sigaction wa;
+            memset(&wa, 0, sizeof wa);
+            wa.sa_sigaction = eu_wait_handler;
+            wa.sa_flags = SA_SIGINFO | SA_RESTART;
+            sigemptyset(&wa.sa_mask);
+            sigaction(EU_WAIT_SIG, &wa, NULL);
+            pthread_t w;
+            if (pthread_create(&w, NULL, eu_wait_thread, NULL) == 0) pthread_detach(w);
+        }
+    }
 }
