@@ -1024,6 +1024,9 @@ struct Pipe {
     u32 attr_count = 0, stride = 0, rt_count = 1;
     VkFormat rt_fmt = VK_FORMAT_R8G8B8A8_UNORM;
     bool pull = false;
+    /* which vertex-program constants the program reads, as runs of float4s; 0 runs = treat the whole block as read */
+    struct CbRun { u16 first, count; } vs_runs[12];
+    u32 vs_nruns = 0, vs_sig = 0;
 };
 Pipe g_pipe[MAX_PIPES];
 u32 g_pipe_count;
@@ -1328,6 +1331,7 @@ struct Rec {
     u32 pull_off, raw_off, raw_bytes;
 };
 extern "C" int g_eu_draw_tag;
+extern "C" int g_eu_prof_on __attribute__((weak));   /* this draw is one of the timed ones */
 extern "C" void eu_thread_place(const char* what, int nice_val, int mode) __attribute__((weak));
 /* GPU vertex fetch: filled by the draw engine (rsx_draw_engine.c, Android patch), same layout there. */
 extern "C" {
@@ -2740,6 +2744,41 @@ u32 be_pipeline_create(void*, const char* vs_hlsl, const char* ps_hlsl, const rs
     p.attr_count = layout ? layout->count : 0;
     p.stride = vertex_stride;
     p.pull = pull;
+    {   /* constants named with a literal index; any computed index means the whole block */
+        static bool used[512];
+        memset(used, 0, sizeof used);
+        bool all = false;
+        u32 n_used = 0;
+        for (const char* q = vs_hlsl; (q = strstr(q, "vp_c[")) != nullptr; q += 5) {
+            const char* d = q + 5;
+            if (!isdigit((unsigned char)*d)) { all = true; break; }
+            u32 idx = 0;
+            while (isdigit((unsigned char)*d) && idx < 100000) idx = idx * 10 + (u32)(*d++ - '0');
+            if (*d != ']') { all = true; break; }
+            if (idx < 512 && !used[idx]) { used[idx] = true; n_used++; }   /* 512 is the declaration itself */
+        }
+        p.vs_nruns = 0;
+        if (!all && n_used) {
+            u32 nr = 0;
+            bool fits = true;
+            for (u32 i = 0; i < 512 && fits;) {
+                if (!used[i]) { i++; continue; }
+                u32 j = i;
+                while (j < 512 && (used[j] || (j + 1 < 512 && used[j + 1]))) j++;   /* bridge single gaps */
+                if (nr >= 12) { fits = false; break; }
+                p.vs_runs[nr].first = (u16)i;
+                p.vs_runs[nr].count = (u16)(j - i);
+                nr++;
+                i = j;
+            }
+            if (fits) {
+                p.vs_nruns = nr;
+                u32 sig = 2166136261u;
+                for (u32 k = 0; k < nr; k++) sig = ((sig ^ p.vs_runs[k].first) * 16777619u ^ p.vs_runs[k].count) * 16777619u;
+                p.vs_sig = sig ? sig : 1u;
+            }
+        }
+    }
     if (pull) {
         p.attr_count = 1;
         p.stride = 8;
@@ -2920,8 +2959,7 @@ bool stage_pull(Rec& r)
         const u32 total = (u32)((mis + len + 3u) & ~(u64)3u) + 8u;
         RawSeen& e = seen[(((uintptr_t)rng[k].lo >> 4) ^ ((u32)len * 2654435761u)) & 1023u];
         u32 blk = 0;
-        struct timespec rt0, rt1;
-        clock_gettime(CLOCK_MONOTONIC, &rt0);
+
         if (e.epoch == g_stage_epoch && e.lo == rng[k].lo && e.len == (u32)len && (u64)e.blk + e.total <= g_stage_used &&
             memcmp(g_stage + e.blk + mis, rng[k].lo, (size_t)len) == 0) {
             blk = e.blk;
@@ -2935,8 +2973,6 @@ bool stage_pull(Rec& r)
             e = {rng[k].lo, (u32)len, blk, total, g_stage_epoch};
             g_pull_raw_bytes += len;
         }
-        clock_gettime(CLOCK_MONOTONIC, &rt1);
-        g_eu_prof[13] += us_between(rt0, rt1) * 1000u;
         rng[k].off = blk + mis;   /* buffer address of rng[k].lo */
         if (blk < raw0) raw0 = blk;
         if (blk + total > raw1) raw1 = blk + total;
@@ -3046,9 +3082,63 @@ void pull_check(const Rec& r, const u32* refs, u32 n)
         fprintf(stderr, "[pull-check] %u pulled draws checked, %u differ from the CPU decoder\n", s_checked, s_bad_draws);
 }
 
+/* Vertex-program constants: only the constants the bound program reads are hashed, compared and copied
+ * (the block is ~8 KB and nearly every draw changes a few of them; most programs read a small part). The
+ * rest of the staged block is never read by that program. EU_VK_CB_USED=0 = whole block as before. */
+uint64_t g_cb_used_bytes, g_cb_used_blocks;
+bool stage_vs_constants_used(const Pipe& p, const u8* data, u32 bytes, u32* off)
+{
+    static CbSeen seen[512];
+    static u32 seen_sig[512];
+    u64 h = 0x9E3779B97F4A7C15ull ^ p.vs_sig;
+    u32 used = 0;
+    for (u32 k = 0; k < p.vs_nruns; k++) {
+        const u32 b0 = p.vs_runs[k].first * 16u, n = p.vs_runs[k].count * 16u;
+        if (b0 + n > bytes) return false;
+        for (u32 i = 0; i < n; i += 8) { u64 w; memcpy(&w, data + b0 + i, 8); h = (h ^ w) * 0xFF51AFD7ED558CCDull; h ^= h >> 29; }
+        used += n;
+    }
+    const u32 slot = (u32)(h >> 40) & 511u;
+    const CbSeen& c = seen[slot];
+    if (c.epoch == g_stage_epoch && c.hash == h && c.bytes == bytes && seen_sig[slot] == p.vs_sig &&
+        (u64)c.off + bytes <= g_stage_used) {
+        bool same = true;
+        for (u32 k = 0; k < p.vs_nruns && same; k++) {
+            const u32 b0 = p.vs_runs[k].first * 16u, n = p.vs_runs[k].count * 16u;
+            same = memcmp(g_stage + c.off + b0, data + b0, n) == 0;
+        }
+        if (same) {
+            *off = c.off;
+            g_cb_reused++;
+            g_cb_bytes_saved += bytes;
+            return true;
+        }
+    }
+    if (!stage_reserve(bytes, off)) return false;   /* may start the staging data over; *off is valid either way */
+    for (u32 k = 0; k < p.vs_nruns; k++) {
+        const u32 b0 = p.vs_runs[k].first * 16u, n = p.vs_runs[k].count * 16u;
+        memcpy(g_stage + *off + b0, data + b0, n);
+    }
+    seen[slot].off = *off; seen[slot].bytes = bytes; seen[slot].epoch = g_stage_epoch; seen[slot].hash = h;
+    seen_sig[slot] = p.vs_sig;
+    g_cb_used_bytes += used;
+    g_cb_used_blocks++;
+    return true;
+}
 void be_bind_vs_constants(void*, const void* data, u32 bytes)
 {
-    if (!stage_constants(0, data, bytes, &g_pending.vs_cb_off)) bytes = 0;
+    static int used_on = -1;
+    if (used_on < 0) {
+        const char* e = getenv("EU_VK_CB_USED");
+        used_on = (e && *e == '0') ? 0 : 1;
+        fprintf(stderr, "[RSX vulkan] vertex constants: only the ones a program reads are staged: %s (EU_VK_CB_USED)\n",
+                used_on ? "on" : "off");
+    }
+    const u32 ph = g_pending.pipeline;
+    bool done = false;
+    if (used_on && data && bytes && ph && ph <= g_pipe_count && g_pipe[ph - 1].vs_nruns)
+        done = stage_vs_constants_used(g_pipe[ph - 1], (const u8*)data, bytes, &g_pending.vs_cb_off);
+    if (!done && !stage_constants(0, data, bytes, &g_pending.vs_cb_off)) bytes = 0;
     g_pending.vs_cb_bytes = bytes;
 }
 void be_bind_ps_constants(void*, const void* data, u32 bytes)
@@ -3098,12 +3188,14 @@ void be_draw(void*, rsx_topology topology, const void* vertices, u32 vertex_coun
     if (indices && index_count && !stage_copy(indices, index_count * (u32)sizeof(u32), &ib)) return;
     Rec pulled{};
     const bool pull = &g_eu_pull != nullptr && g_eu_pull.active && stride == 8;
-    if (pull) {
+    if (pull && !(&g_eu_prof_on != nullptr && g_eu_prof_on)) {
+        if (!stage_pull(pulled)) return;
+    } else if (pull) {
         struct timespec pt0, pt1;
         clock_gettime(CLOCK_MONOTONIC, &pt0);
         const bool ok = stage_pull(pulled);
         clock_gettime(CLOCK_MONOTONIC, &pt1);
-        g_eu_prof[12] += us_between(pt0, pt1) * 1000u;
+        g_eu_prof[12] += (uint64_t)((pt1.tv_sec - pt0.tv_sec) * 1000000000ll + (pt1.tv_nsec - pt0.tv_nsec));
         if (!ok) return;
     }
     if (pull && g_eu_pull.check_verts) pull_check(pulled, (const u32*)vertices, vertex_count);
@@ -3254,6 +3346,9 @@ void be_present(void*, u32 surface)
             static uint64_t s_prof_t0;
             unsigned long long pv[16];
             for (int k = 0; k < 16; k++) { pv[k] = g_eu_prof[k]; g_eu_prof[k] = 0; }
+            /* the per-draw timers run on every 16th draw only (reading the clock for every draw was itself
+             * ~16% of the FIFO thread): scale those up */
+            for (int k : {1, 2, 3, 4, 5, 10, 11, 12, 13}) pv[k] *= 16;
             const double wall = s_prof_t0 ? (double)(t - s_prof_t0) : 5000.0;
             s_prof_t0 = t;
             auto ms = [](unsigned long long ns) { return ns / 1e6; };
@@ -3272,11 +3367,13 @@ void be_present(void*, u32 surface)
             g_async_jobs = g_sync_jobs = 0; g_same_pipe = g_same_tex = g_same_both = g_same_n = 0;
             if (pv[11] || pv[12])
                 fprintf(stderr, "[fifo-prof] GPU vertex fetch on the FIFO thread: index mapping %.0f ms, attribute table %.0f ms, "
-                        "staging %.0f ms (of which comparing/copying vertex bytes %.0f ms)\n", ms(pv[10]), ms(pv[11]),
-                        ms(pv[12]), ms(pv[13]));
+                        "staging %.0f ms (timed on 1 draw in 16)\n", ms(pv[10]), ms(pv[11]), ms(pv[12]));
         }
         fprintf(stderr, "[RSX vulkan] constant blocks reused instead of copied (5s): %llu (%.1f MB not copied)\n",
                 (unsigned long long)g_cb_reused, g_cb_bytes_saved / 1048576.0);
+        fprintf(stderr, "[RSX vulkan] vertex constants staged by use (5s): %llu blocks, %.0f bytes read of each on average\n",
+                (unsigned long long)g_cb_used_blocks, g_cb_used_blocks ? (double)g_cb_used_bytes / g_cb_used_blocks : 0.0);
+        g_cb_used_bytes = g_cb_used_blocks = 0;
         g_cb_reused = g_cb_bytes_saved = 0;
         fprintf(stderr, "[RSX vulkan] vertex fetch (5s): %u draws on the GPU (%.1f MB raw vertex data copied, %.1f MB shared), "
                 "%u decoded on the CPU | GPU-fetch programs that could not be built %u\n", g_pull_draws,

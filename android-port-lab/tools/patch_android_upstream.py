@@ -1466,8 +1466,10 @@ typedef struct eu_pull_draw {
     unsigned char slot_attr[16];
 } eu_pull_draw;
 eu_pull_draw g_eu_pull = { 0, (unsigned int)sizeof(eu_pull_attr) };
+int g_eu_prof_on;   /* per-draw timers run on every 16th draw; the report scales them up */
 static inline unsigned long long eu_prof_ns(void)
 {
+    if (!g_eu_prof_on) return 0;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
@@ -1483,6 +1485,7 @@ change("libs/video/rsx_draw_engine.c",
 static void eu_sink_end_inner(void* user, const rsx_dispatch* r);
 static void sink_end(void* user, const rsx_dispatch* r)
 {
+    { static unsigned eu_n; g_eu_prof_on = ((eu_n++ & 15u) == 0); }
     const unsigned long long t0 = eu_prof_ns();
     g_eu_pull.active = 0;
     eu_sink_end_inner(user, r);
@@ -1722,12 +1725,13 @@ change("libs/video/rsx_draw_engine.c",
         u32 unique = dc.n_refs;""",
 """#if defined(__ANDROID__)
     int eu_direct = 0;
-    if (allow_remap && dc.n_refs > 1 && !dc.inl && eu_vk_pull_ok && eu_vk_pull_ok()) {
+    if (eu_fast) dc.n_source_refs = eu_fast_count;
+    if (!eu_fast && allow_remap && dc.n_refs > 1 && !dc.inl && eu_vk_pull_ok && eu_vk_pull_ok()) {
         const unsigned long long eu_t = eu_prof_ns();
         eu_direct = eu_remap_direct();
         g_eu_prof[10] += eu_prof_ns() - eu_t;
     }
-    if (!eu_direct)
+    if (!eu_direct && !eu_fast)
 #endif
     if (allow_remap && dc.n_refs > 1) {
         u32 unique = dc.n_refs;""")
@@ -1800,6 +1804,7 @@ static void eu_shortcut_report(void)
 {
     static struct timespec t0;
     struct timespec t;
+    if (!g_eu_prof_on) return;
     clock_gettime(CLOCK_MONOTONIC, &t);
     if (!t0.tv_sec) { t0 = t; return; }
     if (t.tv_sec - t0.tv_sec < 10) return;
@@ -1985,4 +1990,85 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
 #endif
 {
     u32 mask = 0;""")
+# One indexed batch on the GPU-fetch path: read the indices once, straight into
+# the index map, instead of one reference per index followed by three passes.
+# Anything unusual (restart index hit, sparse indices, several batches, inline
+# data) returns 0 before touching the draw and the generic code runs.
+change("libs/video/rsx_draw_engine.c",
+"""        for (u32 b = 0; b < dc.n_idx && dc.fetch_ok; b++) {
+            const u32 first = dc.idx[b].first, count = dc.idx[b].count;""",
+"""#if defined(__ANDROID__)
+        { const unsigned long long eu_t = eu_prof_ns();
+          eu_fast = eu_index_fast(&ia, esz, ia_loc, base_index, restart_en, restart_val, allow_remap, &eu_fast_count);
+          g_eu_prof[10] += eu_prof_ns() - eu_t; }
+        if (!eu_fast)
+#endif
+        for (u32 b = 0; b < dc.n_idx && dc.fetch_ok; b++) {
+            const u32 first = dc.idx[b].first, count = dc.idx[b].count;""")
+change("libs/video/rsx_draw_engine.c",
+"""static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+{
+    for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)""",
+"""#if defined(__ANDROID__)
+static int eu_index_fast(const rsx_dsp_index_array* ia, u32 esz, u32 ia_loc, u32 base_index, int restart_en,
+                         u32 restart_val, int allow_remap, u32* out_count)
+{
+    if (!allow_remap || dc.inl || dc.n_arr || dc.n_idx != 1 || dc.n_refs || !eu_vk_pull_ok || !eu_vk_pull_ok()) return 0;
+    const u32 first = dc.idx[0].first, count = dc.idx[0].count;
+    if (count < 2 || count > (1u << 24)) return 0;
+    const u64 start = (u64)ia->offset + (u64)first * esz;
+    if (start + (u64)count * esz > 0x100000000ull) return 0;
+    const u8* run = (const u8*)eng_guest_ptr(NULL, ia_loc, (u32)start, count * esz);
+    if (!run) return 0;
+    if (count > dc.ref_remap.occurrence_capacity) {
+        u32* grown = (u32*)realloc(dc.ref_remap.occurrence_to_unique, (size_t)count * sizeof(u32));
+        if (!grown) return 0;
+        dc.ref_remap.occurrence_to_unique = grown;
+        dc.ref_remap.occurrence_capacity = count;
+    }
+    u32* occ = dc.ref_remap.occurrence_to_unique;
+    u32 lo = 0xFFFFFFFFu, hi = 0;
+    if (esz == 2) {
+        for (u32 i = 0; i < count; i++) {
+            u16 w; memcpy(&w, run + (size_t)i * 2, 2);
+            const u32 v = __builtin_bswap16(w);
+            if (restart_en && v == restart_val) return 0;
+            occ[i] = v;
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+        }
+    } else {
+        for (u32 i = 0; i < count; i++) {
+            u32 w; memcpy(&w, run + (size_t)i * 4, 4);
+            const u32 v = __builtin_bswap32(w);
+            if (restart_en && v == restart_val) return 0;
+            occ[i] = v;
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+        }
+    }
+    const u64 span = (u64)hi - lo + 1u;
+    if (span > count) return 0;                       /* sparse: the generic pass shades fewer vertices */
+    while (dc.cap_refs < (u32)span) {
+        const u32 next = dc.cap_refs ? dc.cap_refs * 2u : 4096u;
+        rsx_vertex_ref* r = (rsx_vertex_ref*)realloc(dc.refs, (size_t)next * sizeof(*r));
+        if (!r) return 0;
+        dc.refs = r;
+        dc.cap_refs = next;
+    }
+    for (u32 i = 0; i < count; i++) occ[i] -= lo;
+    for (u32 k = 0; k < (u32)span; k++) { dc.refs[k].vertex_id = lo + k; dc.refs[k].base_index = base_index; }
+    dc.n_refs = (u32)span;
+    dc.refs_remapped = 1;
+    *out_count = count;
+    return 1;
+}
+#endif
+static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+{
+#if defined(__ANDROID__)
+    int eu_fast = 0;
+    u32 eu_fast_count = 0;
+#endif
+    for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)""")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
