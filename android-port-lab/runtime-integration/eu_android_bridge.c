@@ -734,6 +734,7 @@ volatile int g_eu_live_off;
 #define EU_LIVE_LL_YIELD 32
 #define EU_LIVE_SPU_NICE 64
 #define EU_LIVE_PERF_HINT 128
+#define EU_LIVE_SPU_SERIAL 256
 static int s_main_nice;   /* 0 = main thread not boosted */
 static void eu_prime_sweep(void)
 {
@@ -880,7 +881,10 @@ static void eu_core_split(void)
     for (int i = 0; i < nst; i++) st[i].seen = 0;
     int n_poll = 0, n_work = 0, n_slow = 0, n_niced = 0;
     for (int i = 0; i < nc; i++) {
-        if (strncmp(cur[i].name, "spurs i", 7) && strncmp(cur[i].name, "spu w", 5)) continue;
+        /* Lane threads only. Kernel threads are left where they are: they pick up work within a millisecond
+         * and being judged every 3 s left them on a slow core at low priority when it arrived (446 moves
+         * there and 329 back in five minutes, boot-20261111-141558). */
+        if (strncmp(cur[i].name, "spu w", 5)) continue;
         const int tid = cur[i].tid;
         int k = 0;
         for (; k < nst; k++) if (st[k].tid == tid) break;
@@ -944,7 +948,7 @@ static void eu_core_split(void)
     }
     if (want_split && !applied) { sched_setaffinity(getpid(), sizeof fast, &fast); applied = 1; }
     if (++reports <= 4 || reports % 10 == 0)
-        fprintf(stderr, "[split] SPU threads: %d polling, %d working | on the slow cores %d (moves: %llu there, %llu back) | "
+        fprintf(stderr, "[split] SPU lane threads: %d polling, %d working | on the slow cores %d (moves: %llu there, %llu back) | "
                 "at lowered priority %d (put back by the runtime %llu times)\n", n_poll, n_work, n_slow, to_slow, to_fast,
                 n_niced, renice_again);
 }
@@ -1022,14 +1026,15 @@ static void eu_perf_hint_tick(void)
  * settings is switched off, then everything is on again, then the next one is off, and so on. Frame rate and
  * the main thread's waiting share are measured for each stretch (its first 4 s are left out, things settle),
  * so both states see the same scenes and the same phone temperature.
- * EU_AB=name,name,...  (default EU_CORE_SPLIT,EU_SPU_NICE,EU_MAIN_BOOST,EU_PERF_HINT; also EU_LL_YIELD,
- *                        EU_SPURS_PARK, EU_INDEX_FAST, EU_VK_CB_USED). Which one goes first varies from run to run.
+ * EU_AB=name,name,...  (default EU_SPU_SERIAL,EU_CORE_SPLIT,EU_SPU_NICE; also EU_MAIN_BOOST, EU_PERF_HINT,
+ *                        EU_LL_YIELD, EU_SPURS_PARK, EU_INDEX_FAST, EU_VK_CB_USED). Which one goes first varies from run to run.
  * EU_AB=0 = no switching. */
-#define EU_AB_MAX 8
+#define EU_AB_MAX 9
 static struct { const char* name; int bit; } s_ab_known[] = {
     {"EU_CORE_SPLIT", EU_LIVE_CORE_SPLIT}, {"EU_MAIN_BOOST", EU_LIVE_MAIN_BOOST}, {"EU_SPURS_PARK", EU_LIVE_SPURS_PARK},
     {"EU_INDEX_FAST", EU_LIVE_INDEX_FAST}, {"EU_VK_CB_USED", EU_LIVE_CB_USED}, {"EU_LL_YIELD", EU_LIVE_LL_YIELD},
     {"EU_SPU_NICE", EU_LIVE_SPU_NICE}, {"EU_PERF_HINT", EU_LIVE_PERF_HINT},
+    {"EU_SPU_SERIAL", EU_LIVE_SPU_SERIAL},
 };
 extern volatile unsigned long g_eu_ll_yields __attribute__((weak));
 static int s_ab_n, s_ab_item[EU_AB_MAX];
@@ -1066,7 +1071,7 @@ static void eu_ab_tick(void)
         const char* sv = getenv("EU_AB_SECS");
         if (sv && atoi(sv) >= 8) secs = atoi(sv);
         if (secs > 300) secs = 300;
-        if (!e || !*e) e = "EU_CORE_SPLIT,EU_SPU_NICE,EU_MAIN_BOOST,EU_PERF_HINT";
+        if (!e || !*e) e = "EU_SPU_SERIAL,EU_CORE_SPLIT,EU_SPU_NICE";
         if (&g_eu_frames_total && strcmp(e, "0")) {
             for (unsigned k = 0; k < sizeof s_ab_known / sizeof s_ab_known[0] && s_ab_n < EU_AB_MAX; k++) {
                 const char* hit = strstr(e, s_ab_known[k].name);
