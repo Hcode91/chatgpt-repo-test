@@ -2272,18 +2272,18 @@ change("runtime/spu/spu_channels.c",
  * memory transfer and channel access during the run, registers and local store at exit. A native version
  * of the job is then written and checked against these on a desktop before it runs on a phone.
  *   EU_JOBREC=<first hex digits of the module signature> (0 = off), EU_JOBREC_FIRST (300), EU_JOBREC_EVERY
- *   (3000), EU_JOBREC_MAX (16 runs).
+ *   (2000), EU_JOBREC_MAX (24 runs).
  * File: "EUJR0001", then records; each record = tagged chunks {u32 tag, u32 bytes, data}:
  *   'HEAD' {u32 run, u32 pc, u32 overlay, u32 image, u8 sig[16]}   'CTX0' raw spu_context   'REG0' 128 x 16
  *   'LS_0' 256 KB (first record) or 'LSX0' xor against the first record's LS_0
  *   'DMA_' {u32 cmd, u32 lsa, u64 ea, u32 size, i32 rc} + size bytes of local store after the transfer
- *   'WRCH' {u32 ch, u8 v[16]}   'RDCH' {u32 ch, u8 v[16]}
+ *   'WRCH' {u32 ch, u8 v[16]}   'RDCH' {u32 ch, u8 v[16]}   'ATOM' {u32 lsa, u32 ea} + 128 bytes (after an atomic status read)
  *   'TAIL' {u32 exit pc}   'REG1'   'LSX1' xor against this record's entry local store   'END_' */
 volatile int g_eu_jobrec_live;                 /* some thread is recording right now (read by spu_dma.h) */
 static SPU_THREAD_LOCAL spu_context* t_eu_rec_ctx;
 static uint8_t* s_eu_rec_buf; static size_t s_eu_rec_len, s_eu_rec_cap;
 static uint8_t* s_eu_rec_ls0; static uint8_t* s_eu_rec_first;
-static int s_eu_rec_on = -1, s_eu_rec_n, s_eu_rec_max = 16, s_eu_rec_first_run = 300, s_eu_rec_every = 3000;
+static int s_eu_rec_on = -1, s_eu_rec_n, s_eu_rec_max = 24, s_eu_rec_first_run = 300, s_eu_rec_every = 2000;
 static uint8_t s_eu_rec_sig[16]; static int s_eu_rec_siglen;
 static volatile long s_eu_rec_seen;
 static void eu_rec_put(uint32_t tag, const void* a, uint32_t na, const void* b, uint32_t nb)
@@ -2315,6 +2315,14 @@ static void eu_jobrec_ch(spu_context* ctx, uint32_t tag, uint32_t ch, const u128
 {
     if (t_eu_rec_ctx != ctx) return;
     eu_rec_put(tag, &ch, 4, v, 16);
+    /* Atomic transfers (GETLLAR / PUTLLC) do not go through mfc_do_transfer. Their status read is the
+     * point where the 128-byte line is settled in the local store: save it there. The first recordings
+     * lacked this, and every run that produced output could not be replayed past it. */
+    if (ch == 27 /* MFC_RdAtomicStat */ && tag == EU_TAG('R', 'D', 'C', 'H')) {
+        struct { uint32_t lsa, ea; } h = { ctx->mfc_lsa, ctx->mfc_eal };
+        const uint32_t at = ctx->mfc_lsa & (SPU_LS_SIZE - 1) & ~127u;
+        eu_rec_put(EU_TAG('A', 'T', 'O', 'M'), &h, sizeof h, ctx->ls + at, 128);
+    }
 }
 static void eu_jobrec_begin(spu_context* ctx, uint32_t pc)
 {
@@ -2376,7 +2384,7 @@ static void eu_jobrec_end(spu_context* ctx, uint32_t pc)
     FILE* f = fopen(path, s_eu_rec_n == 0 ? "wb" : "ab");
     int ok = 0;
     if (f) {
-        if (s_eu_rec_n == 0) fwrite("EUJR0001", 1, 8, f);
+        if (s_eu_rec_n == 0) fwrite("EUJR0002", 1, 8, f);
         ok = fwrite(s_eu_rec_buf, 1, s_eu_rec_len, f) == s_eu_rec_len;
         fclose(f);
     }
