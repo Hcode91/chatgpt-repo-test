@@ -2019,6 +2019,7 @@ static int eu_index_fast(const rsx_dsp_index_array* ia, u32 esz, u32 ia_loc, u32
 {
     static int on = -1;
     if (on < 0) { const char* e = getenv("EU_INDEX_FAST"); on = (e && *e == '0') ? 0 : 1; }
+    { extern volatile int g_eu_live_off __attribute__((weak)); if (&g_eu_live_off && (g_eu_live_off & 8)) return 0; }
     if (!on || !allow_remap || dc.inl || dc.n_arr || dc.n_idx != 1 || dc.n_refs || !eu_vk_pull_ok || !eu_vk_pull_ok()) return 0;
     const u32 first = dc.idx[0].first, count = dc.idx[0].count;
     if (count < 2 || count > (1u << 24)) return 0;
@@ -2134,9 +2135,11 @@ change("libs/spurs/cellSpurs.c",
 {""",
 """#if defined(__ANDROID__)
 static volatile long s_eu_park_n, s_eu_park_kicked;
+extern volatile int g_eu_live_off __attribute__((weak));   /* eu_android_bridge.c: bit 4 = parking switched off for now */
 static int eu_spurs_park_ms(void)
 {
     static int ms = -1;
+    if (&g_eu_live_off && (g_eu_live_off & 4)) return 0;
     if (ms < 0) {
         const char* e = getenv("EU_SPURS_PARK"); const char* m = getenv("EU_SPURS_PARK_MS");
         int v = (m && *m) ? atoi(m) : 2;

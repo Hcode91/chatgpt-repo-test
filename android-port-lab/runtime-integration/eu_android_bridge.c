@@ -721,6 +721,15 @@ static void eu_cores_report(const eu_tsample* cur, const int* idx, const uint64_
  * thread's allowed set. Threads start all the time, so this is repeated. EU_PRIME_EXCLUSIVE=0 = off. */
 extern int g_eu_prime_tid[4] __attribute__((weak));
 extern int g_eu_prime_n __attribute__((weak));
+/* Settings the in-run comparison ([ab]) has switched off right now, one bit each. Read (weakly) by the
+ * patched upstream files and the Vulkan backend as well. */
+volatile int g_eu_live_off;
+#define EU_LIVE_CORE_SPLIT 1
+#define EU_LIVE_MAIN_BOOST 2
+#define EU_LIVE_SPURS_PARK 4
+#define EU_LIVE_INDEX_FAST 8
+#define EU_LIVE_CB_USED 16
+static int s_main_nice;   /* 0 = main thread not boosted */
 static void eu_prime_sweep(void)
 {
     static int on = -1;
@@ -758,6 +767,7 @@ static void eu_prime_sweep(void)
                 int nv = (n && *n) ? atoi(n) : -6;
                 if (nv < -19) nv = -19;
                 if (nv > 0) nv = 0;
+                s_main_nice = nv;
                 const int r = setpriority(PRIO_PROCESS, (id_t)getpid(), nv);
                 fprintf(stderr, "[boost] game main thread (tid %d): priority %d %s (EU_MAIN_BOOST)\n", (int)getpid(), nv,
                         r == 0 ? "set" : strerror(errno));
@@ -790,6 +800,261 @@ static void eu_prime_sweep(void)
     moved += now_moved;
     if (now_moved && (++sweeps <= 3 || sweeps % 20 == 0))
         fprintf(stderr, "[boost] kept %llu more thread(s) off the fastest core (%llu so far)\n", now_moved, moved);
+}
+
+/* 44 SPU threads share 8 cores with the game's main thread, which was ready but waiting for a core 63-66%
+ * of the time (boot-20261111-100119). Only about six of the 44 do real work; the rest wake up, find
+ * nothing and sleep again, ~6% of a core each. Split them: the ones that only poll go to the slow cores,
+ * the ones that work stay on the faster cores with the main thread. Re-judged every 3 s:
+ *   on a faster core and under 15% of it            -> slow cores
+ *   on a slow core and over 50%, or running for more
+ *   than 0.5 ms at a stretch (a poll is far shorter) -> back to the faster cores
+ * Threads with a raised priority (the audio SPU kernel) and the RSX FIFO thread are left alone.
+ * EU_CORE_SPLIT=0 = off. */
+static void eu_core_split(void)
+{
+    static int on = -1, avail, applied, tick;
+    static cpu_set_t slow, fast, both;
+    static struct { int tid; uint64_t ticks; unsigned long long run_ns, slices; signed char where, seen; } st[EU_MAX_THREADS];
+    static int nst;
+    static eu_tsample cur[EU_MAX_THREADS];
+    static unsigned long long to_slow, to_fast;
+    static int reports;
+    if (on < 0) {
+        const char* e = getenv("EU_CORE_SPLIT");
+        on = (e && *e == '0') ? 0 : 1;
+        long ncpu = sysconf(_SC_NPROCESSORS_CONF);
+        if (ncpu > 32) ncpu = 32;
+        long top = 0, low = 0, f[32];
+        for (long c = 0; c < ncpu; c++) {
+            char path[96];
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", c);
+            f[c] = eu_read_long(path);
+            if (f[c] > top) top = f[c];
+            if (f[c] > 0 && (!low || f[c] < low)) low = f[c];
+        }
+        CPU_ZERO(&slow); CPU_ZERO(&fast); CPU_ZERO(&both);
+        int nslow = 0, nmid = 0, nfast = 0;
+        for (long c = 0; c < ncpu; c++) if (f[c] > 0 && f[c] > low && f[c] < top) nmid++;
+        for (long c = 0; c < ncpu; c++) {
+            if (f[c] <= 0) continue;
+            if (f[c] == low && low < top) { CPU_SET((int)c, &slow); CPU_SET((int)c, &both); nslow++; }
+            else if (f[c] < top || !nmid) { CPU_SET((int)c, &fast); CPU_SET((int)c, &both); nfast++; }
+            /* the fastest core stays out of both sets when there are middle cores: it is the FIFO thread's */
+        }
+        avail = nslow > 0 && nfast > 0;
+        fprintf(stderr, "[split] polling SPU threads on the %d slow core(s), working ones and the main thread on %d faster "
+                "core(s): %s (EU_CORE_SPLIT)\n", nslow, nfast, !avail ? "not possible on this phone" : on ? "on" : "off");
+    }
+    if (!on || !avail) return;
+    const int want = !(g_eu_live_off & EU_LIVE_CORE_SPLIT);
+    if (!want) {
+        if (applied) {   /* switched off by the comparison: everything back where it may run anywhere */
+            for (int i = 0; i < nst; i++)
+                if (st[i].where) { sched_setaffinity(st[i].tid, sizeof both, &both); st[i].where = 0; }
+            sched_setaffinity(getpid(), sizeof both, &both);
+            applied = 0;
+        }
+    }
+    if (tick++ % 3) return;
+    const long hz = sysconf(_SC_CLK_TCK) > 0 ? sysconf(_SC_CLK_TCK) : 100;
+    const int nc = eu_sample(cur, EU_MAX_THREADS);
+    for (int i = 0; i < nst; i++) st[i].seen = 0;
+    int n_slow = 0, n_fast = 0;
+    for (int i = 0; i < nc; i++) {
+        if (strncmp(cur[i].name, "spurs i", 7) && strncmp(cur[i].name, "spu w", 5)) continue;
+        const int tid = cur[i].tid;
+        int k = 0;
+        for (; k < nst; k++) if (st[k].tid == tid) break;
+        unsigned long long run_ns = 0, wait_ns = 0, slices = 0;
+        {
+            char path[64];
+            snprintf(path, sizeof path, "/proc/self/task/%d/schedstat", tid);
+            FILE* f = fopen(path, "r");
+            if (f) { if (fscanf(f, "%llu %llu %llu", &run_ns, &wait_ns, &slices) != 3) run_ns = slices = 0; fclose(f); }
+        }
+        if (k == nst) {   /* first sight: judge it next time */
+            if (nst >= EU_MAX_THREADS) continue;
+            st[nst].tid = tid; st[nst].ticks = cur[i].ticks; st[nst].run_ns = run_ns; st[nst].slices = slices;
+            st[nst].where = 0; st[nst].seen = 1;
+            nst++;
+            continue;
+        }
+        const double pct = 100.0 * (double)(cur[i].ticks - st[k].ticks) / (double)(hz * 3);
+        const unsigned long long ds = slices - st[k].slices;
+        const double slice_us = ds ? (double)(run_ns - st[k].run_ns) / (double)ds / 1000.0 : 0.0;
+        st[k].ticks = cur[i].ticks; st[k].run_ns = run_ns; st[k].slices = slices; st[k].seen = 1;
+        if (!want) continue;
+        int skip = 0;
+        if (&g_eu_prime_n) for (int j = 0; j < g_eu_prime_n && j < 4; j++) if (g_eu_prime_tid[j] == tid) skip = 1;
+        errno = 0;
+        if (!skip && getpriority(PRIO_PROCESS, (id_t)tid) < 0) skip = 1;   /* boosted (audio): placed elsewhere */
+        if (skip) continue;
+        if (st[k].where != 2) {
+            if (pct < 15.0) {
+                if (sched_setaffinity(tid, sizeof slow, &slow) == 0) { st[k].where = 2; to_slow++; }
+            } else if (st[k].where == 0) {
+                if (sched_setaffinity(tid, sizeof fast, &fast) == 0) st[k].where = 1;
+            }
+        } else if (pct > 50.0 || slice_us > 500.0) {
+            if (sched_setaffinity(tid, sizeof fast, &fast) == 0) { st[k].where = 1; to_fast++; }
+        }
+        if (st[k].where == 2) n_slow++; else if (st[k].where == 1) n_fast++;
+    }
+    {   /* forget threads that ended */
+        int o = 0;
+        for (int i = 0; i < nst; i++) if (st[i].seen) st[o++] = st[i];
+        nst = o;
+    }
+    if (!want) return;
+    if (!applied) { sched_setaffinity(getpid(), sizeof fast, &fast); applied = 1; }
+    if (++reports <= 4 || reports % 10 == 0)
+        fprintf(stderr, "[split] SPU threads: %d on the slow cores, %d on the faster ones | moves so far: %llu to slow, "
+                "%llu back to fast\n", n_slow, n_fast, to_slow, to_fast);
+}
+
+/* In-run comparison. Instead of one run per setting: every EU_AB_SECS (default 20) seconds one of the listed
+ * settings is switched off, then everything is on again, then the next one is off, and so on. Frame rate and
+ * the main thread's waiting share are measured for each stretch (its first 4 s are left out, things settle),
+ * so both states see the same scenes and the same phone temperature.
+ * EU_AB=name,name,...  (default EU_CORE_SPLIT,EU_MAIN_BOOST,EU_SPURS_PARK; also EU_INDEX_FAST, EU_VK_CB_USED)
+ * EU_AB=0 = no switching. */
+extern volatile unsigned long long g_eu_frames_total __attribute__((weak));
+#define EU_AB_MAX 5
+static struct { const char* name; int bit; } s_ab_known[] = {
+    {"EU_CORE_SPLIT", EU_LIVE_CORE_SPLIT}, {"EU_MAIN_BOOST", EU_LIVE_MAIN_BOOST}, {"EU_SPURS_PARK", EU_LIVE_SPURS_PARK},
+    {"EU_INDEX_FAST", EU_LIVE_INDEX_FAST}, {"EU_VK_CB_USED", EU_LIVE_CB_USED},
+};
+static int s_ab_n, s_ab_item[EU_AB_MAX];
+static struct { double fps_sum, wait_sum; int n; } s_ab_acc[EU_AB_MAX + 1];   /* [0] all on, [1+i] item i off */
+static unsigned long long eu_main_wait_ns(unsigned long long* run)
+{
+    char path[64];
+    unsigned long long r = 0, w = 0;
+    snprintf(path, sizeof path, "/proc/self/task/%d/schedstat", (int)getpid());
+    FILE* f = fopen(path, "r");
+    if (f) { if (fscanf(f, "%llu %llu", &r, &w) != 2) r = w = 0; fclose(f); }
+    if (run) *run = r;
+    return w;
+}
+static int eu_ab_table(char* line, int cap)
+{
+    int off = 0;
+    for (int i = 0; i <= s_ab_n && off < cap - 64; i++) {
+        if (!s_ab_acc[i].n) continue;
+        off += snprintf(line + off, cap - off, "%s%s%s %.1f frames/s, main waiting %.0f%% (%d)", off ? " | " : "",
+                        i ? s_ab_known[s_ab_item[i - 1]].name : "all on", i ? " off" : "",
+                        s_ab_acc[i].fps_sum / s_ab_acc[i].n, s_ab_acc[i].wait_sum / s_ab_acc[i].n, s_ab_acc[i].n);
+    }
+    if (!off) off = snprintf(line, cap, "nothing measured yet");
+    return off;
+}
+static void eu_ab_tick(void)
+{
+    static int init, secs = 20, t = -45, seg;   /* the first 45 s (start-up) are not compared */
+    static unsigned long long f0, w0;
+    if (!init) {
+        init = 1;
+        const char* e = getenv("EU_AB");
+        const char* sv = getenv("EU_AB_SECS");
+        if (sv && atoi(sv) >= 8) secs = atoi(sv);
+        if (secs > 300) secs = 300;
+        if (!e || !*e) e = "EU_CORE_SPLIT,EU_MAIN_BOOST,EU_SPURS_PARK";
+        if (&g_eu_frames_total && strcmp(e, "0")) {
+            for (unsigned k = 0; k < sizeof s_ab_known / sizeof s_ab_known[0] && s_ab_n < EU_AB_MAX; k++) {
+                const char* hit = strstr(e, s_ab_known[k].name);
+                const char* own = getenv(s_ab_known[k].name);
+                if (hit && !(own && *own == '0')) s_ab_item[s_ab_n++] = (int)k;   /* off for the whole run: nothing to compare */
+            }
+        }
+        char list[160] = "";
+        for (int i = 0, o = 0; i < s_ab_n; i++) o += snprintf(list + o, sizeof list - o, "%s%s", i ? ", " : "", s_ab_known[s_ab_item[i]].name);
+        if (s_ab_n) fprintf(stderr, "[ab] in-run comparison: every %d s one of [%s] is switched off, then all on again "
+                            "(EU_AB=0 stops this; EU_AB=name,name picks; EU_AB_SECS)\n", secs, list);
+        else fprintf(stderr, "[ab] in-run comparison: off\n");
+    }
+    if (!s_ab_n) return;
+    if (++t <= 0) return;
+    const int at = (t - 1) % secs;   /* second within the stretch */
+    if (at == 0) {
+        seg = (t - 1) / secs;
+        const int off_item = (seg & 1) ? (seg / 2) % s_ab_n : -1;
+        const int old = g_eu_live_off;
+        const int now = off_item < 0 ? 0 : s_ab_known[s_ab_item[off_item]].bit;
+        g_eu_live_off = now;
+        if (s_main_nice && ((old ^ now) & EU_LIVE_MAIN_BOOST))
+            setpriority(PRIO_PROCESS, (id_t)getpid(), (now & EU_LIVE_MAIN_BOOST) ? 0 : s_main_nice);
+    }
+    if (at == 4) { f0 = g_eu_frames_total; w0 = eu_main_wait_ns(NULL); }
+    if (at == secs - 1) {
+        const double span = (double)(secs - 5);
+        const double fps = (double)(g_eu_frames_total - f0) / span;
+        const double wait = (double)(eu_main_wait_ns(NULL) - w0) / (span * 1e7);
+        const int off_item = (seg & 1) ? (seg / 2) % s_ab_n : -1;
+        const int slot = off_item < 0 ? 0 : 1 + off_item;
+        s_ab_acc[slot].fps_sum += fps; s_ab_acc[slot].wait_sum += wait; s_ab_acc[slot].n++;
+        char line[900];
+        eu_ab_table(line, sizeof line);
+        fprintf(stderr, "[ab] %d s with %s%s: %.1f frames/s, main thread waiting %.0f%% | averages so far (stretches): %s\n",
+                secs, off_item < 0 ? "everything on" : s_ab_known[s_ab_item[off_item]].name, off_item < 0 ? "" : " OFF",
+                fps, wait, line);
+    }
+}
+
+/* Once a minute: the handful of numbers that say how the run is going, so the end of the log can be read
+ * without the rest. */
+static void eu_summary(long hz, uint64_t all_ticks, uint64_t spu_ticks, int nspu)
+{
+    static unsigned long long f_prev, f_first, run_prev, wait_prev;
+    static int minutes, have;
+    static double best;
+    unsigned long long run = 0;
+    const unsigned long long wait = eu_main_wait_ns(&run);
+    const unsigned long long frames = &g_eu_frames_total ? g_eu_frames_total : 0;
+    if (!have) { have = 1; f_prev = f_first = frames; run_prev = run; wait_prev = wait; return; }
+    minutes++;
+    const double fps = (double)(frames - f_prev) / 60.0;
+    if (fps > best) best = fps;
+    fprintf(stderr, "[summary] ---- minute %d ----\n", minutes + 1);
+    fprintf(stderr, "[summary] frames per second: %.1f this minute, %.1f best minute, %.1f whole run\n",
+            fps, best, (double)(frames - f_first) / (60.0 * minutes));
+    fprintf(stderr, "[summary] game main thread: running %.0f%% of the time, ready but waiting for a core %.0f%%\n",
+            (double)(run - run_prev) / 6e8, (double)(wait - wait_prev) / 6e8);
+    fprintf(stderr, "[summary] processor use: %.0f%% of one core in total, SPU threads %.0f%% (%d threads)\n",
+            100.0 * (double)all_ticks / (double)(hz * 60), 100.0 * (double)spu_ticks / (double)(hz * 60), nspu);
+    {
+        long ncpu = sysconf(_SC_NPROCESSORS_CONF), best_top = 0, best_cap = 0, hottest = 0;
+        if (ncpu > 32) ncpu = 32;
+        for (long c = 0; c < ncpu; c++) {
+            char path[96];
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", c);
+            const long top = eu_read_long(path);
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/cpufreq/scaling_max_freq", c);
+            const long cap = eu_read_long(path);
+            if (top > best_top) { best_top = top; best_cap = cap; }
+        }
+        for (int z = 0; z < 100; z++) {
+            char path[96], type[40] = "";
+            snprintf(path, sizeof path, "/sys/class/thermal/thermal_zone%d/type", z);
+            FILE* f = fopen(path, "r");
+            if (!f) { if (z > 8 && !hottest) break; continue; }
+            if (!fgets(type, sizeof type, f)) type[0] = 0;
+            fclose(f);
+            if (!strstr(type, "cpu") && !strstr(type, "gpu") && !strstr(type, "soc")) continue;
+            snprintf(path, sizeof path, "/sys/class/thermal/thermal_zone%d/temp", z);
+            long tv = eu_read_long(path);
+            if (tv > 1000) tv /= 1000;
+            if (tv > hottest && tv < 200) hottest = tv;
+        }
+        fprintf(stderr, "[summary] fastest core allowed %ld of %ld MHz%s; hottest chip sensor %ld C\n", best_cap / 1000,
+                best_top / 1000, best_cap > 0 && best_cap < best_top ? " (phone is holding it back)" : "", hottest);
+    }
+    if (s_ab_n) {
+        char line[900];
+        eu_ab_table(line, sizeof line);
+        fprintf(stderr, "[summary] comparison, averages (number of stretches): %s\n", line);
+    }
+    f_prev = frames; run_prev = run; wait_prev = wait;
 }
 
 /* All CPU use, grouped by thread name with digits dropped ("spu w0 lane3" -> "spu w lane"): the [cpu] line
@@ -841,7 +1106,7 @@ static void* eu_cpu_thread(void* arg)
     int np = eu_sample(prev, EU_MAX_THREADS);
     const long hz = sysconf(_SC_CLK_TCK) > 0 ? sysconf(_SC_CLK_TCK) : 100;
     for (;;) {
-        for (int sec = 0; sec < 10; sec++) { sleep(1); eu_prime_sweep(); }
+        for (int sec = 0; sec < 10; sec++) { sleep(1); eu_ab_tick(); eu_core_split(); eu_prime_sweep(); }
         int nc = eu_sample(cur, EU_MAX_THREADS);
         /* Delta per thread, top 10. */
         int idx[EU_MAX_THREADS];
@@ -892,7 +1157,14 @@ static void* eu_cpu_thread(void* arg)
         }
         /* every minute: the busiest thread's whole-run totals */
         static int s_cycles;
+        static uint64_t s_min_all, s_min_spu;
+        int nspu = 0;
+        s_min_all += total;
+        for (int i = 0; i < nc; i++)
+            if (!strncmp(cur[i].name, "spurs i", 7) || !strncmp(cur[i].name, "spu w", 5)) { s_min_spu += dt[i]; nspu++; }
         if (++s_cycles % 6 == 0) {
+            eu_summary(hz, s_min_all, s_min_spu, nspu);
+            s_min_all = s_min_spu = 0;
             eu_tot_print("hot-total", s_tot_self, s_tot_nself);
             eu_tot_print("hot-callers", s_tot_from, s_tot_nfrom);
         }
