@@ -732,6 +732,8 @@ volatile int g_eu_live_off;
 #define EU_LIVE_INDEX_FAST 8
 #define EU_LIVE_CB_USED 16
 #define EU_LIVE_LL_YIELD 32
+#define EU_LIVE_SPU_NICE 64
+#define EU_LIVE_PERF_HINT 128
 static int s_main_nice;   /* 0 = main thread not boosted */
 static void eu_prime_sweep(void)
 {
@@ -760,14 +762,14 @@ static void eu_prime_sweep(void)
     }
     {   /* The game's main thread was ready to run but waiting for a core 58-66% of the time while using a
          * third of one (boot-20261111-100119): everything else is paced by it. Give it priority over the
-         * SPU threads. EU_MAIN_BOOST=0 = leave it; EU_MAIN_NICE sets the value (default -10). */
+         * SPU threads. EU_MAIN_BOOST=0 = leave it; EU_MAIN_NICE sets the value (default -14). */
         static int done;
         if (!done) {
             done = 1;
             const char* e = getenv("EU_MAIN_BOOST");
             const char* n = getenv("EU_MAIN_NICE");
             if (!(e && *e == '0')) {
-                int nv = (n && *n) ? atoi(n) : -10;   /* SPU threads run at -5: -6 changed nothing (boot-20261111-105043) */
+                int nv = (n && *n) ? atoi(n) : -14;   /* working SPU threads run at -10 (boot-20261111-115416): -6 and -10 changed nothing */
                 if (nv < -19) nv = -19;
                 if (nv > 0) nv = 0;
                 s_main_nice = nv;
@@ -807,25 +809,35 @@ static void eu_prime_sweep(void)
 
 /* 44 SPU threads share 8 cores with the game's main thread, which was ready but waiting for a core 63-66%
  * of the time (boot-20261111-100119). Only about six of the 44 do real work; the rest wake up, find
- * nothing and sleep again, ~6% of a core each. Split them: the ones that only poll go to the slow cores,
- * the ones that work stay on the faster cores with the main thread. Re-judged every 3 s:
- *   on a faster core and under 15% of it            -> slow cores
- *   on a slow core and over 50%, or running for more
- *   than 0.5 ms at a stretch (a poll is far shorter) -> back to the faster cores
- * The audio SPU kernel and the RSX FIFO thread are left alone.
- * EU_CORE_SPLIT=0 = off. */
+ * nothing and sleep again, ~6% of a core each -- and the runtime runs all of them at priority -10
+ * (boot-20261111-115416), level with or above everything else. Every 3 s each SPU thread is judged:
+ *   polling: under 15% of a core and never running for more than 0.3 ms at a stretch
+ *   working: over 50%, or running for more than 0.5 ms at a stretch, or 25%+ on a faster core
+ * and two independent things are done with that:
+ *   EU_CORE_SPLIT (default on): polling threads go to the slow cores, working ones and the main thread to
+ *     the faster cores;
+ *   EU_SPU_NICE (default on): polling threads drop to normal priority (EU_SPU_POLL_NICE, default 0), so a
+ *     poll no longer interrupts the main thread; back to their own priority when they start working.
+ * The audio SPU kernel and the RSX FIFO thread are left alone. */
 static void eu_core_split(void)
 {
-    static int on = -1, avail, applied, tick;
+    static int on_split = -1, on_nice, poll_nice, avail, applied, tick;
     static cpu_set_t slow, fast, both;
-    static struct { int tid; uint64_t ticks; unsigned long long run_ns, slices; signed char where, seen; } st[EU_MAX_THREADS];
+    static struct { int tid; uint64_t ticks; unsigned long long run_ns, slices;
+                    signed char where, seen, cls, niced; int nice0; } st[EU_MAX_THREADS];
     static int nst;
     static eu_tsample cur[EU_MAX_THREADS];
-    static unsigned long long to_slow, to_fast;
+    static unsigned long long to_slow, to_fast, renice_again;
     static int reports;
-    if (on < 0) {
+    if (on_split < 0) {
         const char* e = getenv("EU_CORE_SPLIT");
-        on = (e && *e == '0') ? 0 : 1;
+        const char* ne = getenv("EU_SPU_NICE");
+        const char* pn = getenv("EU_SPU_POLL_NICE");
+        on_split = (e && *e == '0') ? 0 : 1;
+        on_nice = (ne && *ne == '0') ? 0 : 1;
+        poll_nice = (pn && *pn) ? atoi(pn) : 0;
+        if (poll_nice < -10) poll_nice = -10;
+        if (poll_nice > 19) poll_nice = 19;
         long ncpu = sysconf(_SC_NPROCESSORS_CONF);
         if (ncpu > 32) ncpu = 32;
         long top = 0, low = 0, f[32];
@@ -847,23 +859,26 @@ static void eu_core_split(void)
         }
         avail = nslow > 0 && nfast > 0;
         fprintf(stderr, "[split] polling SPU threads on the %d slow core(s), working ones and the main thread on %d faster "
-                "core(s): %s (EU_CORE_SPLIT)\n", nslow, nfast, !avail ? "not possible on this phone" : on ? "on" : "off");
+                "core(s): %s (EU_CORE_SPLIT) | polling SPU threads at priority %d: %s (EU_SPU_NICE)\n", nslow, nfast,
+                !avail ? "not possible on this phone" : on_split ? "on" : "off", poll_nice, on_nice ? "on" : "off");
     }
-    if (!on || !avail) return;
-    const int want = !(g_eu_live_off & EU_LIVE_CORE_SPLIT);
-    if (!want) {
-        if (applied) {   /* switched off by the comparison: everything back where it may run anywhere */
-            for (int i = 0; i < nst; i++)
-                if (st[i].where) { sched_setaffinity(st[i].tid, sizeof both, &both); st[i].where = 0; }
-            sched_setaffinity(getpid(), sizeof both, &both);
-            applied = 0;
-        }
+    if (!on_split && !on_nice) return;
+    const int want_split = on_split && avail && !(g_eu_live_off & EU_LIVE_CORE_SPLIT);
+    const int want_nice = on_nice && !(g_eu_live_off & EU_LIVE_SPU_NICE);
+    if (!want_split && applied) {   /* switched off by the comparison: everything back where it may run anywhere */
+        for (int i = 0; i < nst; i++)
+            if (st[i].where) { sched_setaffinity(st[i].tid, sizeof both, &both); st[i].where = 0; }
+        sched_setaffinity(getpid(), sizeof both, &both);
+        applied = 0;
     }
+    if (!want_nice)
+        for (int i = 0; i < nst; i++)
+            if (st[i].niced) { setpriority(PRIO_PROCESS, (id_t)st[i].tid, st[i].nice0); st[i].niced = 0; }
     if (tick++ % 3) return;
     const long hz = sysconf(_SC_CLK_TCK) > 0 ? sysconf(_SC_CLK_TCK) : 100;
     const int nc = eu_sample(cur, EU_MAX_THREADS);
     for (int i = 0; i < nst; i++) st[i].seen = 0;
-    int n_slow = 0, n_fast = 0;
+    int n_poll = 0, n_work = 0, n_slow = 0, n_niced = 0;
     for (int i = 0; i < nc; i++) {
         if (strncmp(cur[i].name, "spurs i", 7) && strncmp(cur[i].name, "spu w", 5)) continue;
         const int tid = cur[i].tid;
@@ -878,8 +893,9 @@ static void eu_core_split(void)
         }
         if (k == nst) {   /* first sight: judge it next time */
             if (nst >= EU_MAX_THREADS) continue;
+            memset(&st[nst], 0, sizeof st[nst]);
             st[nst].tid = tid; st[nst].ticks = cur[i].ticks; st[nst].run_ns = run_ns; st[nst].slices = slices;
-            st[nst].where = 0; st[nst].seen = 1;
+            st[nst].seen = 1;
             nst++;
             continue;
         }
@@ -887,48 +903,133 @@ static void eu_core_split(void)
         const unsigned long long ds = slices - st[k].slices;
         const double slice_us = ds ? (double)(run_ns - st[k].run_ns) / (double)ds / 1000.0 : 0.0;
         st[k].ticks = cur[i].ticks; st[k].run_ns = run_ns; st[k].slices = slices; st[k].seen = 1;
-        if (!want) continue;
         int skip = 0;
         if (&g_eu_prime_n) for (int j = 0; j < g_eu_prime_n && j < 4; j++) if (g_eu_prime_tid[j] == tid) skip = 1;
         /* The audio SPU kernel is placed by its own boost. (It cannot be told apart by priority: the runtime
-         * raises every SPU thread to -5 or better, which made the first version of this skip all of them --
+         * raises every SPU thread, which made the first version of this skip all of them --
          * boot-20261111-105043, "0 on the slow cores".) */
         if (!strncmp(cur[i].name, "spurs i1 k0", 11)) skip = 1;
         if (skip) continue;
-        if (st[k].where != 2) {
-            if (pct < 15.0) {
+        if (st[k].cls != 2) st[k].cls = (pct < 15.0 && slice_us < 300.0) ? 2 : 1;
+        else if (pct > 50.0 || slice_us > 500.0 || (st[k].where != 2 && pct >= 25.0)) st[k].cls = 1;
+        if (want_split) {
+            if (st[k].cls == 2 && st[k].where != 2) {
                 if (sched_setaffinity(tid, sizeof slow, &slow) == 0) { st[k].where = 2; to_slow++; }
-            } else if (st[k].where == 0) {
-                if (sched_setaffinity(tid, sizeof fast, &fast) == 0) st[k].where = 1;
+            } else if (st[k].cls == 1 && st[k].where != 1) {
+                const int was = st[k].where;
+                if (sched_setaffinity(tid, sizeof fast, &fast) == 0) { st[k].where = 1; if (was == 2) to_fast++; }
             }
-        } else if (pct > 50.0 || slice_us > 500.0) {
-            if (sched_setaffinity(tid, sizeof fast, &fast) == 0) { st[k].where = 1; to_fast++; }
         }
-        if (st[k].where == 2) n_slow++; else if (st[k].where == 1) n_fast++;
+        if (want_nice) {
+            if (st[k].cls == 2) {
+                errno = 0;
+                const int cur_nice = getpriority(PRIO_PROCESS, (id_t)tid);
+                if (!errno && cur_nice != poll_nice) {
+                    if (!st[k].niced) st[k].nice0 = cur_nice; else renice_again++;   /* the runtime put it back */
+                    if (cur_nice < poll_nice && setpriority(PRIO_PROCESS, (id_t)tid, poll_nice) == 0) st[k].niced = 1;
+                }
+            } else if (st[k].niced) {
+                setpriority(PRIO_PROCESS, (id_t)tid, st[k].nice0);
+                st[k].niced = 0;
+            }
+        }
+        if (st[k].cls == 2) n_poll++; else n_work++;
+        if (st[k].where == 2) n_slow++;
+        if (st[k].niced) n_niced++;
     }
     {   /* forget threads that ended */
         int o = 0;
         for (int i = 0; i < nst; i++) if (st[i].seen) st[o++] = st[i];
         nst = o;
     }
-    if (!want) return;
-    if (!applied) { sched_setaffinity(getpid(), sizeof fast, &fast); applied = 1; }
+    if (want_split && !applied) { sched_setaffinity(getpid(), sizeof fast, &fast); applied = 1; }
     if (++reports <= 4 || reports % 10 == 0)
-        fprintf(stderr, "[split] SPU threads: %d on the slow cores, %d on the faster ones | moves so far: %llu to slow, "
-                "%llu back to fast\n", n_slow, n_fast, to_slow, to_fast);
+        fprintf(stderr, "[split] SPU threads: %d polling, %d working | on the slow cores %d (moves: %llu there, %llu back) | "
+                "at lowered priority %d (put back by the runtime %llu times)\n", n_poll, n_work, n_slow, to_slow, to_fast,
+                n_niced, renice_again);
+}
+
+/* Android's performance hints: name the threads a frame depends on and how long a frame takes against how
+ * long it should; the system may then favour them when it picks cores and speeds. Done through
+ * libandroid.so (Android 13+), started a minute in. EU_PERF_HINT=0 = off. */
+extern volatile unsigned long long g_eu_frames_total __attribute__((weak));
+static void eu_perf_hint_tick(void)
+{
+    static int state, t;   /* 0 not tried, 1 running, -1 unavailable */
+    static void* session;
+    static void* (*get_mgr)(void);
+    static void* (*create)(void*, const int32_t*, size_t, int64_t);
+    static int (*report)(void*, int64_t);
+    static void (*close_s)(void*);
+    static void* mgr;
+    static unsigned long long f_prev;
+    static unsigned long long reports_ok, reports_bad;
+    if (state < 0 || !&g_eu_frames_total) return;
+    if (++t < 60) return;
+    if (!state) {
+        const char* e = getenv("EU_PERF_HINT");
+        if (e && *e == '0') { state = -1; fprintf(stderr, "[hint] Android performance hints: off (EU_PERF_HINT)\n"); return; }
+        fprintf(stderr, "[hint] asking Android for a performance-hint session (if the game stops right after this line, "
+                "set EU_PERF_HINT=0)\n");
+        void* lib = dlopen("libandroid.so", RTLD_NOW);
+        if (lib) {
+            get_mgr = (void* (*)(void))dlsym(lib, "APerformanceHint_getManager");
+            create = (void* (*)(void*, const int32_t*, size_t, int64_t))dlsym(lib, "APerformanceHint_createSession");
+            report = (int (*)(void*, int64_t))dlsym(lib, "APerformanceHint_reportActualWorkDuration");
+            close_s = (void (*)(void*))dlsym(lib, "APerformanceHint_closeSession");
+        }
+        if (!lib || !get_mgr || !create || !report || !close_s || !(mgr = get_mgr())) {
+            state = -1;
+            fprintf(stderr, "[hint] Android performance hints: not available on this phone (%s)\n",
+                    !lib ? "no libandroid.so" : !get_mgr || !create ? "Android older than 13" : "no hint manager");
+            return;
+        }
+        state = 1;
+    }
+    const int want = !(g_eu_live_off & EU_LIVE_PERF_HINT);
+    if (!want) { if (session) { close_s(session); session = NULL; } return; }
+    if (!session) {
+        static eu_tsample cur[EU_MAX_THREADS];
+        int32_t tids[8];
+        size_t n = 0;
+        tids[n++] = (int32_t)getpid();
+        if (&g_eu_prime_n) for (int j = 0; j < g_eu_prime_n && j < 2; j++) tids[n++] = g_eu_prime_tid[j];
+        const int nc = eu_sample(cur, EU_MAX_THREADS);
+        for (int i = 0; i < nc && n < 8; i++)
+            if (!strncmp(cur[i].name, "vk encode", 9) || !strncmp(cur[i].name, "spurs i1 k0", 11)) tids[n++] = cur[i].tid;
+        session = create(mgr, tids, n, 33333333LL);
+        static int told;
+        if (!told) {
+            told = 1;
+            fprintf(stderr, "[hint] Android performance hints: %s for %d thread(s), target 33 ms a frame (EU_PERF_HINT)\n",
+                    session ? "session started" : "the system refused a session", (int)n);
+        }
+        if (!session) { state = -1; return; }
+        f_prev = g_eu_frames_total;
+        return;
+    }
+    const unsigned long long f = g_eu_frames_total;
+    if (f > f_prev) {
+        long long ns = 1000000000LL / (long long)(f - f_prev);
+        if (report(session, ns) == 0) reports_ok++; else reports_bad++;
+    } else if (report(session, 1000000000LL) == 0) reports_ok++; else reports_bad++;
+    f_prev = f;
+    if ((reports_ok + reports_bad) % 60 == 59)
+        fprintf(stderr, "[hint] frame times reported to Android: %llu accepted, %llu rejected\n", reports_ok, reports_bad);
 }
 
 /* In-run comparison. Instead of one run per setting: every EU_AB_SECS (default 20) seconds one of the listed
  * settings is switched off, then everything is on again, then the next one is off, and so on. Frame rate and
  * the main thread's waiting share are measured for each stretch (its first 4 s are left out, things settle),
  * so both states see the same scenes and the same phone temperature.
- * EU_AB=name,name,...  (default EU_CORE_SPLIT,EU_LL_YIELD,EU_MAIN_BOOST,EU_SPURS_PARK; also EU_INDEX_FAST, EU_VK_CB_USED)
+ * EU_AB=name,name,...  (default EU_CORE_SPLIT,EU_SPU_NICE,EU_MAIN_BOOST,EU_PERF_HINT; also EU_LL_YIELD,
+ *                        EU_SPURS_PARK, EU_INDEX_FAST, EU_VK_CB_USED). Which one goes first varies from run to run.
  * EU_AB=0 = no switching. */
-extern volatile unsigned long long g_eu_frames_total __attribute__((weak));
-#define EU_AB_MAX 6
+#define EU_AB_MAX 8
 static struct { const char* name; int bit; } s_ab_known[] = {
     {"EU_CORE_SPLIT", EU_LIVE_CORE_SPLIT}, {"EU_MAIN_BOOST", EU_LIVE_MAIN_BOOST}, {"EU_SPURS_PARK", EU_LIVE_SPURS_PARK},
     {"EU_INDEX_FAST", EU_LIVE_INDEX_FAST}, {"EU_VK_CB_USED", EU_LIVE_CB_USED}, {"EU_LL_YIELD", EU_LIVE_LL_YIELD},
+    {"EU_SPU_NICE", EU_LIVE_SPU_NICE}, {"EU_PERF_HINT", EU_LIVE_PERF_HINT},
 };
 extern volatile unsigned long g_eu_ll_yields __attribute__((weak));
 static int s_ab_n, s_ab_item[EU_AB_MAX];
@@ -957,7 +1058,7 @@ static int eu_ab_table(char* line, int cap)
 }
 static void eu_ab_tick(void)
 {
-    static int init, secs = 20, t = -45, seg;   /* the first 45 s (start-up) are not compared */
+    static int init, secs = 20, t = -45, seg, first;   /* the first 45 s (start-up) are not compared */
     static unsigned long long f0, w0;
     if (!init) {
         init = 1;
@@ -965,7 +1066,7 @@ static void eu_ab_tick(void)
         const char* sv = getenv("EU_AB_SECS");
         if (sv && atoi(sv) >= 8) secs = atoi(sv);
         if (secs > 300) secs = 300;
-        if (!e || !*e) e = "EU_CORE_SPLIT,EU_LL_YIELD,EU_MAIN_BOOST,EU_SPURS_PARK";
+        if (!e || !*e) e = "EU_CORE_SPLIT,EU_SPU_NICE,EU_MAIN_BOOST,EU_PERF_HINT";
         if (&g_eu_frames_total && strcmp(e, "0")) {
             for (unsigned k = 0; k < sizeof s_ab_known / sizeof s_ab_known[0] && s_ab_n < EU_AB_MAX; k++) {
                 const char* hit = strstr(e, s_ab_known[k].name);
@@ -973,6 +1074,7 @@ static void eu_ab_tick(void)
                 if (hit && !(own && *own == '0')) s_ab_item[s_ab_n++] = (int)k;   /* off for the whole run: nothing to compare */
             }
         }
+        if (s_ab_n) first = (int)((unsigned long)time(NULL) % (unsigned long)s_ab_n);
         char list[160] = "";
         for (int i = 0, o = 0; i < s_ab_n; i++) o += snprintf(list + o, sizeof list - o, "%s%s", i ? ", " : "", s_ab_known[s_ab_item[i]].name);
         if (s_ab_n) fprintf(stderr, "[ab] in-run comparison: every %d s one of [%s] is switched off, then all on again "
@@ -984,7 +1086,7 @@ static void eu_ab_tick(void)
     const int at = (t - 1) % secs;   /* second within the stretch */
     if (at == 0) {
         seg = (t - 1) / secs;
-        const int off_item = (seg & 1) ? (seg / 2) % s_ab_n : -1;
+        const int off_item = (seg & 1) ? (seg / 2 + first) % s_ab_n : -1;
         const int old = g_eu_live_off;
         const int now = off_item < 0 ? 0 : s_ab_known[s_ab_item[off_item]].bit;
         g_eu_live_off = now;
@@ -996,7 +1098,7 @@ static void eu_ab_tick(void)
         const double span = (double)(secs - 5);
         const double fps = (double)(g_eu_frames_total - f0) / span;
         const double wait = (double)(eu_main_wait_ns(NULL) - w0) / (span * 1e7);
-        const int off_item = (seg & 1) ? (seg / 2) % s_ab_n : -1;
+        const int off_item = (seg & 1) ? (seg / 2 + first) % s_ab_n : -1;
         const int slot = off_item < 0 ? 0 : 1 + off_item;
         s_ab_acc[slot].fps_sum += fps; s_ab_acc[slot].wait_sum += wait; s_ab_acc[slot].n++;
         char line[900];
@@ -1175,7 +1277,7 @@ static void* eu_cpu_thread(void* arg)
     int np = eu_sample(prev, EU_MAX_THREADS);
     const long hz = sysconf(_SC_CLK_TCK) > 0 ? sysconf(_SC_CLK_TCK) : 100;
     for (;;) {
-        for (int sec = 0; sec < 10; sec++) { sleep(1); eu_ab_tick(); eu_core_split(); eu_prime_sweep(); eu_cores_limit(); }
+        for (int sec = 0; sec < 10; sec++) { sleep(1); eu_ab_tick(); eu_core_split(); eu_prime_sweep(); eu_cores_limit(); eu_perf_hint_tick(); }
         int nc = eu_sample(cur, EU_MAX_THREADS);
         /* Delta per thread, top 10. */
         int idx[EU_MAX_THREADS];

@@ -623,6 +623,13 @@ public final class EuBootActivity extends Activity {
             header.append("# extra settings: ").append(extra).append('\n');
         }
         try {
+            android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+            header.append("# sustained performance mode: ")
+                    .append(pm != null && pm.isSustainedPerformanceModeSupported() ? "supported by this phone" : "not supported by this phone")
+                    .append((" " + extra + " ").contains(" EU_SUSTAINED=0 ") ? ", switched off (EU_SUSTAINED=0)" : ", requested on the game screen")
+                    .append('\n');
+        } catch (Throwable ignored) { }
+        try {
             EuBridge.current = EuBridge.create(new File(workDir(), "bridge.bin"));
             env.put("PS3_ANDROID_BRIDGE", EuBridge.current.file.getAbsolutePath());
         } catch (IOException e) {

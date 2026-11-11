@@ -36,6 +36,12 @@ public final class GameActivity extends Activity implements Choreographer.FrameC
         super.onCreate(saved);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
                 | WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        // Ask for steady speed instead of bursts followed by throttling, where the phone supports it.
+        // EU_SUSTAINED=0 in Extra settings leaves it alone.
+        try {
+            String extra = getSharedPreferences("eu_boot", MODE_PRIVATE).getString("extra_env", "");
+            if (!(" " + extra + " ").contains(" EU_SUSTAINED=0 ")) getWindow().setSustainedPerformanceMode(true);
+        } catch (Throwable ignored) { }
         view = new GameView(this);
         setContentView(view);
         hideSystemUi();
