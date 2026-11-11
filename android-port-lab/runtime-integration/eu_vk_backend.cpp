@@ -112,7 +112,7 @@ namespace {
     X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCmdBindDescriptorSets) \
     X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) X(vkCmdDraw) \
     X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkResetDescriptorPool) X(vkCmdBlitImage) \
-    X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
+    X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) X(vkDestroyDescriptorPool)
 #define EU_VK_DECL(f) PFN_##f f = nullptr;
 EU_VK_GLOBAL(EU_VK_DECL)
 EU_VK_FUNCS(EU_VK_DECL)
@@ -144,7 +144,11 @@ bool load_instance(VkInstance inst)
 /* ------------------------------------------------------------------ limits */
 constexpr u32 MAX_OBJECTS = 4096;
 constexpr u32 MAX_PIPES = 4096;
-constexpr u32 MAX_RECORDS = 8192;
+/* Records one submission can hold. 8192 split most gameplay frames (6000-8000 draws plus clears, copies and
+ * uploads) into two submissions, and the FIFO thread waits at every hand-over. EU_VK_MAX_RECORDS overrides;
+ * falls back to 8192 if the larger descriptor pools cannot be created. */
+u32 g_max_records = 16384;
+#define MAX_RECORDS g_max_records
 constexpr u32 MAX_VIEWS = 256;
 constexpr u32 MAX_SAMPLERS = 256;
 constexpr u32 STAGE_ALIGN = 256;
@@ -3641,21 +3645,33 @@ bool init_device()
                 g_slot[0].qpool ? "on" : "unavailable", bits, (double)g_props.limits.timestampPeriod);
     }
 
-    VkDescriptorPoolSize sizes[] = {
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_RECORDS * 3 + 64},
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAX_RECORDS * 20 + 64 + CAP_TILES},
-        {VK_DESCRIPTOR_TYPE_SAMPLER, MAX_RECORDS * 20 + 64 + CAP_TILES},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_RECORDS + 64},
-    };
-    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpi.maxSets = MAX_RECORDS + 64 + CAP_TILES;
-    dpi.poolSizeCount = (u32)(sizeof sizes / sizeof sizes[0]);
-    dpi.pPoolSizes = sizes;
-    for (u32 k = 0; k < NUM_SLOTS; k++)
-        if (vkCreateDescriptorPool(g_dev, &dpi, nullptr, &g_slot[k].dpool) != VK_SUCCESS) return false;
-    return true;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        VkDescriptorPoolSize sizes[] = {
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_RECORDS * 3 + 64},
+            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAX_RECORDS * 20 + 64 + CAP_TILES},
+            {VK_DESCRIPTOR_TYPE_SAMPLER, MAX_RECORDS * 20 + 64 + CAP_TILES},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024},
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_RECORDS + 64},
+        };
+        VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpi.maxSets = MAX_RECORDS + 64 + CAP_TILES;
+        dpi.poolSizeCount = (u32)(sizeof sizes / sizeof sizes[0]);
+        dpi.pPoolSizes = sizes;
+        bool ok = true;
+        for (u32 k = 0; k < NUM_SLOTS && ok; k++)
+            ok = vkCreateDescriptorPool(g_dev, &dpi, nullptr, &g_slot[k].dpool) == VK_SUCCESS;
+        if (ok) {
+            fprintf(stderr, "[RSX vulkan] up to %u records per submission (EU_VK_MAX_RECORDS)\n", MAX_RECORDS);
+            return true;
+        }
+        for (u32 k = 0; k < NUM_SLOTS; k++)
+            if (g_slot[k].dpool) { vkDestroyDescriptorPool(g_dev, g_slot[k].dpool, nullptr); g_slot[k].dpool = VK_NULL_HANDLE; }
+        if (MAX_RECORDS <= 8192) return false;
+        fprintf(stderr, "[RSX vulkan] descriptor pools for %u records could not be created; using 8192\n", MAX_RECORDS);
+        g_max_records = 8192;
+    }
+    return false;
 }
 
 bool init_resources()
@@ -3757,6 +3773,8 @@ extern "C" int eu_vk_rsx_init(u32 width, u32 height)
 {
     const char* sel = getenv("EU_RSX");
     if (sel && *sel && strcmp(sel, "vulkan") != 0) return -1;
+    { const char* e = getenv("EU_VK_MAX_RECORDS");
+      if (e && atoi(e) >= 1024 && atoi(e) <= 65536) g_max_records = (u32)atoi(e); }
     g_fd_front.rec = (Rec*)calloc(MAX_RECORDS, sizeof(Rec));
     g_fd_back.rec = (Rec*)calloc(MAX_RECORDS, sizeof(Rec));
     if (!g_fd_front.rec || !g_fd_back.rec) return -1;
