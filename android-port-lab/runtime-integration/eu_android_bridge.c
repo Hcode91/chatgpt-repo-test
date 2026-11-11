@@ -1069,6 +1069,63 @@ static void eu_summary(long hz, uint64_t all_ticks, uint64_t spu_ticks, int nspu
     f_prev = frames; run_prev = run; wait_prev = wait;
 }
 
+/* EU_CORES=3-7 (or 3,4,5,6 or 0-2,7): the whole game may use only these cores, like switching cores off in
+ * Winlator. Applied last, once a second, on top of every other placement: a thread keeps whichever of its
+ * allowed cores are in the list, and gets the whole list if none are. Not set = no limit. */
+static void eu_cores_limit(void)
+{
+    static int init, n_allowed;
+    static cpu_set_t allowed;
+    static unsigned long long changed;
+    static int reports;
+    if (!init) {
+        init = 1;
+        const char* e = getenv("EU_CORES");
+        long ncpu = sysconf(_SC_NPROCESSORS_CONF);
+        if (ncpu > 32) ncpu = 32;
+        CPU_ZERO(&allowed);
+        for (const char* p = e; p && *p;) {
+            while (*p == ',' || *p == ' ') p++;
+            if (*p < '0' || *p > '9') break;
+            char* end;
+            long a = strtol(p, &end, 10), b = a;
+            if (*end == '-') b = strtol(end + 1, &end, 10);
+            for (long c = a; c <= b && c < ncpu; c++) if (c >= 0 && !CPU_ISSET((int)c, &allowed)) { CPU_SET((int)c, &allowed); n_allowed++; }
+            p = end;
+        }
+        if (e && *e) {
+            char list[80] = "";
+            for (int c = 0, o = 0; c < 32 && o < 70; c++) if (CPU_ISSET(c, &allowed)) o += snprintf(list + o, sizeof list - o, " %d", c);
+            if (n_allowed) fprintf(stderr, "[cores-limit] the game is confined to core(s)%s (EU_CORES=%s)\n", list, e);
+            else fprintf(stderr, "[cores-limit] EU_CORES=%s names no core of this phone: ignored\n", e);
+        }
+    }
+    if (!n_allowed) return;
+    DIR* d = opendir("/proc/self/task");
+    if (!d) return;
+    struct dirent* e;
+    unsigned long long now_changed = 0;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        const int tid = atoi(e->d_name);
+        cpu_set_t set, want;
+        CPU_ZERO(&set);
+        if (sched_getaffinity(tid, sizeof set, &set) != 0) continue;
+        CPU_ZERO(&want);
+        int keep = 0, outside = 0;
+        for (int c = 0; c < 32; c++) {
+            if (!CPU_ISSET(c, &set)) continue;
+            if (CPU_ISSET(c, &allowed)) { CPU_SET(c, &want); keep++; } else outside++;
+        }
+        if (!outside) continue;
+        if (sched_setaffinity(tid, sizeof want, keep ? &want : &allowed) == 0) now_changed++;
+    }
+    closedir(d);
+    changed += now_changed;
+    if (now_changed && (++reports <= 3 || reports % 30 == 0))
+        fprintf(stderr, "[cores-limit] moved %llu thread(s) onto the allowed cores (%llu so far)\n", now_changed, changed);
+}
+
 /* All CPU use, grouped by thread name with digits dropped ("spu w0 lane3" -> "spu w lane"): the [cpu] line
  * lists only the ten busiest threads, and ~250% of a core was unaccounted for across ~100 others. */
 static void eu_cpu_groups(const eu_tsample* cur, const uint64_t* dt, int nc, long hz)
@@ -1118,7 +1175,7 @@ static void* eu_cpu_thread(void* arg)
     int np = eu_sample(prev, EU_MAX_THREADS);
     const long hz = sysconf(_SC_CLK_TCK) > 0 ? sysconf(_SC_CLK_TCK) : 100;
     for (;;) {
-        for (int sec = 0; sec < 10; sec++) { sleep(1); eu_ab_tick(); eu_core_split(); eu_prime_sweep(); }
+        for (int sec = 0; sec < 10; sec++) { sleep(1); eu_ab_tick(); eu_core_split(); eu_prime_sweep(); eu_cores_limit(); }
         int nc = eu_sample(cur, EU_MAX_THREADS);
         /* Delta per thread, top 10. */
         int idx[EU_MAX_THREADS];
