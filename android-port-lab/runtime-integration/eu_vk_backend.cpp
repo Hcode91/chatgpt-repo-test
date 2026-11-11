@@ -3157,6 +3157,8 @@ bool stage_vs_constants_used(const Pipe& p, const u8* data, u32 bytes, u32* off)
     g_cb_used_blocks++;
     return true;
 }
+/* Settings the in-run comparison (eu_android_bridge.c) has switched off right now; bit 16 = EU_VK_CB_USED. */
+extern "C" { extern volatile int g_eu_live_off __attribute__((weak)); }
 void be_bind_vs_constants(void*, const void* data, u32 bytes)
 {
     static int used_on = -1;
@@ -3168,7 +3170,7 @@ void be_bind_vs_constants(void*, const void* data, u32 bytes)
     }
     const u32 ph = g_pending.pipeline;
     bool done = false;
-    if (used_on && data && bytes && ph && ph <= g_pipe_count && g_pipe[ph - 1].vs_nruns)
+    if (used_on && !(&g_eu_live_off && (g_eu_live_off & 16)) && data && bytes && ph && ph <= g_pipe_count && g_pipe[ph - 1].vs_nruns)
         done = stage_vs_constants_used(g_pipe[ph - 1], (const u8*)data, bytes, &g_pending.vs_cb_off);
     if (!done && !stage_constants(0, data, bytes, &g_pending.vs_cb_off)) bytes = 0;
     g_pending.vs_cb_bytes = bytes;
@@ -3286,10 +3288,15 @@ void be_clear_depth_stencil(void*, u32 depth, u32 flags, float depth_value, u8 s
 /* What is being shown: grey/black screens are usually a presented surface
  * nothing drew into this frame, so log that. */
 u32 g_pres_unwritten, g_pres_cleared_only, g_pres_missing, g_pres_total;
+extern "C" {
+/* Frames presented since start, for the in-run comparison and the summary (eu_android_bridge.c). */
+volatile unsigned long long g_eu_frames_total;
+}
 void present_diag(u32 surface)
 {
     static u32 last_surface, logged;
     g_pres_total++;
+    g_eu_frames_total = g_eu_frames_total + 1;
     Obj* o = obj(surface);
     if (!o) {
         g_pres_missing++;
