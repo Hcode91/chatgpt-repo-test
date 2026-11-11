@@ -2206,4 +2206,50 @@ static inline void ll_acq(volatile long* l)
 #else
 static inline void ll_acq(volatile long* l) { while (__atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE)) { while (__atomic_load_n(l, __ATOMIC_RELAXED)) { } } }
 #endif""")
+# One SPU thread per workload at a time, as the game asks for. Every inFAMOUS workload is created with
+# maxContention=1; the PC port runs each workload's five lanes on five threads at once anyway ("parallel lane
+# mode") because a desktop has cores to spare. On an 8-core phone that is 32 extra threads competing with the
+# 12 kernel threads, the main thread and the renderer. EU_SPU_SERIAL (default on) takes the port's own serial
+# path instead: the owning kernel thread visits the lanes in turn and the lane threads stay asleep.
+# EU_SPU_SERIAL=0 = parallel as before; EU_SPU_SERIAL_WIDS=0,5,7 limits it to those workloads.
+change("libs/spurs/cellSpurs.c",
+"""static int spurs_parallel_sweep_allowed(u32 wid, u32 lanes, u32 maxcont)
+{
+    if (lanes <= 1 || !spurs_par_lanes_wid(wid)) return 0;
+""",
+"""#if defined(__ANDROID__)
+static volatile long s_eu_serial_passes, s_eu_parallel_passes;
+static int eu_spu_serial(u32 wid)
+{
+    extern volatile int g_eu_live_off __attribute__((weak));   /* eu_android_bridge.c: bit 256 = parallel again for now */
+    static int on = -1; static u32 mask = 0xFFFFu;
+    if (on < 0) {
+        const char* e = getenv("EU_SPU_SERIAL"); const char* m = getenv("EU_SPU_SERIAL_WIDS");
+        if (m && *m) { mask = 0;
+            for (const char* q = m; *q; ) { while (*q == ',' || *q == ' ') q++; if (!*q) break;
+                int w = atoi(q); if (w >= 0 && w < 16) mask |= 1u << w; while (*q && *q != ',') q++; } }
+        const int v = (e && *e == '0') ? 0 : 1;
+        fprintf(stderr, "[serial] one SPU thread per workload at a time (the game's own limit), workload mask 0x%04X: %s (EU_SPU_SERIAL)\\n",
+                (unsigned)mask, v ? "on" : "off");
+        on = v;
+    }
+    if (!on || wid >= 16 || !((mask >> wid) & 1u)) return 0;
+    return !(&g_eu_live_off && (g_eu_live_off & 256));
+}
+#endif
+static int spurs_parallel_sweep_allowed(u32 wid, u32 lanes, u32 maxcont)
+{
+    if (lanes <= 1 || !spurs_par_lanes_wid(wid)) return 0;
+#if defined(__ANDROID__)
+    if (eu_spu_serial(wid)) { InterlockedIncrement(&s_eu_serial_passes); return 0; }
+    InterlockedIncrement(&s_eu_parallel_passes);
+#endif
+""")
+# report the split in the existing [park] line
+change("libs/spurs/cellSpurs.c",
+"""                            fprintf(stderr, "[park] 10s: idle kernel threads parked %ld times, %ld ended by a kick\\n",
+                                    InterlockedExchange(&s_eu_park_n, 0), InterlockedExchange(&s_eu_park_kicked, 0));""",
+"""                            fprintf(stderr, "[park] 10s: idle kernel threads parked %ld times, %ld ended by a kick | workload passes: %ld one thread at a time, %ld on lane threads\\n",
+                                    InterlockedExchange(&s_eu_park_n, 0), InterlockedExchange(&s_eu_park_kicked, 0),
+                                    InterlockedExchange(&s_eu_serial_passes, 0), InterlockedExchange(&s_eu_parallel_passes, 0));""")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
