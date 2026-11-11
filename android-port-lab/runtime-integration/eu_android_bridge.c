@@ -619,6 +619,101 @@ static int eu_sample(eu_tsample* out, int cap)
     return n;
 }
 
+/* Why a busy thread is not getting CPU: is the phone slowing its cores (heat), or are too many threads
+ * waiting for the same cores? Every 10 s:
+ *  [cores]   each core's current and currently allowed top speed against its design top speed (a lowered
+ *            allowed speed is the phone throttling), plus whatever temperatures the app may read;
+ *  [waiting] for the busiest threads: the core each last ran on and the share of the 10 s it spent ready
+ *            to run but waiting for a core (from the kernel's own per-thread scheduling statistics). */
+static long eu_read_long(const char* path)
+{
+    FILE* f = fopen(path, "r");
+    if (!f) return -1;
+    long v = -1;
+    if (fscanf(f, "%ld", &v) != 1) v = -1;
+    fclose(f);
+    return v;
+}
+static void eu_cores_report(const eu_tsample* cur, const int* idx, const uint64_t* dt, int nc)
+{
+    char line[1024];
+    int off = snprintf(line, sizeof line, "[cores] MHz now/allowed/design:");
+    long ncpu = sysconf(_SC_NPROCESSORS_CONF);
+    if (ncpu > 16) ncpu = 16;
+    for (long c = 0; c < ncpu && off < (int)sizeof line - 40; c++) {
+        char path[96];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/cpufreq/scaling_cur_freq", c);
+        const long now = eu_read_long(path);
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/cpufreq/scaling_max_freq", c);
+        const long cap = eu_read_long(path);
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", c);
+        const long top = eu_read_long(path);
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/online", c);
+        const long on = eu_read_long(path);
+        if (on == 0) off += snprintf(line + off, sizeof line - off, " cpu%ld OFF", c);
+        else off += snprintf(line + off, sizeof line - off, " cpu%ld %ld/%ld/%ld", c, now / 1000, cap / 1000, top / 1000);
+    }
+    const long batt = eu_read_long("/sys/class/power_supply/battery/temp");
+    if (batt > 0) off += snprintf(line + off, sizeof line - off, " | battery %.1f C", batt / 10.0);
+    int shown = 0;
+    for (int z = 0; z < 100 && shown < 6 && off < (int)sizeof line - 48; z++) {
+        char path[96], type[40] = "";
+        snprintf(path, sizeof path, "/sys/class/thermal/thermal_zone%d/type", z);
+        FILE* f = fopen(path, "r");
+        if (!f) { if (z > 8 && !shown) break; continue; }
+        if (!fgets(type, sizeof type, f)) type[0] = 0;
+        fclose(f);
+        type[strcspn(type, "\n")] = 0;
+        if (!strstr(type, "cpu") && !strstr(type, "gpu") && !strstr(type, "skin") && !strstr(type, "soc")) continue;
+        snprintf(path, sizeof path, "/sys/class/thermal/thermal_zone%d/temp", z);
+        const long t = eu_read_long(path);
+        if (t <= 0) continue;
+        off += snprintf(line + off, sizeof line - off, " %s %.0f C", type, t > 1000 ? t / 1000.0 : (double)t);
+        shown++;
+    }
+    fprintf(stderr, "%s\n", line);
+
+    static struct { int tid; unsigned long long wait_ns; } prev[16];
+    static int nprev;
+    struct { int tid; unsigned long long wait_ns; } now[16];
+    int nnow = 0;
+    off = snprintf(line, sizeof line, "[waiting] ready but waiting for a core, share of the last 10 s:");
+    for (int k = 0; k < nc && k < 8 && off < (int)sizeof line - 64; k++) {
+        if (!dt[idx[k]]) break;
+        const int tid = cur[idx[k]].tid;
+        char path[64], buf[512];
+        unsigned long long run_ns = 0, wait_ns = 0;
+        snprintf(path, sizeof path, "/proc/self/task/%d/schedstat", tid);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+        const int got = fscanf(f, "%llu %llu", &run_ns, &wait_ns);
+        fclose(f);
+        if (got != 2) continue;
+        int core = -1;
+        snprintf(path, sizeof path, "/proc/self/task/%d/stat", tid);
+        f = fopen(path, "r");
+        if (f) {
+            const size_t n = fread(buf, 1, sizeof buf - 1, f);
+            fclose(f);
+            buf[n] = 0;
+            const char* q = strrchr(buf, ')');
+            /* field 39 (processor) is the 37th field after the closing bracket */
+            for (int fld = 0; q && fld < 37; fld++) { q = strchr(q + 1, ' '); }
+            if (q) core = atoi(q + 1);
+        }
+        unsigned long long before = wait_ns;
+        for (int j = 0; j < nprev; j++) if (prev[j].tid == tid) { before = prev[j].wait_ns; break; }
+        off += snprintf(line + off, sizeof line - off, " %s/%d %.0f%% (cpu%d)", cur[idx[k]].name, tid,
+                        (double)(wait_ns - before) / 1e8, core);
+        now[nnow].tid = tid;
+        now[nnow].wait_ns = wait_ns;
+        nnow++;
+    }
+    memcpy(prev, now, sizeof now);
+    nprev = nnow;
+    fprintf(stderr, "%s\n", line);
+}
+
 static void* eu_cpu_thread(void* arg)
 {
     (void)arg;
@@ -652,6 +747,7 @@ static void* eu_cpu_thread(void* arg)
                             100.0 * (double)dt[idx[k]] / (double)(hz * 10));
         }
         fprintf(stderr, "%s\n", line);
+        eu_cores_report(cur, idx, dt, nc);
         /* Where the two busiest threads spend their time. */
         for (int k = 0; k < nc && k < 2; k++) {
             if (dt[idx[k]] * 2 < (uint64_t)(hz * 10)) break;   /* only threads above 50% */
