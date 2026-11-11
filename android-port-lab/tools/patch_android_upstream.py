@@ -1664,6 +1664,9 @@ change("libs/audio/cellAudio.c",
  * mode 0: any core faster than the slowest cluster; 1: the fastest core(s) only; 2: faster cores except the
  * fastest (so whatever is given mode 1 has that core to itself). */
 void eu_thread_place(const char* what, int nice_val, int mode);
+/* threads given the fastest core (mode 1); the bridge keeps every other thread off that core */
+int g_eu_prime_tid[4];
+int g_eu_prime_n;
 void eu_thread_boost(const char* what, int nice_val) { eu_thread_place(what, nice_val, 0); }
 void eu_thread_place(const char* what, int nice_val, int mode)
 {
@@ -1693,6 +1696,7 @@ void eu_thread_place(const char* what, int nice_val, int mode)
     }
     const int aff = nfast ? sched_setaffinity(tid, sizeof set, &set) : -1;
     const int aff_err = aff ? errno : 0;
+    if (mode == 1 && aff == 0 && g_eu_prime_n < 4) g_eu_prime_tid[g_eu_prime_n++] = (int)tid;
     const int pr = setpriority(PRIO_PROCESS, (id_t)tid, nice_val);
     const int pr_err = pr ? errno : 0;
     fprintf(stderr, "[boost] %s (tid %d): priority %d %s, %s (%d core(s), placement %d)\\n", what, (int)tid, nice_val,
