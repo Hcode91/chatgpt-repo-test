@@ -212,6 +212,7 @@ void eu_bridge_frame(const uint32_t* fb, unsigned w, unsigned h)
  *  - CPU sampler: every 10 s, the busiest threads by CPU time.
  * ====================================================================== */
 #include <dirent.h>
+#include <sched.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <signal.h>
@@ -714,6 +715,105 @@ static void eu_cores_report(const eu_tsample* cur, const int* idx, const uint64_
     fprintf(stderr, "%s\n", line);
 }
 
+/* The RSX FIFO thread is pinned to the fastest core, but everything else was still allowed there and it
+ * spent 32-46% of its time waiting for it (boot-20261111-090128). Take that core out of every other
+ * thread's allowed set. Threads start all the time, so this is repeated. EU_PRIME_EXCLUSIVE=0 = off. */
+extern int g_eu_prime_tid[4] __attribute__((weak));
+extern int g_eu_prime_n __attribute__((weak));
+static void eu_prime_sweep(void)
+{
+    static int on = -1;
+    static cpu_set_t prime;
+    static int have_prime;
+    static unsigned long long moved, sweeps;
+    if (on < 0) {
+        const char* e = getenv("EU_PRIME_EXCLUSIVE");
+        on = (e && *e == '0') ? 0 : 1;
+        long ncpu = sysconf(_SC_NPROCESSORS_CONF);
+        if (ncpu > 32) ncpu = 32;
+        long top = 0, f[32];
+        for (long c = 0; c < ncpu; c++) {
+            char path[96];
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", c);
+            f[c] = eu_read_long(path);
+            if (f[c] > top) top = f[c];
+        }
+        CPU_ZERO(&prime);
+        int nprime = 0;
+        for (long c = 0; c < ncpu; c++) if (top > 0 && f[c] == top) { CPU_SET((int)c, &prime); nprime++; }
+        have_prime = nprime > 0 && nprime < ncpu;
+        fprintf(stderr, "[boost] fastest core reserved for the RSX FIFO thread: %s (EU_PRIME_EXCLUSIVE), %d such core(s)\n",
+                on && have_prime ? "on" : "off", nprime);
+    }
+    if (!on || !have_prime || !&g_eu_prime_n || g_eu_prime_n <= 0) return;
+    DIR* d = opendir("/proc/self/task");
+    if (!d) return;
+    struct dirent* e;
+    unsigned long long now_moved = 0;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        const int tid = atoi(e->d_name);
+        int is_prime = 0;
+        for (int k = 0; k < g_eu_prime_n && k < 4; k++) if (g_eu_prime_tid[k] == tid) is_prime = 1;
+        if (is_prime) continue;
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        if (sched_getaffinity(tid, sizeof set, &set) != 0) continue;
+        int touched = 0, left = 0;
+        for (int c = 0; c < 32; c++) {
+            if (!CPU_ISSET(c, &set)) continue;
+            if (CPU_ISSET(c, &prime)) { CPU_CLR(c, &set); touched = 1; }
+            else left++;
+        }
+        if (touched && left && sched_setaffinity(tid, sizeof set, &set) == 0) now_moved++;
+    }
+    closedir(d);
+    moved += now_moved;
+    if (now_moved && (++sweeps <= 3 || sweeps % 20 == 0))
+        fprintf(stderr, "[boost] kept %llu more thread(s) off the fastest core (%llu so far)\n", now_moved, moved);
+}
+
+/* All CPU use, grouped by thread name with digits dropped ("spu w0 lane3" -> "spu w lane"): the [cpu] line
+ * lists only the ten busiest threads, and ~250% of a core was unaccounted for across ~100 others. */
+static void eu_cpu_groups(const eu_tsample* cur, const uint64_t* dt, int nc, long hz)
+{
+    static struct { char name[20]; uint64_t ticks; int n; } g[96];
+    int ng = 0;
+    for (int i = 0; i < nc; i++) {
+        if (!dt[i]) continue;
+        char key[20];
+        int o = 0;
+        for (const char* p = cur[i].name; *p && o < (int)sizeof key - 1; p++)
+            if (*p < '0' || *p > '9') key[o++] = *p;
+        key[o] = 0;
+        int k = 0;
+        for (; k < ng; k++) if (strcmp(g[k].name, key) == 0) break;
+        if (k == ng) {
+            if (ng >= 96) continue;
+            snprintf(g[ng].name, sizeof g[ng].name, "%s", key);
+            g[ng].ticks = 0;
+            g[ng].n = 0;
+            ng++;
+        }
+        g[k].ticks += dt[i];
+        g[k].n++;
+    }
+    for (int a = 0; a < ng; a++)
+        for (int b = a + 1; b < ng; b++)
+            if (g[b].ticks > g[a].ticks) { __typeof__(g[0]) t = g[a]; g[a] = g[b]; g[b] = t; }
+    char line[1024];
+    int off = snprintf(line, sizeof line, "[cpu-groups] 10s, %% of one core by thread name (threads):");
+    double rest = 0;
+    for (int k = 0; k < ng; k++) {
+        const double pct = 100.0 * (double)g[k].ticks / (double)(hz * 10);
+        if (pct >= 3.0 && off < (int)sizeof line - 48)
+            off += snprintf(line + off, sizeof line - off, " %s %.0f%% (%d)", g[k].name, pct, g[k].n);
+        else rest += pct;
+    }
+    snprintf(line + off, sizeof line - off, " | everything else %.0f%%", rest);
+    fprintf(stderr, "%s\n", line);
+}
+
 static void* eu_cpu_thread(void* arg)
 {
     (void)arg;
@@ -722,7 +822,7 @@ static void* eu_cpu_thread(void* arg)
     int np = eu_sample(prev, EU_MAX_THREADS);
     const long hz = sysconf(_SC_CLK_TCK) > 0 ? sysconf(_SC_CLK_TCK) : 100;
     for (;;) {
-        sleep(10);
+        for (int sec = 0; sec < 10; sec++) { sleep(1); eu_prime_sweep(); }
         int nc = eu_sample(cur, EU_MAX_THREADS);
         /* Delta per thread, top 10. */
         int idx[EU_MAX_THREADS];
@@ -748,6 +848,7 @@ static void* eu_cpu_thread(void* arg)
         }
         fprintf(stderr, "%s\n", line);
         eu_cores_report(cur, idx, dt, nc);
+        eu_cpu_groups(cur, dt, nc, hz);
         /* Where the two busiest threads spend their time. */
         for (int k = 0; k < nc && k < 2; k++) {
             if (dt[idx[k]] * 2 < (uint64_t)(hz * 10)) break;   /* only threads above 50% */
