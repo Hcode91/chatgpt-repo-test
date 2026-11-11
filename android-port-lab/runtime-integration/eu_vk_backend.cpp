@@ -2862,8 +2862,8 @@ extern "C" int eu_vk_pull_ok(void)
     static int on = -1;
     if (on < 0) {
         const char* e = getenv("EU_VK_PULL");
-        on = (e && *e == '1') ? 1 : 0;   /* default off: the start screen drew wrongly with it (boot-20261110-154129) */
-        fprintf(stderr, "[RSX vulkan] vertex fetch on the GPU: %s (EU_VK_PULL=1 turns it on)\n", on ? "on" : "off");
+        on = (e && *e == '0') ? 0 : 1;   /* default on since boot-20261111-004009: 16-18 us per draw against 23-25 on the CPU */
+        fprintf(stderr, "[RSX vulkan] vertex fetch on the GPU: %s (EU_VK_PULL=0 turns it off)\n", on ? "on" : "off");
     }
     return on && g_active;
 }
