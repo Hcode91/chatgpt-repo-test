@@ -735,6 +735,7 @@ volatile int g_eu_live_off;
 #define EU_LIVE_SPU_NICE 64
 #define EU_LIVE_PERF_HINT 128
 #define EU_LIVE_SPU_SERIAL 256
+#define EU_LIVE_SHORT_SPIN 512
 static int s_main_nice;   /* 0 = main thread not boosted */
 static void eu_prime_sweep(void)
 {
@@ -1175,16 +1176,17 @@ static void eu_perf_hint_tick(void)
  * settings is switched off, then everything is on again, then the next one is off, and so on. Frame rate and
  * the main thread's waiting share are measured for each stretch (its first 4 s are left out, things settle),
  * so both states see the same scenes and the same phone temperature.
- * EU_AB=name,name,...  (default EU_SPU_NICE,EU_LL_YIELD; also EU_MAIN_BOOST, EU_PERF_HINT, EU_SPU_SERIAL,
+ * EU_AB=name,name,...  (default EU_SHORT_SPIN,EU_SPU_NICE; also EU_LL_YIELD, EU_MAIN_BOOST, EU_PERF_HINT, EU_SPU_SERIAL,
  *                        EU_CORE_SPLIT, EU_SPURS_PARK, EU_INDEX_FAST, EU_VK_CB_USED). Which one goes first varies from run to run.
  * EU_AB=0 = no switching. */
-#define EU_AB_MAX 9
+#define EU_AB_MAX 10
 static struct { const char* name; int bit; } s_ab_known[] = {
     {"EU_CORE_SPLIT", EU_LIVE_CORE_SPLIT}, {"EU_MAIN_BOOST", EU_LIVE_MAIN_BOOST}, {"EU_SPURS_PARK", EU_LIVE_SPURS_PARK},
     {"EU_INDEX_FAST", EU_LIVE_INDEX_FAST}, {"EU_VK_CB_USED", EU_LIVE_CB_USED}, {"EU_LL_YIELD", EU_LIVE_LL_YIELD},
     {"EU_SPU_NICE", EU_LIVE_SPU_NICE}, {"EU_PERF_HINT", EU_LIVE_PERF_HINT},
-    {"EU_SPU_SERIAL", EU_LIVE_SPU_SERIAL},
+    {"EU_SPU_SERIAL", EU_LIVE_SPU_SERIAL}, {"EU_SHORT_SPIN", EU_LIVE_SHORT_SPIN},
 };
+extern volatile unsigned long g_eu_short_spins __attribute__((weak));
 extern volatile unsigned long g_eu_ll_yields __attribute__((weak));
 static int s_ab_n, s_ab_item[EU_AB_MAX];
 static struct { double fps_sum, wait_sum; int n; } s_ab_acc[EU_AB_MAX + 1];   /* [0] all on, [1+i] item i off */
@@ -1220,7 +1222,7 @@ static void eu_ab_tick(void)
         const char* sv = getenv("EU_AB_SECS");
         if (sv && atoi(sv) >= 8) secs = atoi(sv);
         if (secs > 300) secs = 300;
-        if (!e || !*e) e = "EU_SPU_NICE,EU_LL_YIELD";
+        if (!e || !*e) e = "EU_SHORT_SPIN,EU_SPU_NICE";
         if (&g_eu_frames_total && strcmp(e, "0")) {
             for (unsigned k = 0; k < sizeof s_ab_known / sizeof s_ab_known[0] && s_ab_n < EU_AB_MAX; k++) {
                 const char* hit = strstr(e, s_ab_known[k].name);
@@ -1310,6 +1312,12 @@ static void eu_summary(long hz, uint64_t all_ticks, uint64_t spu_ticks, int nspu
         }
         fprintf(stderr, "[summary] fastest core allowed %ld of %ld MHz%s; hottest chip sensor %ld C\n", best_cap / 1000,
                 best_top / 1000, best_cap > 0 && best_cap < best_top ? " (phone is holding it back)" : "", hottest);
+    }
+    if (&g_eu_short_spins) {
+        static unsigned long sp_prev;
+        const unsigned long sp = g_eu_short_spins;
+        fprintf(stderr, "[summary] main thread's short job-poll sleeps answered by spinning: %lu this minute\n", sp - sp_prev);
+        sp_prev = sp;
     }
     if (&g_eu_ll_yields) {
         static unsigned long y_prev;

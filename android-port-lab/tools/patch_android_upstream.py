@@ -2267,8 +2267,7 @@ change("runtime/spu/spu_channels.c",
 """,
 """#if defined(__ANDROID__)
 /* ---- job recorder ----
- * Saves complete runs of one job module (default: the costliest one in boot-20261111-182540, signature
- * 434ec20243de...) to <game folder>/eu_logs/jobrec-<sig>.bin: registers and local store at entry, every
+ * Saves complete runs of one job module (EU_JOBREC=434ec20243de is the costliest one in boot-20261111-182540) to <game folder>/eu_logs/jobrec-<sig>.bin: registers and local store at entry, every
  * memory transfer and channel access during the run, registers and local store at exit. A native version
  * of the job is then written and checked against these on a desktop before it runs on a phone.
  *   EU_JOBREC=<first hex digits of the module signature> (0 = off), EU_JOBREC_FIRST (300), EU_JOBREC_EVERY
@@ -2329,7 +2328,7 @@ static void eu_jobrec_begin(spu_context* ctx, uint32_t pc)
     if (s_eu_rec_on < 0) {
         const char* e = getenv("EU_JOBREC"); const char* a = getenv("EU_JOBREC_FIRST");
         const char* b = getenv("EU_JOBREC_EVERY"); const char* c = getenv("EU_JOBREC_MAX");
-        if (!e || !*e) e = "434ec20243de";
+        if (!e || !*e) e = "0";   /* off unless asked for: the 24 runs of 434ec20243de are in hand */
         int n = 0;
         if (strcmp(e, "0")) for (; n < 16 && e[2 * n] && e[2 * n + 1]; n++) {
             unsigned v = 0; if (sscanf(e + 2 * n, "%2x", &v) != 1) break; s_eu_rec_sig[n] = (uint8_t)v; }
@@ -2545,4 +2544,65 @@ static inline int mfc_do_transfer_eu_inner(spu_context* spu, uint32_t lsa, uint6
                                             uint32_t size, uint32_t cmd)
 {
 """)
+# The game's main thread waits for SPU jobs by polling: check a counter, sys_timer_usleep(1) (5 at one
+# site), check again (func_002CFFE0 / func_001167C8). On Windows the runtime answers sleeps of 50 us or less
+# with a PAUSE spin to the deadline (its v54 note: with a real yield "the main PPU thread spent about 30% of
+# wall time here"). Everything else fell through to nanosleep: on Android that is 50 us of timer slack at
+# best, and the thread gives its core away each time and queues for another on a phone whose cores are all
+# busy. boot-20261111-234138: a third of all main-thread samples were inside these sleeps and the thread
+# was ready-but-waiting for a core 39-47% of the time. Same answer as on Windows, for the main thread only
+# (a background thread that polls forever must not turn into a spinning core).
+# EU_SHORT_SPIN=0 = nanosleep as before.
+change("runtime/syscalls/sys_timer.c",
+"""#else
+    if (usec > 0) {
+        struct timespec ts;
+        ts.tv_sec  = (time_t)(usec / 1000000);
+        ts.tv_nsec = (long)((usec % 1000000) * 1000);
+        nanosleep(&ts, NULL);
+    }
+#endif
+
+    return CELL_OK;
+}""",
+"""#else
+    if (usec > 0) {
+#if defined(__ANDROID__)
+        if (usec <= 50) {
+            extern volatile int g_eu_live_off __attribute__((weak));   /* eu_android_bridge.c: bit 512 = sleep for now */
+            static int s_on = -1;
+            static __thread int t_is_main = -1;
+            if (s_on < 0) {
+                const char* e = getenv("EU_SHORT_SPIN");
+                s_on = (e && *e == '0') ? 0 : 1;
+                fprintf(stderr, "[timer] main-thread sleeps of 50 us or less are spun to their deadline, not slept: %s (EU_SHORT_SPIN)\\n", s_on ? "on" : "off");
+            }
+            if (t_is_main < 0) t_is_main = (gettid() == getpid());
+            if (s_on && t_is_main && !(&g_eu_live_off && (g_eu_live_off & 512))) {
+                struct timespec t0, t1;
+                clock_gettime(CLOCK_MONOTONIC, &t0);
+                const long long deadline = (long long)t0.tv_sec * 1000000000LL + t0.tv_nsec + (long long)usec * 1000LL;
+                do {
+#if defined(__aarch64__)
+                    __asm__ __volatile__("yield"); __asm__ __volatile__("yield"); __asm__ __volatile__("yield"); __asm__ __volatile__("yield");
+#endif
+                    clock_gettime(CLOCK_MONOTONIC, &t1);
+                } while ((long long)t1.tv_sec * 1000000000LL + t1.tv_nsec < deadline);
+                { extern volatile unsigned long g_eu_short_spins; g_eu_short_spins = g_eu_short_spins + 1; }
+                return CELL_OK;
+            }
+        }
+#endif
+        struct timespec ts;
+        ts.tv_sec  = (time_t)(usec / 1000000);
+        ts.tv_nsec = (long)((usec % 1000000) * 1000);
+        nanosleep(&ts, NULL);
+    }
+#endif
+
+    return CELL_OK;
+}
+#if defined(__ANDROID__)
+volatile unsigned long g_eu_short_spins;   /* main-thread short sleeps answered by spinning (reported in [summary]) */
+#endif""")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
