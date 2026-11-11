@@ -815,7 +815,7 @@ static void eu_prime_sweep(void)
  *   polling: under 15% of a core and never running for more than 0.3 ms at a stretch
  *   working: over 50%, or running for more than 0.5 ms at a stretch, or 25%+ on a faster core
  * and two independent things are done with that:
- *   EU_CORE_SPLIT (default on): polling threads go to the slow cores, working ones and the main thread to
+ *   EU_CORE_SPLIT=1 (default off, it never measured faster): polling threads go to the slow cores, working ones and the main thread to
  *     the faster cores;
  *   EU_SPU_NICE (default on): polling threads drop to normal priority (EU_SPU_POLL_NICE, default 0), so a
  *     poll no longer interrupts the main thread; back to their own priority when they start working.
@@ -834,7 +834,7 @@ static void eu_core_split(void)
         const char* e = getenv("EU_CORE_SPLIT");
         const char* ne = getenv("EU_SPU_NICE");
         const char* pn = getenv("EU_SPU_POLL_NICE");
-        on_split = (e && *e == '0') ? 0 : 1;
+        on_split = (e && *e == '1') ? 1 : 0;   /* default off: no gain in four runs, 9.8 frames/s without it against 6.3-7.1 with (boot-20261111-182540) */
         on_nice = (ne && *ne == '0') ? 0 : 1;
         poll_nice = (pn && *pn) ? atoi(pn) : 0;
         if (poll_nice < -10) poll_nice = -10;
@@ -1026,8 +1026,8 @@ static void eu_perf_hint_tick(void)
  * settings is switched off, then everything is on again, then the next one is off, and so on. Frame rate and
  * the main thread's waiting share are measured for each stretch (its first 4 s are left out, things settle),
  * so both states see the same scenes and the same phone temperature.
- * EU_AB=name,name,...  (default EU_SPU_SERIAL,EU_CORE_SPLIT,EU_SPU_NICE; also EU_MAIN_BOOST, EU_PERF_HINT,
- *                        EU_LL_YIELD, EU_SPURS_PARK, EU_INDEX_FAST, EU_VK_CB_USED). Which one goes first varies from run to run.
+ * EU_AB=name,name,...  (default EU_SPU_NICE,EU_LL_YIELD; also EU_MAIN_BOOST, EU_PERF_HINT, EU_SPU_SERIAL,
+ *                        EU_CORE_SPLIT, EU_SPURS_PARK, EU_INDEX_FAST, EU_VK_CB_USED). Which one goes first varies from run to run.
  * EU_AB=0 = no switching. */
 #define EU_AB_MAX 9
 static struct { const char* name; int bit; } s_ab_known[] = {
@@ -1071,7 +1071,7 @@ static void eu_ab_tick(void)
         const char* sv = getenv("EU_AB_SECS");
         if (sv && atoi(sv) >= 8) secs = atoi(sv);
         if (secs > 300) secs = 300;
-        if (!e || !*e) e = "EU_SPU_SERIAL,EU_CORE_SPLIT,EU_SPU_NICE";
+        if (!e || !*e) e = "EU_SPU_NICE,EU_LL_YIELD";
         if (&g_eu_frames_total && strcmp(e, "0")) {
             for (unsigned k = 0; k < sizeof s_ab_known / sizeof s_ab_known[0] && s_ab_n < EU_AB_MAX; k++) {
                 const char* hit = strstr(e, s_ab_known[k].name);
