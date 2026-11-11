@@ -705,8 +705,10 @@ static void eu_cores_report(const eu_tsample* cur, const int* idx, const uint64_
         }
         unsigned long long before = wait_ns;
         for (int j = 0; j < nprev; j++) if (prev[j].tid == tid) { before = prev[j].wait_ns; break; }
-        off += snprintf(line + off, sizeof line - off, " %s/%d %.0f%% (cpu%d)", cur[idx[k]].name, tid,
-                        (double)(wait_ns - before) / 1e8, core);
+        errno = 0;
+        const int nice_now = getpriority(PRIO_PROCESS, (id_t)tid);
+        off += snprintf(line + off, sizeof line - off, " %s/%d %.0f%% (cpu%d, pri %d)", cur[idx[k]].name, tid,
+                        (double)(wait_ns - before) / 1e8, core, errno ? 99 : nice_now);
         now[nnow].tid = tid;
         now[nnow].wait_ns = wait_ns;
         nnow++;
@@ -758,14 +760,14 @@ static void eu_prime_sweep(void)
     }
     {   /* The game's main thread was ready to run but waiting for a core 58-66% of the time while using a
          * third of one (boot-20261111-100119): everything else is paced by it. Give it priority over the
-         * SPU threads. EU_MAIN_BOOST=0 = leave it; EU_MAIN_NICE sets the value (default -6). */
+         * SPU threads. EU_MAIN_BOOST=0 = leave it; EU_MAIN_NICE sets the value (default -10). */
         static int done;
         if (!done) {
             done = 1;
             const char* e = getenv("EU_MAIN_BOOST");
             const char* n = getenv("EU_MAIN_NICE");
             if (!(e && *e == '0')) {
-                int nv = (n && *n) ? atoi(n) : -6;
+                int nv = (n && *n) ? atoi(n) : -10;   /* SPU threads run at -5: -6 changed nothing (boot-20261111-105043) */
                 if (nv < -19) nv = -19;
                 if (nv > 0) nv = 0;
                 s_main_nice = nv;
@@ -810,7 +812,7 @@ static void eu_prime_sweep(void)
  *   on a faster core and under 15% of it            -> slow cores
  *   on a slow core and over 50%, or running for more
  *   than 0.5 ms at a stretch (a poll is far shorter) -> back to the faster cores
- * Threads with a raised priority (the audio SPU kernel) and the RSX FIFO thread are left alone.
+ * The audio SPU kernel and the RSX FIFO thread are left alone.
  * EU_CORE_SPLIT=0 = off. */
 static void eu_core_split(void)
 {
@@ -888,8 +890,10 @@ static void eu_core_split(void)
         if (!want) continue;
         int skip = 0;
         if (&g_eu_prime_n) for (int j = 0; j < g_eu_prime_n && j < 4; j++) if (g_eu_prime_tid[j] == tid) skip = 1;
-        errno = 0;
-        if (!skip && getpriority(PRIO_PROCESS, (id_t)tid) < 0) skip = 1;   /* boosted (audio): placed elsewhere */
+        /* The audio SPU kernel is placed by its own boost. (It cannot be told apart by priority: the runtime
+         * raises every SPU thread to -5 or better, which made the first version of this skip all of them --
+         * boot-20261111-105043, "0 on the slow cores".) */
+        if (!strncmp(cur[i].name, "spurs i1 k0", 11)) skip = 1;
         if (skip) continue;
         if (st[k].where != 2) {
             if (pct < 15.0) {
