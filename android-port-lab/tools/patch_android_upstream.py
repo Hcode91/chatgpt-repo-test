@@ -2167,4 +2167,43 @@ for sig in ("s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId 
 #if defined(__ANDROID__)
     { extern void ps3_spurs_kick(void); ps3_spurs_kick(); }   /* work may be about to appear: wake parked kernels */
 #endif""")
+# The lock every SPU thread takes around shared guest memory. Outside Windows it was a bare busy loop:
+# with 44 SPU threads on 8 cores the holder is often not running, and each waiter then burns its whole
+# turn on a core spinning (boot-20261111-102445: up to 23 of 40 samples of a kernel thread in
+# spu_lockline_lock_ea). Spin briefly, then give the core away, as the Windows path does.
+change("runtime/spu/spu_coherency.c",
+"""static inline void ll_acq(volatile long* l) { while (__atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE)) { while (__atomic_load_n(l, __ATOMIC_RELAXED)) { } } }""",
+"""#if defined(__ANDROID__)
+#include <sched.h>
+#include <unistd.h>
+extern volatile int g_eu_live_off __attribute__((weak));   /* eu_android_bridge.c: bit 32 = back to the bare loop for now */
+volatile unsigned long g_eu_ll_yields;                     /* times a waiter gave its core away (reported in [summary]) */
+static int eu_ll_yield_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("EU_LL_YIELD");
+        on = (e && *e == '0') ? 0 : 1;
+        fprintf(stderr, "[lock] SPU shared-memory lock: waiters give their core away after a short spin: %s (EU_LL_YIELD)\\n", on ? "on" : "off");
+    }
+    return on && !(&g_eu_live_off && (g_eu_live_off & 32));
+}
+static inline void ll_acq(volatile long* l)
+{
+    unsigned spins = 0;
+    while (__atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE)) {
+        while (__atomic_load_n(l, __ATOMIC_RELAXED)) {
+#if defined(__aarch64__)
+            __asm__ __volatile__("yield");
+#endif
+            if (++spins < 200 || !eu_ll_yield_on()) continue;
+            __atomic_fetch_add(&g_eu_ll_yields, 1, __ATOMIC_RELAXED);
+            if (spins < 200 + 32) sched_yield();   /* holder is probably waiting for a core: let it run */
+            else usleep(100);                       /* still held: stop competing with it altogether */
+        }
+    }
+}
+#else
+static inline void ll_acq(volatile long* l) { while (__atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE)) { while (__atomic_load_n(l, __ATOMIC_RELAXED)) { } } }
+#endif""")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
