@@ -2771,6 +2771,15 @@ u32 be_pipeline_create(void*, const char* vs_hlsl, const char* ps_hlsl, const rs
                 nr++;
                 i = j;
             }
+            /* The block does not end with vp_c[512]: vp_posscale and vp_posoffset follow it and every program's
+             * viewport epilogue reads them. Leaving them out drew nothing at all (boot-20261111-013301). */
+            if (fits && nr < 12) {
+                p.vs_runs[nr].first = 512;
+                p.vs_runs[nr].count = 2;
+                nr++;
+            } else {
+                fits = false;
+            }
             if (fits) {
                 p.vs_nruns = nr;
                 u32 sig = 2166136261u;
@@ -3095,6 +3104,7 @@ bool stage_vs_constants_used(const Pipe& p, const u8* data, u32 bytes, u32* off)
     for (u32 k = 0; k < p.vs_nruns; k++) {
         const u32 b0 = p.vs_runs[k].first * 16u, n = p.vs_runs[k].count * 16u;
         if (b0 + n > bytes) return false;
+        if (k + 1 == p.vs_nruns && b0 + n != bytes) return false;   /* the last run must reach the end of the block */
         for (u32 i = 0; i < n; i += 8) { u64 w; memcpy(&w, data + b0 + i, 8); h = (h ^ w) * 0xFF51AFD7ED558CCDull; h ^= h >> 29; }
         used += n;
     }

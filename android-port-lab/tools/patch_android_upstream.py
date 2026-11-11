@@ -2013,7 +2013,9 @@ change("libs/video/rsx_draw_engine.c",
 static int eu_index_fast(const rsx_dsp_index_array* ia, u32 esz, u32 ia_loc, u32 base_index, int restart_en,
                          u32 restart_val, int allow_remap, u32* out_count)
 {
-    if (!allow_remap || dc.inl || dc.n_arr || dc.n_idx != 1 || dc.n_refs || !eu_vk_pull_ok || !eu_vk_pull_ok()) return 0;
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("EU_INDEX_FAST"); on = (e && *e == '0') ? 0 : 1; }
+    if (!on || !allow_remap || dc.inl || dc.n_arr || dc.n_idx != 1 || dc.n_refs || !eu_vk_pull_ok || !eu_vk_pull_ok()) return 0;
     const u32 first = dc.idx[0].first, count = dc.idx[0].count;
     if (count < 2 || count > (1u << 24)) return 0;
     const u64 start = (u64)ia->offset + (u64)first * esz;
