@@ -729,6 +729,7 @@ volatile int g_eu_live_off;
 #define EU_LIVE_SPURS_PARK 4
 #define EU_LIVE_INDEX_FAST 8
 #define EU_LIVE_CB_USED 16
+#define EU_LIVE_LL_YIELD 32
 static int s_main_nice;   /* 0 = main thread not boosted */
 static void eu_prime_sweep(void)
 {
@@ -917,14 +918,15 @@ static void eu_core_split(void)
  * settings is switched off, then everything is on again, then the next one is off, and so on. Frame rate and
  * the main thread's waiting share are measured for each stretch (its first 4 s are left out, things settle),
  * so both states see the same scenes and the same phone temperature.
- * EU_AB=name,name,...  (default EU_CORE_SPLIT,EU_MAIN_BOOST,EU_SPURS_PARK; also EU_INDEX_FAST, EU_VK_CB_USED)
+ * EU_AB=name,name,...  (default EU_CORE_SPLIT,EU_LL_YIELD,EU_MAIN_BOOST,EU_SPURS_PARK; also EU_INDEX_FAST, EU_VK_CB_USED)
  * EU_AB=0 = no switching. */
 extern volatile unsigned long long g_eu_frames_total __attribute__((weak));
-#define EU_AB_MAX 5
+#define EU_AB_MAX 6
 static struct { const char* name; int bit; } s_ab_known[] = {
     {"EU_CORE_SPLIT", EU_LIVE_CORE_SPLIT}, {"EU_MAIN_BOOST", EU_LIVE_MAIN_BOOST}, {"EU_SPURS_PARK", EU_LIVE_SPURS_PARK},
-    {"EU_INDEX_FAST", EU_LIVE_INDEX_FAST}, {"EU_VK_CB_USED", EU_LIVE_CB_USED},
+    {"EU_INDEX_FAST", EU_LIVE_INDEX_FAST}, {"EU_VK_CB_USED", EU_LIVE_CB_USED}, {"EU_LL_YIELD", EU_LIVE_LL_YIELD},
 };
+extern volatile unsigned long g_eu_ll_yields __attribute__((weak));
 static int s_ab_n, s_ab_item[EU_AB_MAX];
 static struct { double fps_sum, wait_sum; int n; } s_ab_acc[EU_AB_MAX + 1];   /* [0] all on, [1+i] item i off */
 static unsigned long long eu_main_wait_ns(unsigned long long* run)
@@ -959,7 +961,7 @@ static void eu_ab_tick(void)
         const char* sv = getenv("EU_AB_SECS");
         if (sv && atoi(sv) >= 8) secs = atoi(sv);
         if (secs > 300) secs = 300;
-        if (!e || !*e) e = "EU_CORE_SPLIT,EU_MAIN_BOOST,EU_SPURS_PARK";
+        if (!e || !*e) e = "EU_CORE_SPLIT,EU_LL_YIELD,EU_MAIN_BOOST,EU_SPURS_PARK";
         if (&g_eu_frames_total && strcmp(e, "0")) {
             for (unsigned k = 0; k < sizeof s_ab_known / sizeof s_ab_known[0] && s_ab_n < EU_AB_MAX; k++) {
                 const char* hit = strstr(e, s_ab_known[k].name);
@@ -1048,6 +1050,12 @@ static void eu_summary(long hz, uint64_t all_ticks, uint64_t spu_ticks, int nspu
         }
         fprintf(stderr, "[summary] fastest core allowed %ld of %ld MHz%s; hottest chip sensor %ld C\n", best_cap / 1000,
                 best_top / 1000, best_cap > 0 && best_cap < best_top ? " (phone is holding it back)" : "", hottest);
+    }
+    if (&g_eu_ll_yields) {
+        static unsigned long y_prev;
+        const unsigned long y = g_eu_ll_yields;
+        fprintf(stderr, "[summary] SPU shared-memory lock: waiters gave their core away %lu times this minute\n", y - y_prev);
+        y_prev = y;
     }
     if (s_ab_n) {
         char line[900];
