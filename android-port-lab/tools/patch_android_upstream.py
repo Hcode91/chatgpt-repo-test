@@ -2077,4 +2077,91 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
     u32 eu_fast_count = 0;
 #endif
     for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)""")
+# Idle SPURS kernel threads on Android. The kick machinery (a kernel thread
+# parks on its own event, work publication wakes it) is compiled for Windows
+# only; elsewhere an idle kernel thread just slept 250 us per empty pass, i.e.
+# 4000 wake-ups a second each. boot-20261111-091739: 12 kernel threads used
+# ~235% of a core, most of it nine or ten idle ones at 10-19% each, while the
+# game's main thread waited 58-62% of the time for a core.
+# Now (EU_SPURS_PARK, default 1; 0 = old 250 us naps): the kick slots, their
+# events and the SetEvent calls exist on Android too; a kernel thread idle for
+# more than 5 ms waits on its kick event for 1 ms per empty pass, more than
+# 50 ms -> EU_SPURS_PARK_MS (default 2). ReadyCountStore already kicks the
+# owning kernels; the other entry points that publish work kick as well.
+change("libs/spurs/cellSpurs.c",
+"""#ifdef _WIN32
+            SetEvent(s_kick_ev[i]);
+#endif""",
+"""#if defined(_WIN32) || defined(__ANDROID__)
+            SetEvent(s_kick_ev[i]);
+#endif""", count=2)
+change("libs/spurs/cellSpurs.c",
+"""    int kick_slot = -1;         /* v82 SPURS_KICK slot */
+#ifdef _WIN32
+    {   /* v83: always register (TASKWAIT_BOOST uses the same wake path) */""",
+"""    int kick_slot = -1;         /* v82 SPURS_KICK slot */
+#if defined(_WIN32) || defined(__ANDROID__)
+    {   /* v83: always register (TASKWAIT_BOOST uses the same wake path) */""")
+change("libs/spurs/cellSpurs.c",
+"""                else if (wait_us >= 1000) Sleep((DWORD)(wait_us / 1000));
+                else {""",
+"""#if defined(__ANDROID__)
+                else if (kick_slot >= 0 && wait_us > 0 && eu_spurs_park_ms() > 0 &&
+                         now.QuadPart - t_last_busy > s_freq / 200) {
+                    const DWORD ms = now.QuadPart - t_last_busy > s_freq / 20 ? (DWORD)eu_spurs_park_ms() : 1u;
+                    InterlockedExchange(&s_kick_waiting[kick_slot], 1);
+                    InterlockedIncrement(&s_kick_parked);
+                    const DWORD r = WaitForSingleObject(s_kick_ev[kick_slot], ms);
+                    InterlockedDecrement(&s_kick_parked);
+                    InterlockedIncrement(&s_eu_park_n);
+                    if (r == WAIT_OBJECT_0) InterlockedIncrement(&s_eu_park_kicked);
+                    else if (InterlockedExchange(&s_kick_waiting[kick_slot], 0) == 0)
+                        WaitForSingleObject(s_kick_ev[kick_slot], 0);   /* a kicker claimed the slot after the timeout */
+                    {   /* one line per 10 s, from whichever kernel gets there first */
+                        static volatile LONGLONG s_rep;
+                        const LONGLONG last = s_rep;
+                        if (now.QuadPart - last > s_freq * 10 &&
+                            InterlockedCompareExchange64(&s_rep, now.QuadPart, last) == last && last)
+                            fprintf(stderr, "[park] 10s: idle kernel threads parked %ld times, %ld ended by a kick\\n",
+                                    InterlockedExchange(&s_eu_park_n, 0), InterlockedExchange(&s_eu_park_kicked, 0));
+                    }
+                }
+#endif
+                else if (wait_us >= 1000) Sleep((DWORD)(wait_us / 1000));
+                else {""")
+change("libs/spurs/cellSpurs.c",
+"""static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+{""",
+"""#if defined(__ANDROID__)
+static volatile long s_eu_park_n, s_eu_park_kicked;
+static int eu_spurs_park_ms(void)
+{
+    static int ms = -1;
+    if (ms < 0) {
+        const char* e = getenv("EU_SPURS_PARK"); const char* m = getenv("EU_SPURS_PARK_MS");
+        int v = (m && *m) ? atoi(m) : 2;
+        if (v < 1) v = 1;
+        if (v > 8) v = 8;
+        if (e && *e == '0') v = 0;
+        fprintf(stderr, "[park] idle SPURS kernel threads wait on their kick event: %s, up to %d ms (EU_SPURS_PARK, EU_SPURS_PARK_MS)\\n",
+                v ? "on" : "off", v);
+        ms = v;
+        return v;
+    }
+    return ms;
+}
+#endif
+static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+{""")
+for sig in ("s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId taskId)\n{",
+            "s32 cellSpursWakeUp(CellSpurs* spurs)\n{",
+            "s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits)\n{",
+            "s32 _cellSpursSendSignal(void* taskset, u32 taskId)\n{",
+            "s32 cellSpursRunJobChain(u64 jc_ea)\n{",
+            "s32 cellSpursKickJobChain(u64 jc_ea, u32 numReadyCount)\n{",
+            "s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)\n{"):
+    change("libs/spurs/cellSpurs.c", sig, sig + """
+#if defined(__ANDROID__)
+    { extern void ps3_spurs_kick(void); ps3_spurs_kick(); }   /* work may be about to appear: wake parked kernels */
+#endif""")
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
