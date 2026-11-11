@@ -2266,6 +2266,126 @@ change("runtime/spu/spu_channels.c",
 {
 """,
 """#if defined(__ANDROID__)
+/* ---- job recorder ----
+ * Saves complete runs of one job module (default: the costliest one in boot-20261111-182540, signature
+ * 434ec20243de...) to <game folder>/eu_logs/jobrec-<sig>.bin: registers and local store at entry, every
+ * memory transfer and channel access during the run, registers and local store at exit. A native version
+ * of the job is then written and checked against these on a desktop before it runs on a phone.
+ *   EU_JOBREC=<first hex digits of the module signature> (0 = off), EU_JOBREC_FIRST (300), EU_JOBREC_EVERY
+ *   (3000), EU_JOBREC_MAX (16 runs).
+ * File: "EUJR0001", then records; each record = tagged chunks {u32 tag, u32 bytes, data}:
+ *   'HEAD' {u32 run, u32 pc, u32 overlay, u32 image, u8 sig[16]}   'CTX0' raw spu_context   'REG0' 128 x 16
+ *   'LS_0' 256 KB (first record) or 'LSX0' xor against the first record's LS_0
+ *   'DMA_' {u32 cmd, u32 lsa, u64 ea, u32 size, i32 rc} + size bytes of local store after the transfer
+ *   'WRCH' {u32 ch, u8 v[16]}   'RDCH' {u32 ch, u8 v[16]}
+ *   'TAIL' {u32 exit pc}   'REG1'   'LSX1' xor against this record's entry local store   'END_' */
+volatile int g_eu_jobrec_live;                 /* some thread is recording right now (read by spu_dma.h) */
+static SPU_THREAD_LOCAL spu_context* t_eu_rec_ctx;
+static uint8_t* s_eu_rec_buf; static size_t s_eu_rec_len, s_eu_rec_cap;
+static uint8_t* s_eu_rec_ls0; static uint8_t* s_eu_rec_first;
+static int s_eu_rec_on = -1, s_eu_rec_n, s_eu_rec_max = 16, s_eu_rec_first_run = 300, s_eu_rec_every = 3000;
+static uint8_t s_eu_rec_sig[16]; static int s_eu_rec_siglen;
+static volatile long s_eu_rec_seen;
+static void eu_rec_put(uint32_t tag, const void* a, uint32_t na, const void* b, uint32_t nb)
+{
+    const size_t need = s_eu_rec_len + 8 + na + nb;
+    if (need > s_eu_rec_cap) {
+        size_t cap = s_eu_rec_cap ? s_eu_rec_cap * 2 : (1u << 20);
+        while (cap < need) cap *= 2;
+        uint8_t* nbuf = (uint8_t*)realloc(s_eu_rec_buf, cap);
+        if (!nbuf) return;
+        s_eu_rec_buf = nbuf; s_eu_rec_cap = cap;
+    }
+    const uint32_t bytes = na + nb;
+    memcpy(s_eu_rec_buf + s_eu_rec_len, &tag, 4); memcpy(s_eu_rec_buf + s_eu_rec_len + 4, &bytes, 4);
+    if (na) memcpy(s_eu_rec_buf + s_eu_rec_len + 8, a, na);
+    if (nb) memcpy(s_eu_rec_buf + s_eu_rec_len + 8 + na, b, nb);
+    s_eu_rec_len = need;
+}
+#define EU_TAG(a, b, c, d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+void eu_jobrec_dma(spu_context* ctx, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd, int rc)
+{
+    if (t_eu_rec_ctx != ctx) return;
+    struct { uint32_t cmd, lsa; uint64_t ea; uint32_t size; int32_t rc; } h = { cmd, lsa, ea, size, rc };
+    const uint32_t at = lsa & (SPU_LS_SIZE - 1);
+    const uint32_t n = (size <= 0x4000 && at + size <= SPU_LS_SIZE) ? size : 0;
+    eu_rec_put(EU_TAG('D', 'M', 'A', '_'), &h, sizeof h, ctx->ls + at, n);
+}
+static void eu_jobrec_ch(spu_context* ctx, uint32_t tag, uint32_t ch, const u128* v)
+{
+    if (t_eu_rec_ctx != ctx) return;
+    eu_rec_put(tag, &ch, 4, v, 16);
+}
+static void eu_jobrec_begin(spu_context* ctx, uint32_t pc)
+{
+    if (s_eu_rec_on < 0) {
+        const char* e = getenv("EU_JOBREC"); const char* a = getenv("EU_JOBREC_FIRST");
+        const char* b = getenv("EU_JOBREC_EVERY"); const char* c = getenv("EU_JOBREC_MAX");
+        if (!e || !*e) e = "434ec20243de";
+        int n = 0;
+        if (strcmp(e, "0")) for (; n < 16 && e[2 * n] && e[2 * n + 1]; n++) {
+            unsigned v = 0; if (sscanf(e + 2 * n, "%2x", &v) != 1) break; s_eu_rec_sig[n] = (uint8_t)v; }
+        if (a && atoi(a) > 0) s_eu_rec_first_run = atoi(a);
+        if (b && atoi(b) > 0) s_eu_rec_every = atoi(b);
+        if (c && *c) s_eu_rec_max = atoi(c);
+        s_eu_rec_siglen = n;
+        fprintf(stderr, "[jobrec] recording %d runs of job module %s (run %d, then every %d): %s (EU_JOBREC)\\n", s_eu_rec_max, e,
+                s_eu_rec_first_run, s_eu_rec_every, n >= 4 ? "on" : "off");
+        s_eu_rec_on = n >= 4;
+    }
+    if (!s_eu_rec_on || s_eu_rec_n >= s_eu_rec_max) return;
+    if (memcmp(ctx->ls + 0x4000, s_eu_rec_sig, (size_t)s_eu_rec_siglen)) return;
+    const long seen = __atomic_add_fetch(&s_eu_rec_seen, 1, __ATOMIC_RELAXED);
+    if (seen < s_eu_rec_first_run || (seen - s_eu_rec_first_run) % s_eu_rec_every) return;
+    if (__atomic_exchange_n(&g_eu_jobrec_live, 1, __ATOMIC_ACQUIRE)) return;   /* one recording at a time */
+    if (!s_eu_rec_ls0) { s_eu_rec_ls0 = (uint8_t*)malloc(SPU_LS_SIZE); s_eu_rec_first = (uint8_t*)malloc(SPU_LS_SIZE); }
+    if (!s_eu_rec_ls0 || !s_eu_rec_first) { __atomic_store_n(&g_eu_jobrec_live, 0, __ATOMIC_RELEASE); s_eu_rec_on = 0; return; }
+    s_eu_rec_len = 0;
+    struct { uint32_t run, pc, ovl, img; uint8_t sig[16]; } h = { (uint32_t)seen, pc, (uint32_t)ctx->resident_ovl, (uint32_t)ctx->image_id, {0} };
+    memcpy(h.sig, ctx->ls + 0x4000, 16);
+    eu_rec_put(EU_TAG('H', 'E', 'A', 'D'), &h, sizeof h, NULL, 0);
+    eu_rec_put(EU_TAG('C', 'T', 'X', '0'), ctx, sizeof *ctx, NULL, 0);
+    eu_rec_put(EU_TAG('R', 'E', 'G', '0'), ctx->gpr, sizeof ctx->gpr, NULL, 0);
+    memcpy(s_eu_rec_ls0, ctx->ls, SPU_LS_SIZE);
+    if (s_eu_rec_n == 0) {
+        memcpy(s_eu_rec_first, ctx->ls, SPU_LS_SIZE);
+        eu_rec_put(EU_TAG('L', 'S', '_', '0'), ctx->ls, SPU_LS_SIZE, NULL, 0);
+    } else {
+        uint8_t* x = (uint8_t*)malloc(SPU_LS_SIZE);
+        if (x) { for (uint32_t i = 0; i < SPU_LS_SIZE; i++) x[i] = ctx->ls[i] ^ s_eu_rec_first[i];
+                 eu_rec_put(EU_TAG('L', 'S', 'X', '0'), x, SPU_LS_SIZE, NULL, 0); free(x); }
+    }
+    t_eu_rec_ctx = ctx;
+}
+static void eu_jobrec_end(spu_context* ctx, uint32_t pc)
+{
+    if (t_eu_rec_ctx != ctx) return;
+    t_eu_rec_ctx = NULL;
+    eu_rec_put(EU_TAG('T', 'A', 'I', 'L'), &pc, 4, NULL, 0);
+    eu_rec_put(EU_TAG('R', 'E', 'G', '1'), ctx->gpr, sizeof ctx->gpr, NULL, 0);
+    {
+        uint8_t* x = (uint8_t*)malloc(SPU_LS_SIZE);
+        if (x) { for (uint32_t i = 0; i < SPU_LS_SIZE; i++) x[i] = ctx->ls[i] ^ s_eu_rec_ls0[i];
+                 eu_rec_put(EU_TAG('L', 'S', 'X', '1'), x, SPU_LS_SIZE, NULL, 0); free(x); }
+    }
+    eu_rec_put(EU_TAG('E', 'N', 'D', '_'), NULL, 0, NULL, 0);
+    const char* root = getenv("PS3_VFS_ROOT");
+    char path[512], sig[16];
+    snprintf(sig, sizeof sig, "%02x%02x%02x%02x%02x%02x", s_eu_rec_sig[0], s_eu_rec_sig[1], s_eu_rec_sig[2], s_eu_rec_sig[3], s_eu_rec_sig[4], s_eu_rec_sig[5]);
+    snprintf(path, sizeof path, "%s/eu_logs/jobrec-%s.bin", root && *root ? root : ".", sig);
+    FILE* f = fopen(path, s_eu_rec_n == 0 ? "wb" : "ab");
+    int ok = 0;
+    if (f) {
+        if (s_eu_rec_n == 0) fwrite("EUJR0001", 1, 8, f);
+        ok = fwrite(s_eu_rec_buf, 1, s_eu_rec_len, f) == s_eu_rec_len;
+        fclose(f);
+    }
+    s_eu_rec_n++;
+    fprintf(stderr, "[jobrec] run %d of %d %s: %zu bytes, left the job at pc 0x%05X (%s)\\n", s_eu_rec_n, s_eu_rec_max,
+            ok ? "saved" : "NOT saved", s_eu_rec_len, pc, path);
+    if (!ok) s_eu_rec_on = 0;
+    __atomic_store_n(&g_eu_jobrec_live, 0, __ATOMIC_RELEASE);
+}
 #define EU_JOBTIME_SLOTS 66   /* 0..63 = overlay ids 200..263, 64 = job code that is not a lifted module, 65 = spare */
 static volatile long long s_eu_job_ns[EU_JOBTIME_SLOTS];
 static volatile long s_eu_job_runs[EU_JOBTIME_SLOTS];
@@ -2275,9 +2395,11 @@ static SPU_THREAD_LOCAL long long t_eu_job_t0;
 void eu_jobtime_edge(spu_context* ctx, uint32_t pc)
 {
     if (__builtin_expect(s_eu_jobtime < 0, 0)) { const char* e = getenv("EU_JOBTIME"); s_eu_jobtime = (e && *e == '0') ? 0 : 1; }
-    if (!s_eu_jobtime || (ctx->image_id != 1 && ctx->image_id != 2)) return;
+    if (ctx->image_id != 1 && ctx->image_id != 2) return;
     const int in = pc >= 0x4000 && pc < 0x3E000;
     if (in == t_eu_in_job) return;
+    if (in) eu_jobrec_begin(ctx, pc); else if (g_eu_jobrec_live) eu_jobrec_end(ctx, pc);
+    if (!s_eu_jobtime) { t_eu_in_job = in; return; }
     struct timespec ts;
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
     const long long now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
@@ -2366,5 +2488,53 @@ void eu_jobtime_report(double secs)
     fprintf(stderr, "%s\\n", line);
 }
 #endif
+""")
+# Job recorder hooks (see the [jobrec] block in spu_channels.c above).
+change("runtime/spu/spu_channels.c",
+"""void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+{
+""",
+"""#if defined(__ANDROID__)
+static void eu_jobrec_ch(spu_context* ctx, uint32_t tag, uint32_t ch, const u128* v);
+extern volatile int g_eu_jobrec_live;
+#endif
+void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+{
+#if defined(__ANDROID__)
+    if (__builtin_expect(g_eu_jobrec_live, 0)) eu_jobrec_ch(ctx, 0x48435257u /* 'WRCH' */, channel, &value);
+#endif
+""")
+change("runtime/spu/spu_channels.c",
+"""    u128 r = spu_rdch_impl(ctx, channel);
+    spu_lp_end(t0, LP_RDCH);
+    return r;
+""",
+"""    u128 r = spu_rdch_impl(ctx, channel);
+    spu_lp_end(t0, LP_RDCH);
+#if defined(__ANDROID__)
+    if (__builtin_expect(g_eu_jobrec_live, 0)) eu_jobrec_ch(ctx, 0x48434452u /* 'RDCH' */, channel, &r);
+#endif
+    return r;
+""")
+change("runtime/spu/spu_dma.h",
+"""static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                                   uint32_t size, uint32_t cmd)
+{
+""",
+"""static inline int mfc_do_transfer_eu_inner(spu_context* spu, uint32_t lsa, uint64_t ea,
+                                            uint32_t size, uint32_t cmd);
+static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                                   uint32_t size, uint32_t cmd)
+{
+    const int rc = mfc_do_transfer_eu_inner(spu, lsa, ea, size, cmd);
+#if defined(__ANDROID__)
+    { extern volatile int g_eu_jobrec_live; extern void eu_jobrec_dma(spu_context*, uint32_t, uint64_t, uint32_t, uint32_t, int);
+      if (__builtin_expect(g_eu_jobrec_live, 0)) eu_jobrec_dma(spu, lsa, ea, size, cmd, rc); }
+#endif
+    return rc;
+}
+static inline int mfc_do_transfer_eu_inner(spu_context* spu, uint32_t lsa, uint64_t ea,
+                                            uint32_t size, uint32_t cmd)
+{
 """)
 print("Android patches applied:", len(changes), "edit anchors in", len(set(changes)), "real upstream files")
