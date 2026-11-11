@@ -2209,9 +2209,9 @@ static inline void ll_acq(volatile long* l) { while (__atomic_exchange_n(l, 1, _
 # One SPU thread per workload at a time, as the game asks for. Every inFAMOUS workload is created with
 # maxContention=1; the PC port runs each workload's five lanes on five threads at once anyway ("parallel lane
 # mode") because a desktop has cores to spare. On an 8-core phone that is 32 extra threads competing with the
-# 12 kernel threads, the main thread and the renderer. EU_SPU_SERIAL (default on) takes the port's own serial
+# 12 kernel threads, the main thread and the renderer. EU_SPU_SERIAL=1 (default off, it measured slower) takes the port's own serial
 # path instead: the owning kernel thread visits the lanes in turn and the lane threads stay asleep.
-# EU_SPU_SERIAL=0 = parallel as before; EU_SPU_SERIAL_WIDS=0,5,7 limits it to those workloads.
+# EU_SPU_SERIAL_WIDS=0,5,7 limits it to those workloads.
 change("libs/spurs/cellSpurs.c",
 """static int spurs_parallel_sweep_allowed(u32 wid, u32 lanes, u32 maxcont)
 {
@@ -2228,7 +2228,9 @@ static int eu_spu_serial(u32 wid)
         if (m && *m) { mask = 0;
             for (const char* q = m; *q; ) { while (*q == ',' || *q == ' ') q++; if (!*q) break;
                 int w = atoi(q); if (w >= 0 && w < 16) mask |= 1u << w; while (*q && *q != ',') q++; } }
-        const int v = (e && *e == '0') ? 0 : 1;
+        /* Default off since boot-20261111-182540: with it on 5.0-7.4 frames/s, in the stretches with it off
+         * 7.7 and 8.8. The five lanes do share real work; one thread at a time just queues it. */
+        const int v = (e && *e == '1') ? 1 : 0;
         fprintf(stderr, "[serial] one SPU thread per workload at a time (the game's own limit), workload mask 0x%04X: %s (EU_SPU_SERIAL)\\n",
                 (unsigned)mask, v ? "on" : "off");
         on = v;
