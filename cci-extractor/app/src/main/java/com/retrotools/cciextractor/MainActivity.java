@@ -100,6 +100,9 @@ public class MainActivity extends Activity {
     private Button pngToRetro, retroFormat, paletteButton;
     private ListView list;
     private ArrayAdapter<String> adapter;
+    private ConvertTab convertTab;
+    private LinearLayout extractPanel;
+    private Button tabExtract, tabConvert;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -121,6 +124,15 @@ public class MainActivity extends Activity {
         b.setText(label); b.setAllCaps(false);
         return b;
     }
+    private void showTab(boolean convert) {
+        extractPanel.setVisibility(convert ? View.GONE : View.VISIBLE);
+        convertTab.view.setVisibility(convert ? View.VISIBLE : View.GONE);
+        tabExtract.setAlpha(convert ? 0.6f : 1f);
+        tabConvert.setAlpha(convert ? 1f : 0.6f);
+        tabExtract.setTypeface(null, convert ? android.graphics.Typeface.NORMAL : android.graphics.Typeface.BOLD);
+        tabConvert.setTypeface(null, convert ? android.graphics.Typeface.BOLD : android.graphics.Typeface.NORMAL);
+    }
+
     private void buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -131,6 +143,21 @@ public class MainActivity extends Activity {
         headline.setBackgroundColor(Color.rgb(35, 45, 91));
         headline.setPadding(dp(18), dp(16), dp(14), dp(16));
         root.addView(headline);
+        LinearLayout tabs = new LinearLayout(this);
+        tabs.setBackgroundColor(Color.rgb(35, 45, 91));
+        tabs.setPadding(dp(6), 0, dp(6), dp(6));
+        tabExtract = button("Extract");
+        tabConvert = button("Convert");
+        tabs.addView(tabExtract, new LinearLayout.LayoutParams(0, dp(46), 1));
+        tabs.addView(tabConvert, new LinearLayout.LayoutParams(0, dp(46), 1));
+        root.addView(tabs);
+        LinearLayout outer = root;
+        extractPanel = new LinearLayout(this);
+        extractPanel.setOrientation(LinearLayout.VERTICAL);
+        outer.addView(extractPanel, new LinearLayout.LayoutParams(-1, 0, 1));
+        convertTab = new ConvertTab(this);
+        outer.addView(convertTab.view, new LinearLayout.LayoutParams(-1, 0, 1));
+        root = extractPanel;
         summary = text("3DS · DS · NES · SNES · Mega Drive · Game Boy · GBA asset tools", 14, Color.DKGRAY);
         root.addView(summary);
         LinearLayout controls = new LinearLayout(this);
@@ -177,6 +204,9 @@ public class MainActivity extends Activity {
         detail.setMaxLines(4);
         root.addView(detail);
 
+        tabExtract.setOnClickListener(v -> showTab(false));
+        tabConvert.setOnClickListener(v -> showTab(true));
+        showTab(false);
         open.setOnClickListener(v -> openCci());
         pngToBtex.setOnClickListener(v -> choosePng());
         pngToNes.setOnClickListener(v -> startNesImport());
@@ -253,6 +283,7 @@ public class MainActivity extends Activity {
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
         if (result != RESULT_OK || data == null) return;
+        if (convertTab != null && convertTab.handles(request)) { convertTab.onResult(request, data); return; }
         if (request == PICK_HD_PNGS) {
             hdPngUris.clear();
             ClipData clip = data.getClipData();
