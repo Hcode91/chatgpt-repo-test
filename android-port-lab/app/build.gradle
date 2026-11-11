@@ -26,6 +26,9 @@ android {
         jniLibs {
             useLegacyPackaging true
             keepDebugSymbols.add("**/libps3boot.so")
+            // Keep the game runner's .symtab: its crash reporter and hot-spot
+            // sampler resolve internal (non-exported) function names from it.
+            keepDebugSymbols.add("**/libps3eu.so")
         }
     }
     buildTypes {

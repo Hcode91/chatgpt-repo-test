@@ -58,21 +58,25 @@ static std::string execute_lifted_smoke() {
         }
     }
     uint64_t result = ctx.gpr[3];
-    bool ok = found == 1 && result == 71 && unexpected_calls == 0;
+    uint64_t srwResult = ctx.gpr[9];
+    bool ok = found == 1 && result == 71 && srwResult == 16 && unexpected_calls == 0;
     char details[512];
     snprintf(details, sizeof details,
         "Real PowerPC64 instruction lift on Android\n"
-        "Original guest instructions: addi; mulli; addi; blr\n"
+        "Original guest instructions: addi; mulli; addi; li; li; srw; blr\n"
         "Host CPU: arm64-v8a\n"
         "Input guest register r3: 5\n"
         "Expected r3: 71\n"
         "Actual r3: %llu\n"
+        "Expected r9 after PPC srw: 16\n"
+        "Actual r9 after PPC srw: %llu\n"
         "Lifted entries matched: %u\n"
         "Unexpected HLE/memory calls: %d\n"
         "Result: %s\n"
         "NOTE: This is a clean-room single-function smoke test, "
         "NOT a full PS3 ELF boot and NOT inFAMOUS gameplay.",
-        (unsigned long long)result, found, unexpected_calls, ok ? "PASS" : "FAIL");
+        (unsigned long long)result, (unsigned long long)srwResult,
+        found, unexpected_calls, ok ? "PASS" : "FAIL");
     return details;
 }
 

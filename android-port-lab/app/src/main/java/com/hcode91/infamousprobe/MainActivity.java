@@ -17,12 +17,14 @@ import java.util.Locale;
 
 public final class MainActivity extends Activity {
     private static final int PICK_EXECUTABLE = 101;
+    private static final int PICK_EU_DIRECT = 105;
     private TextView output;
     private String startup;
     private int testRunCount = 0;
     private static native String nativeProbe();
     private static native String nativePpuSmoke();
     private static native String nativeElfSmoke(byte[] image);
+    private static native String nativeRealPpuProbe(byte[] image);
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -89,6 +91,31 @@ public final class MainActivity extends Activity {
         integrated.setText("BOOT REAL PS3RECOMP RUNTIME (EXPERIMENTAL)");
         root.addView(integrated);
         integrated.setOnClickListener(v -> runIntegratedBoot());
+
+        // This button is enabled only if a PRIVATE build included the BCES00220
+        // game-specific native executable, generated from the owner's own ELF.
+        java.io.File privateRunner = new java.io.File(
+                getApplicationInfo().nativeLibraryDir, "libps3eu.so");
+        Button realGame = new Button(this);
+        realGame.setText(privateRunner.isFile()
+                ? "BOOT MY EUROPEAN inFAMOUS (REAL GAME ATTEMPT)"
+                : "European game boot unavailable (private PPU lift required)");
+        root.addView(realGame);
+        realGame.setEnabled(privateRunner.isFile());
+        // Opens the dedicated boot-test screen (ELF check, game folder,
+        // live milestones, log export). See EuBootActivity.
+        realGame.setOnClickListener(v ->
+                startActivity(new Intent(this, EuBootActivity.class)));
+
+        Button directEuropean = new Button(this);
+        directEuropean.setText("RUN REAL EUROPEAN GAME STARTUP (DIRECT PPU)");
+        root.addView(directEuropean);
+        directEuropean.setOnClickListener(v -> {
+            Intent chooser = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            chooser.setType("*/*");
+            chooser.addCategory(Intent.CATEGORY_OPENABLE);
+            startActivityForResult(chooser, PICK_EU_DIRECT);
+        });
 
         Button rsxGraphics = new Button(this);
         rsxGraphics.setText("DRAW PS3 RSX TRIANGLES (GUEST CODE)");
@@ -214,6 +241,47 @@ public final class MainActivity extends Activity {
         }, "ps3recomp-boot-worker").start();
     }
 
+    /**
+     * First EU executable launch path. Runs actual guest PowerPC startup in
+     * the bounded on-device PPU interpreter, NOT the synthetic smoke demo.
+     * It is independent of the private AOT runner while recompilation is
+     * being integrated. It does not pretend to emulate RSX or SPU yet.
+     */
+    private void runEuropeanDirectStartup(Uri uri) {
+        output.setText("Verifying exact European BCES00220 executable and "
+                + "starting real guest PowerPC code locally...\n");
+        new Thread(() -> {
+            String report;
+            try (InputStream in = getContentResolver().openInputStream(uri)) {
+                if (in == null) throw new IOException("Cannot open game ELF");
+                java.security.MessageDigest digest =
+                        java.security.MessageDigest.getInstance("SHA-256");
+                java.io.ByteArrayOutputStream stream = new java.io.ByteArrayOutputStream();
+                byte[] buf = new byte[65536];
+                for (int n; (n = in.read(buf)) != -1;) {
+                    if (stream.size() + n > 32 * 1024 * 1024)
+                        throw new IOException("ELF exceeds 32 MiB safety limit");
+                    stream.write(buf, 0, n);
+                    digest.update(buf, 0, n);
+                }
+                StringBuilder hex = new StringBuilder();
+                for (byte b : digest.digest())
+                    hex.append(String.format(Locale.US, "%02x", b & 255));
+                String required = "095d851432f3b55179cd725b46838ffedb3e5eb9f73889e52b6f11f3d3f494fd";
+                if (!required.equals(hex.toString()))
+                    throw new IOException("Wrong release / changed executable. SHA-256: " + hex);
+                report = "BCES00220 SHA-256 verified.\n"
+                        + "Executing REAL European inFAMOUS guest startup, not synthetic code.\n\n"
+                        + nativeRealPpuProbe(stream.toByteArray());
+            } catch (Throwable error) {
+                report = "EUROPEAN GAME STARTUP FAILED\n"
+                        + error.getClass().getSimpleName() + ": " + error.getMessage();
+            }
+            String result = report;
+            runOnUiThread(() -> output.setText(result));
+        }, "eu-ppu-startup").start();
+    }
+
     private void showProbe() {
         testRunCount++;
         String completedAt = new java.text.SimpleDateFormat("HH:mm:ss", Locale.getDefault())
@@ -230,6 +298,11 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == PICK_EU_DIRECT && resultCode == RESULT_OK
+                && data != null && data.getData() != null) {
+            runEuropeanDirectStartup(data.getData());
+            return;
+        }
         if (requestCode != PICK_EXECUTABLE || resultCode != RESULT_OK || data == null) return;
         Uri uri = data.getData();
         if (uri == null) return;
