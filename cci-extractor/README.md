@@ -1,4 +1,26 @@
-# Game Asset Extractor (Android v0.9.0)
+# Game Asset Extractor (Android v0.10.0)
+
+## New in v0.10: more 3DS and DS formats, unpacked automatically
+
+Nothing new to tap: when you extract files from a 3DS or DS game, anything in one of these formats is now unpacked or converted **next to the original file**. Originals are always kept, and a file that can't be parsed is simply left alone.
+
+| Format | What you get |
+|---|---|
+| **3DS archives:** SARC, darc, ZAR, GARC | a `<file>_contents/` folder with the files inside (names kept where the archive stores them; GARC and nameless SARC entries are numbered and given an extension from their contents) |
+| **3DS compression:** Yaz0, LZ10/LZ11 | a `<file>.decompressed` copy, which is then examined in turn |
+| **3DS textures:** CTPK, BCLIM, BFLIM, and the textures inside CGFX (`.bcres`/`.bcmdl`) and BCH | PNG (`<file>.png`, or `<file>.<texture name>.png` when a file holds several); largest mip level only |
+| **3DS audio:** BCWAV, BCSTM | 16-bit WAV (`<file>.wav`); PCM8, PCM16, DSP ADPCM and IMA ADPCM |
+| **DS textures:** NSBTX, and the texture block inside NSBMD models | one PNG per texture; all seven texture formats including 4x4-compressed |
+| **DS tilemaps:** NSCR | `<name>_screen.png`, the assembled background, using the same-named `.ncgr` (or the nearest one in the folder) and its palette |
+| **DS audio:** SDAT sound archives, SWAR wave archives, SWAV, STRM | SDAT → `<file>_contents/` with `SEQ/`, `BANK/`, `WAVEARC/`, `STRM/` (named from the archive's symbol table when it has one); every sample and stream as WAV |
+
+It works through layers, so an LZ-compressed darc of BCLIM images ends up as PNGs. Files over 64 MB are not examined.
+
+**How far this has been checked.** No retail files in these formats were available during development, so:
+- The DS readers (NSBTX, SWAV, SWAR, STRM, SDAT) and SARC and Yaz0 were checked against files produced by independent open-source libraries (ndspy, sarc, libyaz0) and decode them correctly.
+- darc, ZAR, GARC, CTPK, BCLIM, BFLIM, CGFX, BCH, BCWAV and BCSTM are written from the public documentation (3dbrew) and open-source tools (Kuriimu), and tested only against fixtures built from those same layouts in `tests/AssetFormatsTest.java`. They may need fixes once tried on real games; BCH texture names and BFLIM rotation are the least certain.
+
+Not included: 3D models and animations, sequenced music (SSEQ/SBNK → MIDI), DS sprite cells (NCER/NANR), fonts, and putting edited files back into these containers.
 
 ## New in v0.9: Torus PAK asset packs (`packfile.dat`)
 
