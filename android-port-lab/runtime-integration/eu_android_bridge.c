@@ -738,6 +738,8 @@ volatile int g_eu_live_off;
 #define EU_LIVE_SHORT_SPIN 512
 #define EU_LIVE_N205 1024
 #define EU_LIVE_PPU_INLINE 2048
+#define EU_LIVE_SPU_CHAIN 4096   /* reserved (chained SPU chunks, not in any build) */
+#define EU_LIVE_N218 8192
 static int s_main_nice;   /* 0 = main thread not boosted */
 static void eu_prime_sweep(void)
 {
@@ -1285,10 +1287,10 @@ static void eu_perf_hint_tick(void)
  * settings is switched off, then everything is on again, then the next one is off, and so on. Frame rate and
  * the main thread's waiting share are measured for each stretch (its first 4 s are left out, things settle),
  * so both states see the same scenes and the same phone temperature.
- * EU_AB=name,name,...  (default V242A_AUDSPIN,LEAN_LANESPIN,LEAN_KSPIN = scheduler choices, see g_eu_feat_flip; also V242A_NAP, LEAN_TASKWAIT, EU_PPU_INLINE, EU_N205, EU_SHORT_SPIN, EU_SPU_NICE, EU_LL_YIELD, EU_MAIN_BOOST, EU_PERF_HINT, EU_SPU_SERIAL,
+ * EU_AB=name,name,...  (default EU_N218,EU_N205 = the native job code; also the scheduler choices V242A_AUDSPIN, LEAN_LANESPIN, LEAN_KSPIN, V242A_NAP, LEAN_TASKWAIT (see g_eu_feat_flip), EU_PPU_INLINE, EU_N205, EU_SHORT_SPIN, EU_SPU_NICE, EU_LL_YIELD, EU_MAIN_BOOST, EU_PERF_HINT, EU_SPU_SERIAL,
  *                        EU_CORE_SPLIT, EU_SPURS_PARK, EU_INDEX_FAST, EU_VK_CB_USED). Which one goes first varies from run to run.
  * EU_AB=0 = no switching. */
-#define EU_AB_MAX 11
+#define EU_AB_MAX 20
 /* EU_PPU_INLINE: the translated game code reads and writes guest memory inline (CMake INFAMOUS_PPU_INLINE,
  * -DPPU_INLINE_LOADS) and only calls vm_read / vm_write for the special cases. The runtime gates that with
  * limits it recomputes in ppu_vm_gate_update(); zero limits send every access out of line again, which is
@@ -1334,7 +1336,7 @@ static struct { const char* name; int bit; } s_ab_known[] = {
     {"EU_INDEX_FAST", EU_LIVE_INDEX_FAST}, {"EU_VK_CB_USED", EU_LIVE_CB_USED}, {"EU_LL_YIELD", EU_LIVE_LL_YIELD},
     {"EU_SPU_NICE", EU_LIVE_SPU_NICE}, {"EU_PERF_HINT", EU_LIVE_PERF_HINT},
     {"EU_SPU_SERIAL", EU_LIVE_SPU_SERIAL}, {"EU_SHORT_SPIN", EU_LIVE_SHORT_SPIN},
-    {"EU_N205", EU_LIVE_N205}, {"EU_PPU_INLINE", EU_LIVE_PPU_INLINE},
+    {"EU_N205", EU_LIVE_N205}, {"EU_PPU_INLINE", EU_LIVE_PPU_INLINE}, {"EU_N218", EU_LIVE_N218},
 };
 extern volatile long long g_eu_job_watch_ns __attribute__((weak));
 extern volatile long g_eu_job_watch_runs __attribute__((weak));
@@ -1377,7 +1379,7 @@ static void eu_ab_tick(void)
         const char* sv = getenv("EU_AB_SECS");
         if (sv && atoi(sv) >= 8) secs = atoi(sv);
         if (secs > 300) secs = 300;
-        if (!e || !*e) e = "V242A_AUDSPIN,LEAN_LANESPIN,LEAN_KSPIN";
+        if (!e || !*e) e = "EU_N218,EU_N205";
         if (&g_eu_frames_total && strcmp(e, "0")) {
             for (unsigned k = 0; k < sizeof s_ab_known / sizeof s_ab_known[0] && s_ab_n < EU_AB_MAX; k++) {
                 const char* hit = strstr(e, s_ab_known[k].name);
