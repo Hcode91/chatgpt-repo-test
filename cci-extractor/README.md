@@ -1,4 +1,20 @@
-# Game Asset Extractor (Android v0.10.0)
+# Game Asset Extractor (Android v0.11.0)
+
+## New in v0.11: PlayStation disc images
+
+Open a PS1 `.bin` with **Open ROM** (`.iso` and `.img` work too). The app reads the disc's file system and lists every file; **Extract all** saves the whole disc, or tap a file to save just that one.
+
+- **Disc layouts:** raw `.bin` (2352-byte sectors, Mode 2 or Mode 1), 2336-byte Mode 2 images, and plain 2048-byte `.iso`. Detection is by content, so a PS1 `.bin` is never mistaken for a Mega Drive `.bin`.
+- **Multi-track games:** open the first track (the data track, usually `Track 01.bin`). The other tracks are CD audio and have no files on them. You don't need the `.cue`.
+- **Output:** `PS1_<boot file>_<time>/`, with the disc's own folder structure and file names.
+- **TIM images → PNG.** All four depths (4, 8, 16, 24-bit). A TIM with several palettes gives one PNG per palette (`_clut01`, `_clut02` …, up to 16). Pure black is transparent, as on the console.
+- **TIMs inside other files:** many games pack their TIMs into their own archives. Every file up to 16 MB (except the game executable) is scanned, and TIMs found inside are saved to `<file>_tims/0x<offset>.png`. Compressed images can't be found this way.
+- **VAG sounds → WAV.**
+- **XA audio and STR video** are stored in a special sector format, so they're saved as raw 2352-byte sectors. They aren't converted here; open them with a tool such as jPSXdec.
+
+Not included: 3D models (TMD and game-specific formats), VAB sound banks, SEQ music, decoding XA/STR, and writing files back to the disc.
+
+**How this was checked:** `tests/Ps1Test.java` runs against a test disc (`tests/fixtures/ps1`) whose ISO 9660 file system was written by an independent library (pycdlib) and wrapped into raw Mode 2 sectors, including Form 2 files. The same disc is tested as 2352, 2336 and 2048-byte images. TIM images are encoded from known source pixels, so the expected output is the source image. The VAG expectation comes from a test encoder written alongside the decoder, so that check is weaker. Not yet tried on a retail disc.
 
 ## New in v0.10: more 3DS and DS formats, unpacked automatically
 

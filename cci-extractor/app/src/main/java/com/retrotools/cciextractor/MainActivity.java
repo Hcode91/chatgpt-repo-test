@@ -65,6 +65,7 @@ public class MainActivity extends Activity {
     private static final int SAVE_NDS = 316;
     private static final int PICK_PALETTE = 317;
     private static final int PICK_PAK_FOLDER = 318;
+    private static final int PICK_PS1_FOLDER = 319;
     private static final String DIR_MIME = DocumentsContract.Document.MIME_TYPE_DIR;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -75,6 +76,9 @@ public class MainActivity extends Activity {
     private NdsArchive.Info ndsInfo;
     private RetroTiles.Info retroInfo;
     private TorusPak.Info pakInfo;
+    private Ps1Disc.Info ps1Info;
+    /** Index of the single disc file to extract, or -1 for the whole disc. */
+    private int ps1Only = -1;
     /** Index of the single bundle to extract, or -1 for the whole PAK. */
     private int pakOnly = -1;
     private RetroTiles.Mode retroMode;
@@ -168,7 +172,7 @@ public class MainActivity extends Activity {
         controls.setOrientation(LinearLayout.HORIZONTAL);
         controls.setPadding(dp(6), 0, dp(6), 0);
         root.addView(controls);
-        open = button("Open ROM (3DS / DS / NES / SNES / MD / GB / GBA) or PAK");
+        open = button("Open ROM (3DS / DS / PS1 / NES / SNES / MD / GB / GBA) or PAK");
         extractAll = button("Extract all");
         controls.addView(open, new LinearLayout.LayoutParams(0, dp(54), 1));
         controls.addView(extractAll, new LinearLayout.LayoutParams(0, dp(54), 1));
@@ -219,7 +223,8 @@ public class MainActivity extends Activity {
         paletteButton.setOnClickListener(v -> choosePalette());
         upscaleHd.setOnClickListener(v -> chooseHdUpscale());
         extractAll.setOnClickListener(v -> {
-            if (pakInfo != null) beginPakExtract(-1);
+            if (ps1Info != null) beginPs1Extract(-1);
+            else if (pakInfo != null) beginPakExtract(-1);
             else if (retroInfo != null) beginRetroExport(-1);
             else if (nesInfo != null) beginNesExport(-1);
             else if (ndsInfo != null) beginNdsExtract(ndsNodes);
@@ -241,6 +246,18 @@ public class MainActivity extends Activity {
             if (busy || position < 0 || position >= displayed.size()) return;
             if (retroInfo != null || nesInfo != null) {
                 showTilePreview(position);
+                return;
+            }
+            if (ps1Info != null) {
+                if (position >= ps1Info.files.size()) return;
+                Ps1Disc.FileEntry file = ps1Info.files.get(position);
+                new AlertDialog.Builder(this).setTitle(file.path)
+                        .setMessage("Size: " + human(file.exportSize()) + (file.form2 ? "\n\nStored as XA audio / STR video " +
+                                "sectors, so it's saved as raw 2352-byte sectors (open it with a tool such as jPSXdec)." : "") +
+                                "\n\nExtract this file?")
+                        .setNegativeButton("Cancel", null)
+                        .setPositiveButton("Extract", (d, w) -> beginPs1Extract(position))
+                        .show();
                 return;
             }
             if (pakInfo != null) {
@@ -328,6 +345,7 @@ public class MainActivity extends Activity {
             ndsInfo = null;
             retroInfo = null;
             pakInfo = null;
+            ps1Info = null;
             retroMode = null;
             ndsNodes.clear();
             expandedNds.clear();
@@ -342,7 +360,17 @@ public class MainActivity extends Activity {
                     try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
                          FileChannel channel = stream.getChannel()) {
                         String inputName = getFilename(uri);
-                        if (NesCodec.isNes(channel)) {
+                        if (Ps1Disc.isDisc(channel)) {
+                            Ps1Disc.Info parsedDisc = Ps1Disc.parse(channel);
+                            runOnUiThread(() -> {
+                                ps1Info = parsedDisc; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null;
+                                busy = false;
+                                summary.setText(parsedDisc.description());
+                                detail.setText("Extract all, or tap a file to extract just that one. TIM images are saved as PNG " +
+                                        "and VAG sounds as WAV; TIMs packed inside other files are found too.");
+                                render();
+                            });
+                        } else if (NesCodec.isNes(channel)) {
                             NesCodec.Info parsedNes = NesCodec.parse(channel);
                             runOnUiThread(() -> {
                                 nesInfo = parsedNes; archive = null; ndsInfo = null; retroInfo = null;
@@ -412,7 +440,7 @@ public class MainActivity extends Activity {
                     }
                 } catch (Exception e) {
                     runOnUiThread(() -> {
-                        busy = false; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null;
+                        busy = false; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null;
                         summary.setText("Could not open game file");
                         detail.setText(message(e));
                         render();
@@ -457,6 +485,8 @@ public class MainActivity extends Activity {
             startActivityForResult(save, SAVE_NDS);
         } else if (request == SAVE_NDS && ndsImportNode != null && ndsPngUri != null) {
             rebuildNds(uri);
+        } else if (request == PICK_PS1_FOLDER && ps1Info != null) {
+            extractPs1(uri);
         } else if (request == PICK_PAK_FOLDER && pakInfo != null) {
             extractPak(uri);
         } else if (request == PICK_PALETTE) {
@@ -527,6 +557,10 @@ public class MainActivity extends Activity {
                                 retroInfo.lzBlocks.get(i).offset,retroInfo.lzBlocks.get(i).size/retroMode.tileBytes) :
                         String.format(Locale.ROOT,"📄 %s page %04d",retroMode.slug,i));
         }
+        if (ps1Info != null) {
+            for (Ps1Disc.FileEntry f : ps1Info.files)
+                displayed.add("💿 " + f.path + " · " + human(f.exportSize()) + (f.form2 ? " · raw XA/STR sectors" : ""));
+        }
         if (pakInfo != null) {
             for (TorusPak.Hunk h : pakInfo.hunks)
                 displayed.add("📦 " + h.name + " · " + human(h.data.storedSize) + " packed");
@@ -556,6 +590,7 @@ public class MainActivity extends Activity {
                         " (" + displayed.size() + " sheets)" :
                 "/" + activePath + "   (" + displayed.size() + " items)");
         if (pakInfo != null) location.setText("/PAK   (" + displayed.size() + " bundles)");
+        if (ps1Info != null) location.setText("/" + ps1Info.title() + "   (" + displayed.size() + " files, " + human(ps1Info.totalBytes) + ")");
         open.setEnabled(!busy);
         pngToBtex.setEnabled(!busy);
         upscaleHd.setEnabled(!busy);
@@ -570,7 +605,7 @@ public class MainActivity extends Activity {
         pngToRetro.setVisibility(retroInfo!=null?View.VISIBLE:View.GONE);
         if(retroMode!=null)retroFormat.setText("Format: "+retroMode.slug);
         extractAll.setText((nesInfo != null || retroInfo != null) ? "Export all tile PNGs" : "Extract all");
-        extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null || pakInfo != null));
+        extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null || pakInfo != null || ps1Info != null));
         extractHere.setEnabled(!busy && (archive != null && !entriesIn(activePath).isEmpty() ||
                 ndsInfo != null && !ndsEntriesIn(activePath).isEmpty()));
         up.setEnabled(!busy && (archive != null || ndsInfo!=null) && !activePath.isEmpty());
@@ -1485,6 +1520,125 @@ public class MainActivity extends Activity {
                 });
             }
         });
+    }
+
+    private void beginPs1Extract(int onlyFile) {
+        if (busy || ps1Info == null) return;
+        ps1Only = onlyFile;
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        startActivityForResult(intent, PICK_PS1_FOLDER);
+    }
+
+    /** PS1 disc: the disc's folder tree as is, plus PNGs for TIM images and WAVs for VAG sounds. */
+    private void extractPs1(Uri tree) {
+        if (busy || ps1Info == null || imageUri == null) return;
+        final Ps1Disc.Info info = ps1Info;
+        final int only = ps1Only;
+        busy = true; cancelled.set(false); render();
+        summary.setText("Extracting disc files...");
+        worker.execute(() -> {
+            final long[] stats = new long[5]; // files, bytes, PNGs, WAVs, raw Form 2 files
+            try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                if (descriptor == null) throw new IOException("Could not reopen the disc image");
+                try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
+                     FileChannel channel = stream.getChannel()) {
+                    String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+                    Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+                    String folderName = "PS1_" + TorusPak.safeName(info.title()).replace(' ', '_') + "_" + stamp;
+                    Uri folder = DocumentsContract.createDocument(getContentResolver(), parent, DIR_MIME, folderName);
+                    if (folder == null) throw new IOException("Cannot create output folder");
+                    Map<String, Uri> folders = new HashMap<>();
+                    folders.put("", folder);
+                    int total = only >= 0 ? 1 : info.files.size(), done = 0;
+                    for (int index = 0; index < info.files.size(); index++) {
+                        if (only >= 0 && index != only) continue;
+                        if (cancelled.get()) break;
+                        Ps1Disc.FileEntry file = info.files.get(index);
+                        final int position = ++done;
+                        final long bytesSoFar = stats[1];
+                        runOnUiThread(() -> {
+                            summary.setText("Extracting " + position + "/" + total + "...");
+                            detail.setText(file.path + "\n" + human(bytesSoFar) + " written");
+                        });
+                        int slash = file.path.lastIndexOf('/');
+                        String dirPath = slash < 0 ? "" : file.path.substring(0, slash);
+                        String name = slash < 0 ? file.path : file.path.substring(slash + 1);
+                        Uri dir = ensureFolder(dirPath, folders);
+                        boolean small = !file.form2 && file.size <= 16L << 20;
+                        byte[] content = null;
+                        if (small) {
+                            content = Ps1Disc.read(channel, info.layout, file);
+                            writeDoc(dir, name, "application/octet-stream", content);
+                        } else {
+                            Uri out = DocumentsContract.createDocument(getContentResolver(), dir, "application/octet-stream", name);
+                            if (out == null) throw new IOException("Cannot create " + name);
+                            try (OutputStream os = getContentResolver().openOutputStream(out, "w")) {
+                                if (os == null) throw new IOException("Cannot write " + name);
+                                java.io.BufferedOutputStream buffered = new java.io.BufferedOutputStream(os, 1 << 20);
+                                Ps1Disc.copy(channel, info.layout, file, buffered);
+                                buffered.flush();
+                            }
+                        }
+                        stats[0]++; stats[1] += file.exportSize();
+                        if (file.form2) stats[4]++;
+                        if (content != null) convertPs1(content, name, dirPath, dir, folders, stats);
+                    }
+                }
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    String result = stats[0] + " file(s), " + human(stats[1]) + ". " + stats[2] + " image(s) saved as PNG, " +
+                            stats[3] + " sound(s) as WAV." + (stats[4] > 0 ? "\n\n" + stats[4] + " XA audio / STR video file(s) " +
+                            "were saved as raw 2352-byte sectors; open them with a tool such as jPSXdec." : "");
+                    summary.setText("Disc extraction " + (cancelled.get() ? "cancelled" : "complete"));
+                    detail.setText(result);
+                    new AlertDialog.Builder(this).setTitle(cancelled.get() ? "Disc extraction cancelled" : "Disc extraction complete")
+                            .setMessage(result + "\n\nThe disc image is unchanged.").setPositiveButton("OK", null).show();
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                final String why = e instanceof Exception ? message((Exception) e) : "Not enough memory";
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Disc extraction failed"); detail.setText(why);
+                    new AlertDialog.Builder(this).setTitle("Disc extraction failed")
+                            .setMessage(why).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+    /** TIM → PNG (one per palette), VAG → WAV, and TIMs embedded in any other file → <file>_tims/. Never throws. */
+    private void convertPs1(byte[] content, String name, String dirPath, Uri dir, Map<String, Uri> folders, long[] stats) {
+        try {
+            String stem = name.contains(".") ? name.substring(0, name.lastIndexOf('.')) : name;
+            if (Ps1Assets.isTim(content)) {
+                for (Ps1Assets.Image img : Ps1Assets.decodeTim(content, 0)) {
+                    writePng(dir, stem + (img.clut == 0 ? "" : String.format(Locale.ROOT, "_clut%02d", img.clut)) + ".png",
+                            img.width, img.height, img.argb);
+                    stats[2]++;
+                }
+                return;
+            }
+            if (Ps1Assets.isVag(content)) {
+                writeDoc(dir, stem + ".wav", "audio/wav", Ps1Assets.vagToWav(content));
+                stats[3]++;
+                return;
+            }
+            String lower = name.toLowerCase(Locale.ROOT);
+            if (lower.endsWith(".exe") || lower.matches("s[a-z]{3}_\\d{3}\\.\\d{2}")) return;   // program code
+            List<Ps1Assets.Found> found = Ps1Assets.scanTims(content);
+            if (found.isEmpty()) return;
+            Uri tims = ensureFolder((dirPath.isEmpty() ? "" : dirPath + "/") + name + "_tims", folders);
+            for (Ps1Assets.Found f : found) {
+                if (cancelled.get()) return;
+                for (Ps1Assets.Image img : Ps1Assets.decodeTim(content, f.offset)) {
+                    writePng(tims, String.format(Locale.ROOT, "0x%08X%s.png", f.offset,
+                            img.clut == 0 ? "" : String.format(Locale.ROOT, "_clut%02d", img.clut)), img.width, img.height, img.argb);
+                    stats[2]++;
+                }
+            }
+        } catch (Exception | OutOfMemoryError unsupported) {
+            // The original file is already saved.
+        }
     }
 
     private void beginPakExtract(int onlyHunk) {
