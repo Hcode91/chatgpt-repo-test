@@ -171,11 +171,16 @@ if(INFAMOUS_EU_UPSTREAM_TITLE)
                 list(APPEND _eu_spu_rc "${_d}/spu_recomp_rc.c")
             endif()
         endforeach()
-        set(EU_SPU_SOURCES ${_eu_spu_plain} ${_eu_spu_rc})
+        # Hand-written native replacements for parts of a job module. The private build puts them next to
+        # the module's generated sources as eu_native_*.c (none in a plain build).
+        file(GLOB _eu_spu_native CONFIGURE_DEPENDS
+            "${INFAMOUS_EU_SPU_DIR}/*/eu_native_*.c")
+        set(EU_SPU_SOURCES ${_eu_spu_plain} ${_eu_spu_rc} ${_eu_spu_native})
         if(EU_SPU_SOURCES)
             list(LENGTH _eu_spu_plain _eu_spu_n)
             list(LENGTH _eu_spu_rc _eu_spu_rc_n)
-            message(STATUS "European game: ${_eu_spu_n} lifted SPU image(s) + ${_eu_spu_rc_n} register-cached twin(s)")
+            list(LENGTH _eu_spu_native _eu_spu_native_n)
+            message(STATUS "European game: ${_eu_spu_n} lifted SPU image(s) + ${_eu_spu_rc_n} register-cached twin(s) + ${_eu_spu_native_n} native job source(s)")
             # The real title's many lifted SPU functions need the upstream
             # musttail indirect dispatch trampoline (not the stubbed runner).
             list(APPEND EU_SPU_SOURCES
