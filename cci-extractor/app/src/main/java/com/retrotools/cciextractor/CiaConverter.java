@@ -15,7 +15,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * Repackages Nintendo 3DS titles between CIA (installable) and CCI/.3ds (cartridge image) containers.
  * Only the container changes: NCCH partitions are copied byte-for-byte. Title-key encrypted CIA contents
- * are rejected; nothing is decrypted or encrypted here.
+ * are rejected; nothing is decrypted or encrypted here. Encrypted CIAs are detected with
+ * {@link #needsDecryption} and handed to the native engine ({@code NativeCia}) by the Convert tab instead.
  */
 public final class CiaConverter {
     public static final int CERT_CHAIN_SIZE = 0xA00;
@@ -142,6 +143,21 @@ public final class CiaConverter {
         }
         if (l.contents.isEmpty()) throw new IOException("CIA contains no contents");
         return l;
+    }
+
+    /**
+     * True when a CIA can't simply be repackaged: a content is title-key encrypted, or an NCCH partition
+     * isn't flagged NoCrypto. Such files go through the native decryption engine instead of {@link #ciaToCci}.
+     */
+    public static boolean needsDecryption(FileChannel ch) throws IOException {
+        CiaLayout l = parseCia(ch);
+        for (long[] c : l.contents) {
+            if ((c[2] & 1) != 0) return true;
+            if (c[3] < 0x200) continue;
+            byte[] ncch = read(ch, c[4], 0x200);
+            if (magic(ncch, 0x100, "NCCH") && (ncch[0x18F] & 4) == 0) return true;
+        }
+        return false;
     }
 
     /** CIA → CCI. Content index 0 becomes partition 0 (game), 1 → manual, 2 → download play child. */

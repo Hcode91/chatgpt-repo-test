@@ -92,9 +92,18 @@ public class ConvertersTest {
             // Title-key encrypted CIA is refused
             byte[] cia = Files.readAllBytes(ciaPath);
             CiaConverter.CiaLayout l2;
-            try (FileChannel ch = FileChannel.open(ciaPath)) { l2 = CiaConverter.parseCia(ch); }
+            try (FileChannel ch = FileChannel.open(ciaPath)) {
+                l2 = CiaConverter.parseCia(ch);
+                check(!CiaConverter.needsDecryption(ch), "decrypted CIA needs no engine");
+            }
+            // NCCH-level encryption (NoCrypto flag cleared) is routed to the decryption engine
+            byte[] ncchEncrypted = cia.clone();
+            ncchEncrypted[(int) l2.contents.get(0)[4] + 0x18F] &= ~4;
+            Files.write(ciaPath, ncchEncrypted);
+            try (FileChannel ch = FileChannel.open(ciaPath)) { check(CiaConverter.needsDecryption(ch), "NCCH-encrypted CIA detected"); }
             cia[(int) l2.tmdOffset + 0xB04 + 7] |= 1;
             Files.write(ciaPath, cia);
+            try (FileChannel ch = FileChannel.open(ciaPath)) { check(CiaConverter.needsDecryption(ch), "title-key encrypted CIA detected"); }
             try (FileChannel ch = FileChannel.open(ciaPath)) {
                 CiaConverter.ciaToCci(ch, new ByteArrayOutputStream(), null, null);
                 throw new AssertionError("encrypted CIA accepted");
