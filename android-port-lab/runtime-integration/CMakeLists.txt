@@ -88,8 +88,12 @@ if(INFAMOUS_PRIVATE_RECOMP)
     # -ffp-contract=off is a CORRECTNESS flag on arm64: clang otherwise fuses
     # a*b+c into one fmadd, so lifted PPC float maths would round differently
     # from the console (a PPC fmadd is emitted as an explicit fma() call).
+    # -g0: the NDK toolchain file adds -g to everything. For these four 40 MB machine-generated files
+    # the debug information is of no use (the crash handler and the samplers name functions from the
+    # symbol table), and producing it took the compiler past 6 GB per file once the accesses below
+    # were inlined.
     set_source_files_properties(${PRIVATE_PPU_SOURCES} PROPERTIES
-        COMPILE_OPTIONS "-w;-ffp-contract=off")
+        COMPILE_OPTIONS "-w;-ffp-contract=off;-g0")
     # Inline guest-memory accesses in the translated game code. Upstream's CMakeLists defines
     # PPU_INLINE_LOADS for these files only in its MSVC branch, so off Windows every load and store
     # was a call into vm_read* / vm_write* (about 30% of the main thread's samples on the phone were
