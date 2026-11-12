@@ -106,7 +106,7 @@ public final class EuBootActivity extends Activity {
     private SharedPreferences prefs;
     private TextView buildInfo, elfStatus, dataStatus, milestones, logView, runState;
     private EditText pathEdit, extraEnv;
-    private CheckBox verbose, upstreamEnv, lean, lowCpu, openScreen;
+    private CheckBox verbose, upstreamEnv, lean, lowCpu, skipMovies, openScreen;
     private Button rendererButton;
     private int renderer;
     private Button bootButton, stopButton;
@@ -193,6 +193,11 @@ public final class EuBootActivity extends Activity {
         lowCpu.setText("Low-CPU preset (upstream LOW_CPU: lower animation/draw detail)");
         lowCpu.setTextColor(Color.WHITE);
         root.addView(lowCpu);
+        skipMovies = new CheckBox(this);
+        skipMovies.setText("Skip cutscene videos");
+        skipMovies.setTextColor(Color.WHITE);
+        skipMovies.setChecked(prefs.getBoolean("skip_movies", false));
+        root.addView(skipMovies);
         openScreen = new CheckBox(this);
         openScreen.setText("Open the game screen when booting");
         openScreen.setTextColor(Color.WHITE);
@@ -601,6 +606,7 @@ public final class EuBootActivity extends Activity {
         // with < 17 CPU threads; off Windows its auto mode is always off.
         if (lean.isChecked()) env.put("V241A_LEAN", "1");
         if (lowCpu.isChecked()) env.put("LOW_CPU", "1");
+        if (skipMovies.isChecked()) env.put("EU_SKIP_MOVIES", "1");
         // inFamous' immediate-mode movie quad carries its UVs in attribute 1
         // (upstream rsx_null_backend.c note) -- for the software preview.
         env.put("NULLSW_UVATTR", "1");
@@ -611,7 +617,8 @@ public final class EuBootActivity extends Activity {
         EuBridge.rendererLabel = renderer == 0 ? "Starting renderer…"
                 : renderer == 1 ? "Software preview (CPU, no shaders)" : "Speed test: drawing off";
         header.append("# lean=").append(lean.isChecked()).append(" low_cpu=")
-                .append(lowCpu.isChecked()).append('\n');
+                .append(lowCpu.isChecked()).append(" skip_movies=").append(skipMovies.isChecked()).append('\n');
+        prefs.edit().putBoolean("skip_movies", skipMovies.isChecked()).apply();
         // Extra settings typed by the user: KEY=VALUE pairs separated by spaces or new lines, applied last.
         String extra = extraEnv.getText().toString().trim();
         prefs.edit().putString("extra_env", extra).apply();
