@@ -1238,6 +1238,101 @@ change("runtime/spu/spu_helpers.h",
 #else
 #define SPU__FSIMD 0
 #endif""")
+# "Skip cutscene videos" (EU_SKIP_MOVIES=1, launcher tick box). The story videos are Bink files the game
+# plays to the end; the number of frames comes from the file header. With the switch on, the header of
+# every movies/cutscene/*.bik is handed to the game with a frame count of 1 (EU_SKIP_MOVIES_FRAMES), so
+# the video is over as soon as it starts. Nothing on disk is changed, and the in-world TV screens
+# (movies/tv) are left alone.
+change("runtime/ppu/ppu_fs.cpp",
+"""static int fd_alloc_file(FILE* f)""",
+"""static struct { uint8_t on, dup; uint32_t keep; } g_eu_skipmv[FS_MAX];
+static void eu_skip_movie_open(int fd, const char* gpath, FILE* f)
+{
+    if (fd < 0 || fd >= FS_MAX) return;
+    g_eu_skipmv[fd].on = 0;
+    static int s_on = -1; static uint32_t s_keep = 1;
+    if (s_on < 0) { const char* e = getenv("EU_SKIP_MOVIES"); s_on = (e && *e == '1') ? 1 : 0;
+                    const char* k = getenv("EU_SKIP_MOVIES_FRAMES"); if (k && atoi(k) > 0) s_keep = (uint32_t)atoi(k);
+                    if (s_on) fprintf(stderr, "[skip-movie] cutscene videos are cut to %u frame(s) (EU_SKIP_MOVIES)\\\\n", (unsigned)s_keep); }
+    if (!s_on || !f) return;
+    const char* d = strstr(gpath, "/movies/cutscene/");
+    if (!d || !strstr(d, ".bik")) return;
+    unsigned char h[20];
+    const long pos = ftell(f);
+    if (pos < 0 || fseek(f, 0, SEEK_SET) != 0) return;
+    const size_t got = fread(h, 1, sizeof h, f);
+    fseek(f, pos, SEEK_SET);
+    if (got != sizeof h || memcmp(h, "BIK", 3) != 0) {
+        fprintf(stderr, "[skip-movie] %s: not a Bink 1 file (starts %02X %02X %02X %02X), left alone\\\\n", d + 17, h[0], h[1], h[2], h[3]);
+        return; }
+    const uint32_t frames = (uint32_t)h[8] | ((uint32_t)h[9] << 8) | ((uint32_t)h[10] << 16) | ((uint32_t)h[11] << 24);
+    const uint32_t again  = (uint32_t)h[16] | ((uint32_t)h[17] << 8) | ((uint32_t)h[18] << 16) | ((uint32_t)h[19] << 24);
+    if (frames <= s_keep) return;
+    g_eu_skipmv[fd].on = 1; g_eu_skipmv[fd].dup = (again == frames); g_eu_skipmv[fd].keep = s_keep;
+    fprintf(stderr, "[skip-movie] %s: %u frames -> %u\\\\n", d + 17, (unsigned)frames, (unsigned)s_keep);
+}
+/* patch the frame count where a read covers it: file offsets 8..11, and 16..19 when that word repeats it */
+static void eu_skip_movie_fix(int fd, long long pos, unsigned char* buf, size_t n)
+{
+    if (fd < 0 || fd >= FS_MAX || !g_eu_skipmv[fd].on || pos < 0 || pos >= 20 || !n) return;
+    for (int w = 0; w < 2; w++) {
+        if (w && !g_eu_skipmv[fd].dup) break;
+        for (int k = 0; k < 4; k++) {
+            const long long off = (w ? 16 : 8) + k;
+            if (off >= pos && off < pos + (long long)n) buf[off - pos] = (unsigned char)(g_eu_skipmv[fd].keep >> (8 * k));
+        }
+    }
+}
+static int fd_alloc_file(FILE* f)""")
+change("runtime/ppu/ppu_fs.cpp",
+"""    g_fd_cut[fd] = (uint8_t)fs_is_story_cutscene(gpath);""",
+"""    g_fd_cut[fd] = (uint8_t)fs_is_story_cutscene(gpath);
+    eu_skip_movie_open(fd, gpath, f);""")
+change("runtime/ppu/ppu_fs.cpp",
+"""    size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */""",
+"""    size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
+    eu_skip_movie_fix(fd, (long long)fpos_before, (unsigned char*)vm_base + buf, n);""")
+change("runtime/ppu/ppu_fs.cpp",
+"""            n = fread(vm_base + buf, 1, (size_t)size, g_files[fd]);""",
+"""        {   n = fread(vm_base + buf, 1, (size_t)size, g_files[fd]);
+            eu_skip_movie_fix(fd, (long long)offset, (unsigned char*)vm_base + buf, n); }""")
+
+# Save data. (1) The list of save folders handed to the game: newest first, with each folder's list
+# parameter, and logged in full (root, prefix, every folder with its files) -- a save written in one run
+# was not offered back in the next and the log could not say why. (2) Every save says in the log
+# whether the game supplied the descriptor (PARAM.SFO) parameters, and what the folder holds afterwards.
+change("libs/system/cellSaveData.c",
+'        DIR* dp = opendir(s_save_root);\n        if (!dp)\n            return 0;\n\n        struct dirent* de;\n        while ((de = readdir(dp)) != NULL) {\n            if (de->d_name[0] == \'.\')\n                continue;\n            /* Check it\'s a directory */\n            char full[1024];\n            snprintf(full, sizeof(full), "%s/%s", s_save_root, de->d_name);\n            if (!dir_exists(full))\n                continue;\n            if (prefix && prefix[0] && strncmp(de->d_name, prefix, strlen(prefix)) != 0)\n                continue;\n            if (count < max && dirList) {\n                memset(&dirList[count], 0, sizeof(CellSaveDataDirList));\n                strncpy(dirList[count].dirName, de->d_name,\n                        CELL_SAVEDATA_DIRNAME_SIZE - 1);\n            }\n            count++;\n        }\n        closedir(dp);\n',
+'        /* Android port: the save folders newest first (the order the console\'s own list has by default --\n         * a title that auto-loads "the first entry" means its most recent save), each with the list\n         * parameter from its PARAM.SFO, and a log line per folder so a save that is written but not found\n         * again can be traced from the log alone. */\n        struct { char name[CELL_SAVEDATA_DIRNAME_SIZE]; long long mt; } ent[64]; int ne = 0;\n        { char rp[1024]; if (!realpath(s_save_root, rp)) snprintf(rp, sizeof rp, "%s (unresolved)", s_save_root);\n          printf("[cellSaveData] list: root \'%s\', prefix \'%s\', room for %u\\n", rp, prefix ? prefix : "", (unsigned)max); }\n        DIR* dp = opendir(s_save_root);\n        if (!dp) { printf("[cellSaveData] list: cannot open the save root\\n"); return 0; }\n\n        struct dirent* de;\n        while ((de = readdir(dp)) != NULL) {\n            if (de->d_name[0] == \'.\')\n                continue;\n            char full[1024];\n            snprintf(full, sizeof(full), "%s/%s", s_save_root, de->d_name);\n            if (!dir_exists(full))\n                continue;\n            const int match = !(prefix && prefix[0] && strncmp(de->d_name, prefix, strlen(prefix)) != 0);\n            long long newest = 0; int nfiles = 0; long long bytes = 0;\n            { DIR* sd = opendir(full); struct dirent* fe;\n              if (sd) { while ((fe = readdir(sd)) != NULL) { if (fe->d_name[0] == \'.\') continue;\n                            char fp[1300]; snprintf(fp, sizeof fp, "%s/%s", full, fe->d_name);\n                            HOST_STAT_T fs; if (HOST_STAT(fp, &fs) == 0) { nfiles++; bytes += (long long)fs.st_size;\n                                if ((long long)fs.st_mtim.tv_sec > newest) newest = (long long)fs.st_mtim.tv_sec; } }\n                        closedir(sd); } }\n            printf("[cellSaveData] list:   %s  %s, %d file(s), %lld bytes, descriptor %s, last written %lld s ago\\n",\n                   de->d_name, match ? "offered" : "not offered (prefix)", nfiles, bytes,\n                   dir_has_save(full) ? "present" : "MISSING", newest ? (long long)time(NULL) - newest : -1LL);\n            if (!match) continue;\n            if (ne < 64) { snprintf(ent[ne].name, sizeof ent[ne].name, "%s", de->d_name); ent[ne].mt = newest; ne++; }\n            count++;\n        }\n        closedir(dp);\n        for (int i = 1; i < ne; i++)            /* newest first */\n            for (int j = i; j > 0 && ent[j].mt > ent[j - 1].mt; j--) {\n                char tn[CELL_SAVEDATA_DIRNAME_SIZE]; long long tm = ent[j].mt;\n                memcpy(tn, ent[j].name, sizeof tn); memcpy(ent[j].name, ent[j - 1].name, sizeof tn); memcpy(ent[j - 1].name, tn, sizeof tn);\n                ent[j].mt = ent[j - 1].mt; ent[j - 1].mt = tm; }\n        for (int i = 0; i < ne && (u32)i < max && dirList; i++) {\n            memset(&dirList[i], 0, sizeof(CellSaveDataDirList));\n            strncpy(dirList[i].dirName, ent[i].name, CELL_SAVEDATA_DIRNAME_SIZE - 1);\n            char full[1024]; CellSaveDataSystemFileParam sp;\n            snprintf(full, sizeof(full), "%s/%s", s_save_root, ent[i].name);\n            read_param_sfo(full, &sp);\n            memcpy(dirList[i].listParam, sp.listParam, sizeof dirList[i].listParam);\n        }\n')
+change("libs/system/cellSaveData.c",
+"""/* Enumerate save directories matching a prefix. Returns count, fills dirList up to max. */""",
+"""static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* param);
+/* Enumerate save directories matching a prefix. Returns count, fills dirList up to max. */""")
+change("libs/system/cellSaveData.c",
+"""    if (is_save && statSet.setParam) {
+        ensure_dirs(save_path);""",
+"""    if (is_save) printf("[cellSaveData] save '%s': the game %s descriptor parameters, re-create mode %u\\n", dirName,
+                        statSet.setParam ? "supplied" : "did NOT supply", (unsigned)statSet.reCreateMode);
+    if (is_save && statSet.setParam) {
+        ensure_dirs(save_path);""")
+change("libs/system/cellSaveData.c",
+"""    printf("[cellSaveData] %s complete for '%s'\\n",
+           is_save ? "SAVE" : "LOAD", dirName);
+    return CELL_OK;""",
+"""    printf("[cellSaveData] %s complete for '%s'\\n",
+           is_save ? "SAVE" : "LOAD", dirName);
+#if !defined(_WIN32)
+    if (is_save) {   /* what is on disk now */
+        DIR* sd = opendir(save_path); struct dirent* fe;
+        if (!sd) printf("[cellSaveData] after save: folder '%s' cannot be opened\\n", save_path);
+        else { while ((fe = readdir(sd)) != NULL) { if (fe->d_name[0] == '.') continue;
+                   char fp[1300]; snprintf(fp, sizeof fp, "%s/%s", save_path, fe->d_name);
+                   HOST_STAT_T fs; if (HOST_STAT(fp, &fs) == 0) printf("[cellSaveData] after save:   %s  %lld bytes\\n", fe->d_name, (long long)fs.st_size); }
+               closedir(sd); }
+    }
+#endif
+    return CELL_OK;""")
+
 # Scheduler switches of the SPURS runtime, changeable while running: the in-run comparison
 # (eu_android_bridge.c, g_eu_feat_flip / g_eu_lean_flip) inverts one V242A_* switch by name or
 # some lean-mode component bits for a stretch. Nothing changes while both are zero.
