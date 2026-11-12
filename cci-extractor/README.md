@@ -1,11 +1,24 @@
-# Game Asset Extractor (Android v0.7.0)
+# Game Asset Extractor (Android v0.8.0)
+
+## New in v0.8: encrypted CIA → CCI
+
+**CIA → CCI (.3ds)** on the Convert tab now accepts encrypted CIAs as well as decrypted ones.
+
+- **Encrypted CIA** (title-key or NCCH level): decrypted on the device and rebuilt as a *decrypted* CCI that emulators such as Azahar can load. This uses a bundled native engine: `ctrtool` and `makerom` from [3DSGuy/Project_CTR](https://github.com/3DSGuy/Project_CTR), wrapped by the JNI layer from [cia3ds-android](https://github.com/Hinoaaaaaf212/cia3ds-android) (both MIT, see `native/`).
+- **Decrypted CIA**: unchanged. It is still repackaged in pure Java, byte-for-byte.
+- **Games and demos only** for encrypted input. DLC, updates, system titles and DSiWare have no cartridge-image form, so they are refused with an explanation and no file is written.
+- **No network access.** Seed-encrypted titles use the bundled community `seeddb.bin`; a title whose seed isn't in it can't be decrypted.
+- **Free space:** the engine stages the decrypted contents in the app's cache while it works, so allow roughly twice the CIA's size free on internal storage.
+- The APK now contains native code for `arm64-v8a` and `armeabi-v7a` only.
+
+The engine is exercised in CI on small synthetic titles (`tests/run-native-engine-test.sh`). Those are generated unencrypted, so the decryption step itself isn't covered by an automated test.
 
 ## New in v0.7: Extract and Convert tabs
 
 The app now has two tabs. **Extract** holds everything from earlier versions. **Convert** adds:
 
 **3DS containers**
-- **CIA → CCI (.3ds):** repacks a *decrypted* CIA into a cartridge image. Content 0 becomes the game partition, 1 the manual, 2 Download Play. Title-key encrypted CIAs are refused; nothing is decrypted.
+- **CIA → CCI (.3ds):** repacks a *decrypted* CIA into a cartridge image. Content 0 becomes the game partition, 1 the manual, 2 Download Play. (v0.7 refused encrypted CIAs; from v0.8 they are decrypted first, see above.)
 - **CCI → CIA:** builds an unsigned CIA (contents unencrypted, SHA-256 hashes in the TMD). Install it with signature patches (e.g. Luma3DS + FBI). Update partitions are dropped.
 - The standard 3DS certificate chain that every CIA needs isn't bundled. **Save certificate chain from a CIA** copies it from any CIA you own (encrypted ones work for this step), and converting a CIA → CCI saves it automatically.
 

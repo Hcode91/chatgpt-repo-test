@@ -10,3 +10,5 @@ app/build/
 *.cxi
 *.cia
 test-build/
+.cxx/
+app/.cxx/

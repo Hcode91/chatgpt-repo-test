@@ -77,8 +77,9 @@ final class ConvertTab {
         box.setPadding(0, 0, 0, dp(16));
         TextView h1 = text("3DS containers", 17, Color.rgb(35, 45, 91));
         box.addView(h1);
-        box.addView(text("Repackages titles without changing their contents. Only decrypted CIAs can become CCIs; " +
-                "nothing is decrypted here (use GodMode9 on your own console for that).", 12, Color.DKGRAY));
+        box.addView(text("Decrypted CIAs are repackaged without changing their contents. Encrypted CIAs are " +
+                "decrypted on this device first (games and demos only) and saved as a decrypted CCI for emulators.",
+                12, Color.DKGRAY));
         ciaToCci = button("CIA → CCI (.3ds)");
         cciToCia = button("CCI (.3ds) → CIA");
         saveCert = button("Save certificate chain from a CIA");
@@ -119,7 +120,7 @@ final class ConvertTab {
         });
         saveCert.setOnClickListener(v -> pick(PICK_CERT_CIA, "*/*", false));
         textures.setOnClickListener(v -> pick(PICK_TEXTURES, "*/*", true));
-        cancel.setOnClickListener(v -> { cancelled.set(true); status.setText("Cancelling…"); });
+        cancel.setOnClickListener(v -> { cancelled.set(true); NativeCia.cancel(); status.setText("Cancelling…"); });
 
         ScrollView scroll = new ScrollView(activity);
         scroll.addView(box);
@@ -271,7 +272,61 @@ final class ConvertTab {
         };
     }
 
+    /** Encrypted CIAs (title-key or NCCH level) need the native engine; decrypted ones are repackaged in Java. */
+    private boolean needsEngine(Uri source) {
+        try (ParcelFileDescriptor pfd = activity.getContentResolver().openFileDescriptor(source, "r");
+             FileInputStream in = new FileInputStream(pfd.getFileDescriptor()); FileChannel ch = in.getChannel()) {
+            if (!CiaConverter.isCia(ch)) return false;      // let the Java path report "not a CIA"
+            try { return CiaConverter.needsDecryption(ch); }
+            catch (IOException unusualLayout) { return true; } // e.g. DLC with many contents: the engine explains why
+        } catch (Exception e) { return false; }
+    }
+
+    /** Encrypted CIA → decrypted CCI through the bundled ctrtool/makerom engine. */
+    private void runEncryptedCiaToCci(Uri source, Uri dest) {
+        final String label = "CIA → CCI (decrypting)";
+        final String name = filename(source);
+        busy = true; cancelled.set(false); refresh();
+        status.setText(label + "…"); log.setText("");
+        worker.execute(() -> {
+            final List<String> errors = new ArrayList<>();
+            final String[] titleId = {null};
+            try (ParcelFileDescriptor in = activity.getContentResolver().openFileDescriptor(source, "r");
+                 ParcelFileDescriptor out = activity.getContentResolver().openFileDescriptor(dest, "rwt")) {
+                if (in == null) throw new IOException("Cannot open source file");
+                if (out == null) throw new IOException("Cannot write output file");
+                int rc = NativeCia.ciaToCci(activity, in.getFd(), out.getFd(), name,
+                        (pct, msg) -> activity.runOnUiThread(() -> { if (busy) status.setText(msg + "… " + pct + "%"); }),
+                        line -> {
+                            String t = line.trim();
+                            if (t.startsWith("META: title_id=") && t.length() > 15) titleId[0] = t.substring(15).toUpperCase(Locale.ROOT);
+                            if (t.startsWith("ERR:") && errors.size() < 4) errors.add(t.substring(4).trim());
+                        });
+                if (rc != 0) {
+                    if (rc == NativeCia.RC_CANCELLED || cancelled.get()) throw new IOException("Cancelled");
+                    String detail = errors.isEmpty() ? "" : "\n\nDetails: " + String.join(" ", errors);
+                    throw new IOException(NativeCia.describe(rc) + (rc == NativeCia.RC_NOT_CONVERTIBLE ? "" : detail));
+                }
+                long bytes = out.getStatSize();
+                String cert = "";
+                if (loadCertChain() == null) {
+                    try (FileInputStream fin = new FileInputStream(in.getFileDescriptor()); FileChannel ch = fin.getChannel()) {
+                        storeCertChain(CiaConverter.certChainFromCia(ch));
+                        cert = "\nCertificate chain saved for CCI → CIA.";
+                    } catch (IOException ignored) { }
+                }
+                final String summary = (titleId[0] == null ? "" : "Title " + titleId[0] + " · ") +
+                        (bytes > 0 ? (bytes >> 20) + " MB · " : "") + "decrypted on this device" + cert;
+                activity.runOnUiThread(() -> { busy = false; refresh(); status.setText("CIA → CCI done"); log.setText(summary); });
+            } catch (Exception e) {
+                try { DocumentsContract.deleteDocument(activity.getContentResolver(), dest); } catch (Exception ignored) { }
+                activity.runOnUiThread(() -> { busy = false; refresh(); error("CIA → CCI failed", e); });
+            }
+        });
+    }
+
     private void runCiaToCci(Uri source, Uri dest) {
+        if (needsEngine(source)) { runEncryptedCiaToCci(source, dest); return; }
         runContainer("CIA → CCI", source, dest, (ch, out) -> {
             CiaConverter.Result r = CiaConverter.ciaToCci(ch, out, progress(), cancelled);
             out.flush();
