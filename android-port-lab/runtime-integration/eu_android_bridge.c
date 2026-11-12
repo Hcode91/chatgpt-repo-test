@@ -1285,7 +1285,7 @@ static void eu_perf_hint_tick(void)
  * settings is switched off, then everything is on again, then the next one is off, and so on. Frame rate and
  * the main thread's waiting share are measured for each stretch (its first 4 s are left out, things settle),
  * so both states see the same scenes and the same phone temperature.
- * EU_AB=name,name,...  (default EU_PPU_INLINE,EU_N205; also EU_SHORT_SPIN, EU_SPU_NICE, EU_LL_YIELD, EU_MAIN_BOOST, EU_PERF_HINT, EU_SPU_SERIAL,
+ * EU_AB=name,name,...  (default V242A_AUDSPIN,LEAN_LANESPIN,LEAN_KSPIN = scheduler choices, see g_eu_feat_flip; also V242A_NAP, LEAN_TASKWAIT, EU_PPU_INLINE, EU_N205, EU_SHORT_SPIN, EU_SPU_NICE, EU_LL_YIELD, EU_MAIN_BOOST, EU_PERF_HINT, EU_SPU_SERIAL,
  *                        EU_CORE_SPLIT, EU_SPURS_PARK, EU_INDEX_FAST, EU_VK_CB_USED). Which one goes first varies from run to run.
  * EU_AB=0 = no switching. */
 #define EU_AB_MAX 11
@@ -1303,7 +1303,33 @@ static void eu_ppu_inline_set(int on)
     else if (saved >= 0) { g_vm_fast_inline = saved; saved = -1; }
     ppu_vm_gate_update();
 }
+/* Scheduler choices of the SPURS runtime that upstream tuned on desktop processors, switchable while running
+ * so the in-run comparison can try the other setting on a phone (cellSpurs.c reads these two; Android patch):
+ *   g_eu_feat_flip  name of one upstream V242A_* switch whose current value is inverted
+ *   g_eu_lean_flip  "lean mode" component bits that are inverted
+ * In the comparison these items are not "off" but "changed" for their stretch:
+ *   V242A_AUDSPIN   audio SPURS thread spins 50 us after its last job before it naps (now: 300 us)
+ *   V242A_NAP       idle SPURS kernel threads sleep 1000 us per empty pass after 3 ms idle (now: 250 us); on Android
+ *                   they park after 5 ms anyway, so this barely matters and is not in the default list
+ *   LEAN_LANESPIN   job lane threads spin up to 200 us for the next pass instead of sleeping at once
+ *   LEAN_KSPIN      SPURS kernel threads keep yielding 500 us after their last busy pass (now: 50 us)
+ *   LEAN_TASKWAIT   the game thread's pure task waits poll instead of blocking */
+const char* volatile g_eu_feat_flip;
+volatile int g_eu_lean_flip;
+#define EU_LIVE_F_AUDSPIN  (1 << 16)
+#define EU_LIVE_F_NAP      (1 << 17)
+#define EU_LIVE_L_LANESPIN (1 << 18)
+#define EU_LIVE_L_KSPIN    (1 << 19)
+#define EU_LIVE_L_TASKWAIT (1 << 20)
+#define EU_LIVE_CHANGES    (EU_LIVE_F_AUDSPIN | EU_LIVE_F_NAP | EU_LIVE_L_LANESPIN | EU_LIVE_L_KSPIN | EU_LIVE_L_TASKWAIT)
+static void eu_sched_flip_set(int now)
+{
+    g_eu_feat_flip = (now & EU_LIVE_F_AUDSPIN) ? "V242A_AUDSPIN" : (now & EU_LIVE_F_NAP) ? "V242A_NAP" : NULL;
+    g_eu_lean_flip = ((now & EU_LIVE_L_LANESPIN) ? 0x08 : 0) | ((now & EU_LIVE_L_KSPIN) ? 0x01 : 0) | ((now & EU_LIVE_L_TASKWAIT) ? 0x20 : 0);
+}
 static struct { const char* name; int bit; } s_ab_known[] = {
+    {"V242A_AUDSPIN", EU_LIVE_F_AUDSPIN}, {"V242A_NAP", EU_LIVE_F_NAP}, {"LEAN_LANESPIN", EU_LIVE_L_LANESPIN},
+    {"LEAN_KSPIN", EU_LIVE_L_KSPIN}, {"LEAN_TASKWAIT", EU_LIVE_L_TASKWAIT},
     {"EU_CORE_SPLIT", EU_LIVE_CORE_SPLIT}, {"EU_MAIN_BOOST", EU_LIVE_MAIN_BOOST}, {"EU_SPURS_PARK", EU_LIVE_SPURS_PARK},
     {"EU_INDEX_FAST", EU_LIVE_INDEX_FAST}, {"EU_VK_CB_USED", EU_LIVE_CB_USED}, {"EU_LL_YIELD", EU_LIVE_LL_YIELD},
     {"EU_SPU_NICE", EU_LIVE_SPU_NICE}, {"EU_PERF_HINT", EU_LIVE_PERF_HINT},
@@ -1333,7 +1359,8 @@ static int eu_ab_table(char* line, int cap)
     for (int i = 0; i <= s_ab_n && off < cap - 64; i++) {
         if (!s_ab_acc[i].n) continue;
         off += snprintf(line + off, cap - off, "%s%s%s %.1f frames/s, main waiting %.0f%% (%d)", off ? " | " : "",
-                        i ? s_ab_known[s_ab_item[i - 1]].name : "all on", i ? " off" : "",
+                        i ? s_ab_known[s_ab_item[i - 1]].name : "all on",
+                        !i ? "" : (s_ab_known[s_ab_item[i - 1]].bit & EU_LIVE_CHANGES) ? " changed" : " off",
                         s_ab_acc[i].fps_sum / s_ab_acc[i].n, s_ab_acc[i].wait_sum / s_ab_acc[i].n, s_ab_acc[i].n);
     }
     if (!off) off = snprintf(line, cap, "nothing measured yet");
@@ -1350,7 +1377,7 @@ static void eu_ab_tick(void)
         const char* sv = getenv("EU_AB_SECS");
         if (sv && atoi(sv) >= 8) secs = atoi(sv);
         if (secs > 300) secs = 300;
-        if (!e || !*e) e = "EU_PPU_INLINE,EU_N205";
+        if (!e || !*e) e = "V242A_AUDSPIN,LEAN_LANESPIN,LEAN_KSPIN";
         if (&g_eu_frames_total && strcmp(e, "0")) {
             for (unsigned k = 0; k < sizeof s_ab_known / sizeof s_ab_known[0] && s_ab_n < EU_AB_MAX; k++) {
                 const char* hit = strstr(e, s_ab_known[k].name);
@@ -1361,7 +1388,7 @@ static void eu_ab_tick(void)
         if (s_ab_n) first = (int)((unsigned long)time(NULL) % (unsigned long)s_ab_n);
         char list[160] = "";
         for (int i = 0, o = 0; i < s_ab_n; i++) o += snprintf(list + o, sizeof list - o, "%s%s", i ? ", " : "", s_ab_known[s_ab_item[i]].name);
-        if (s_ab_n) fprintf(stderr, "[ab] in-run comparison: every %d s one of [%s] is switched off, then all on again "
+        if (s_ab_n) fprintf(stderr, "[ab] in-run comparison: every %d s one of [%s] is switched off or changed, then back to normal "
                             "(EU_AB=0 stops this; EU_AB=name,name picks; EU_AB_SECS)\n", secs, list);
         else fprintf(stderr, "[ab] in-run comparison: off\n");
     }
@@ -1377,6 +1404,7 @@ static void eu_ab_tick(void)
         if (s_main_nice && ((old ^ now) & EU_LIVE_MAIN_BOOST))
             setpriority(PRIO_PROCESS, (id_t)getpid(), (now & EU_LIVE_MAIN_BOOST) ? 0 : s_main_nice);
         if ((old ^ now) & EU_LIVE_PPU_INLINE) eu_ppu_inline_set(!(now & EU_LIVE_PPU_INLINE));
+        if ((old ^ now) & EU_LIVE_CHANGES) eu_sched_flip_set(now);
     }
     if (at == 4) { f0 = g_eu_frames_total; w0 = eu_main_wait_ns(NULL);
                    if (&g_eu_job_watch_ns) { jn0 = g_eu_job_watch_ns; jr0 = g_eu_job_watch_runs; } }
@@ -1396,7 +1424,8 @@ static void eu_ab_tick(void)
                                  (double)dn / 1000.0 / (double)dr, dr, (double)dn / (span * 1e7));
         }
         fprintf(stderr, "[ab] %d s with %s%s: %.1f frames/s, main thread waiting %.0f%%%s | averages so far (stretches): %s\n",
-                secs, off_item < 0 ? "everything on" : s_ab_known[s_ab_item[off_item]].name, off_item < 0 ? "" : " OFF",
+                secs, off_item < 0 ? "everything on" : s_ab_known[s_ab_item[off_item]].name,
+                off_item < 0 ? "" : (s_ab_known[s_ab_item[off_item]].bit & EU_LIVE_CHANGES) ? " CHANGED" : " OFF",
                 fps, wait, job, line);
     }
 }
