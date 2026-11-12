@@ -1,4 +1,17 @@
-# Game Asset Extractor (Android v0.8.0)
+# Game Asset Extractor (Android v0.9.0)
+
+## New in v0.9: Torus PAK asset packs (`packfile.dat`)
+
+Some 3DS games built on Torus Games' engine keep nearly everything in one `packfile.dat` inside RomFS. Extract it from the game as usual, then open the `.dat` itself with **Open ROM**.
+
+- The list shows each bundle ("hunk") in the pack, named from its manifest (`Global`, `HUB`, `Environment01_LOAD_01` …).
+- **Extract all** unpacks every bundle; tapping a bundle extracts just that one.
+- Output is `PAK_Extract_<time>/<Bundle>/<AssetType>/<AssetName>`, using the names stored in the pack.
+- **Textures (`TSETexture`) are saved as PNG.** They are standard 3DS ETC1 / ETC1A4; only the largest mip level is exported.
+- **Everything else is saved raw** as `.bin` (models, animations, sounds, scripts, string tables, collision, level data). Those formats are custom and aren't decoded. Each `.bin` holds the asset's records as `u32 size, u16 type, u16 flags, data`.
+- Read-only: there is no PNG → PAK import or repacking.
+
+The format was worked out from a single game's pack, so other Torus titles may use texture formats this doesn't know; those textures are saved raw and counted in the summary. Opening a `.cia` on the Extract tab now explains that it needs converting first instead of reporting an unsupported file.
 
 ## New in v0.8: encrypted CIA → CCI
 

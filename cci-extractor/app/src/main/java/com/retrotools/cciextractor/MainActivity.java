@@ -64,6 +64,7 @@ public class MainActivity extends Activity {
     private static final int PICK_NDS_PNG = 315;
     private static final int SAVE_NDS = 316;
     private static final int PICK_PALETTE = 317;
+    private static final int PICK_PAK_FOLDER = 318;
     private static final String DIR_MIME = DocumentsContract.Document.MIME_TYPE_DIR;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -73,6 +74,9 @@ public class MainActivity extends Activity {
     private NesCodec.Info nesInfo;
     private NdsArchive.Info ndsInfo;
     private RetroTiles.Info retroInfo;
+    private TorusPak.Info pakInfo;
+    /** Index of the single bundle to extract, or -1 for the whole PAK. */
+    private int pakOnly = -1;
     private RetroTiles.Mode retroMode;
     private int retroPage = -1;
     private Uri retroPngUri;
@@ -164,7 +168,7 @@ public class MainActivity extends Activity {
         controls.setOrientation(LinearLayout.HORIZONTAL);
         controls.setPadding(dp(6), 0, dp(6), 0);
         root.addView(controls);
-        open = button("Open ROM (3DS / DS / NES / SNES / MD / GB / GBA)");
+        open = button("Open ROM (3DS / DS / NES / SNES / MD / GB / GBA) or PAK");
         extractAll = button("Extract all");
         controls.addView(open, new LinearLayout.LayoutParams(0, dp(54), 1));
         controls.addView(extractAll, new LinearLayout.LayoutParams(0, dp(54), 1));
@@ -215,7 +219,8 @@ public class MainActivity extends Activity {
         paletteButton.setOnClickListener(v -> choosePalette());
         upscaleHd.setOnClickListener(v -> chooseHdUpscale());
         extractAll.setOnClickListener(v -> {
-            if (retroInfo != null) beginRetroExport(-1);
+            if (pakInfo != null) beginPakExtract(-1);
+            else if (retroInfo != null) beginRetroExport(-1);
             else if (nesInfo != null) beginNesExport(-1);
             else if (ndsInfo != null) beginNdsExtract(ndsNodes);
             else beginExtract(archive == null ? null : archive.entries);
@@ -236,6 +241,16 @@ public class MainActivity extends Activity {
             if (busy || position < 0 || position >= displayed.size()) return;
             if (retroInfo != null || nesInfo != null) {
                 showTilePreview(position);
+                return;
+            }
+            if (pakInfo != null) {
+                if (position >= pakInfo.hunks.size()) return;
+                TorusPak.Hunk hunk = pakInfo.hunks.get(position);
+                new AlertDialog.Builder(this).setTitle(hunk.name)
+                        .setMessage("Packed size: " + human(hunk.data.storedSize) + "\n\nExtract this bundle?")
+                        .setNegativeButton("Cancel", null)
+                        .setPositiveButton("Extract", (d, w) -> beginPakExtract(position))
+                        .show();
                 return;
             }
             if (archive == null && ndsInfo == null) return;
@@ -312,6 +327,7 @@ public class MainActivity extends Activity {
             nesInfo = null;
             ndsInfo = null;
             retroInfo = null;
+            pakInfo = null;
             retroMode = null;
             ndsNodes.clear();
             expandedNds.clear();
@@ -363,6 +379,19 @@ public class MainActivity extends Activity {
                                         "Only rebuild pages you've identified as real graphics.");
                                 render();
                             });
+                        } else if (TorusPak.isPak(channel)) {
+                            TorusPak.Info parsedPak = TorusPak.parse(channel);
+                            runOnUiThread(() -> {
+                                pakInfo = parsedPak; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null;
+                                busy = false;
+                                summary.setText(parsedPak.description());
+                                detail.setText("Extract all, or tap a bundle to extract just that one. Textures are saved " +
+                                        "as PNG; models, animations, sounds and other assets are saved as raw data.");
+                                render();
+                            });
+                        } else if (CiaConverter.isCia(channel)) {
+                            throw new IOException("This is a CIA, which can't be browsed directly. Go to the Convert tab, " +
+                                    "use CIA → CCI (.3ds), then open the .3ds it saves here.");
                         } else {
                             CciArchive.Info resultInfo = CciArchive.parse(channel);
                             runOnUiThread(() -> {
@@ -383,7 +412,7 @@ public class MainActivity extends Activity {
                     }
                 } catch (Exception e) {
                     runOnUiThread(() -> {
-                        busy = false; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null;
+                        busy = false; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null;
                         summary.setText("Could not open game file");
                         detail.setText(message(e));
                         render();
@@ -428,6 +457,8 @@ public class MainActivity extends Activity {
             startActivityForResult(save, SAVE_NDS);
         } else if (request == SAVE_NDS && ndsImportNode != null && ndsPngUri != null) {
             rebuildNds(uri);
+        } else if (request == PICK_PAK_FOLDER && pakInfo != null) {
+            extractPak(uri);
         } else if (request == PICK_PALETTE) {
             loadPaletteFile(uri);
         } else if (request == PICK_RETRO_FOLDER && retroInfo != null) {
@@ -496,6 +527,10 @@ public class MainActivity extends Activity {
                                 retroInfo.lzBlocks.get(i).offset,retroInfo.lzBlocks.get(i).size/retroMode.tileBytes) :
                         String.format(Locale.ROOT,"📄 %s page %04d",retroMode.slug,i));
         }
+        if (pakInfo != null) {
+            for (TorusPak.Hunk h : pakInfo.hunks)
+                displayed.add("📦 " + h.name + " · " + human(h.data.storedSize) + " packed");
+        }
         if (archive != null || ndsInfo != null) {
             String prefix = activePath.isEmpty() ? "" : activePath + "/";
             Set<String> directories = new TreeSet<>();
@@ -520,6 +555,7 @@ public class MainActivity extends Activity {
                 (nesInfo.usesChrRam() ? "/NES/PRG candidate scan" : "/NES/CHR graphics") +
                         " (" + displayed.size() + " sheets)" :
                 "/" + activePath + "   (" + displayed.size() + " items)");
+        if (pakInfo != null) location.setText("/PAK   (" + displayed.size() + " bundles)");
         open.setEnabled(!busy);
         pngToBtex.setEnabled(!busy);
         upscaleHd.setEnabled(!busy);
@@ -534,7 +570,7 @@ public class MainActivity extends Activity {
         pngToRetro.setVisibility(retroInfo!=null?View.VISIBLE:View.GONE);
         if(retroMode!=null)retroFormat.setText("Format: "+retroMode.slug);
         extractAll.setText((nesInfo != null || retroInfo != null) ? "Export all tile PNGs" : "Extract all");
-        extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null));
+        extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null || pakInfo != null));
         extractHere.setEnabled(!busy && (archive != null && !entriesIn(activePath).isEmpty() ||
                 ndsInfo != null && !ndsEntriesIn(activePath).isEmpty()));
         up.setEnabled(!busy && (archive != null || ndsInfo!=null) && !activePath.isEmpty());
@@ -1363,6 +1399,94 @@ public class MainActivity extends Activity {
                     detail.setText(message(e));
                     new AlertDialog.Builder(this).setTitle("Rebuild failed").setMessage(message(e))
                         .setPositiveButton("OK",null).show();
+                });
+            }
+        });
+    }
+
+    private void beginPakExtract(int onlyHunk) {
+        if (busy || pakInfo == null) return;
+        pakOnly = onlyHunk;
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        startActivityForResult(intent, PICK_PAK_FOLDER);
+    }
+
+    /** Torus PAK: one folder per bundle, assets grouped by type. Textures → PNG, everything else raw. */
+    private void extractPak(Uri tree) {
+        if (busy || pakInfo == null || imageUri == null) return;
+        final TorusPak.Info info = pakInfo;
+        final int only = pakOnly;
+        busy = true; cancelled.set(false); render();
+        summary.setText("Extracting PAK assets...");
+        worker.execute(() -> {
+            final int[] stats = new int[4]; // bundles, textures → PNG, raw assets, textures left raw
+            try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                if (descriptor == null) throw new IOException("Could not reopen the PAK file");
+                try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
+                     FileChannel channel = stream.getChannel()) {
+                    String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+                    Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+                    Uri folder = DocumentsContract.createDocument(getContentResolver(), parent, DIR_MIME, "PAK_Extract_" + stamp);
+                    if (folder == null) throw new IOException("Cannot create output folder");
+                    Map<String, Uri> folders = new HashMap<>();
+                    folders.put("", folder);
+                    if (only < 0) for (String[] loose : info.looseManifests)
+                        writeDoc(folder, loose[0] + ".files.txt", "text/plain", loose[1].getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+                    for (int index = 0; index < info.hunks.size(); index++) {
+                        if (only >= 0 && index != only) continue;
+                        if (cancelled.get()) break;
+                        TorusPak.Hunk hunk = info.hunks.get(index);
+                        final int position = index + 1;
+                        runOnUiThread(() -> summary.setText("Extracting " + hunk.name +
+                                (only < 0 ? " (" + position + "/" + info.hunks.size() + ")" : "") + "..."));
+                        byte[] raw = TorusPak.read(channel, hunk.data);
+                        String base = TorusPak.safeName(hunk.name);
+                        Uri hunkDir = ensureFolder(base, folders);
+                        if (hunk.manifest != null)
+                            writeDoc(hunkDir, base + ".files.txt", "text/plain", hunk.manifest.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+                        for (TorusPak.Asset asset : TorusPak.assets(raw)) {
+                            if (cancelled.get()) break;
+                            Uri dir = ensureFolder(base + "/" + TorusPak.safeName(asset.type), folders);
+                            String name = TorusPak.safeName(asset.name);
+                            TorusPak.Texture texture = null;
+                            if (asset.type.equals("TSETexture")) {
+                                // Never abort a whole extraction for one unsupported/broken texture.
+                                try { texture = TorusPak.texture(raw, asset); } catch (Exception broken) { texture = null; }
+                            }
+                            if (texture != null) {
+                                writePng(dir, name + ".png", texture.width, texture.height, texture.argb);
+                                stats[1]++;
+                            } else {
+                                writeDoc(dir, name + ".bin", "application/octet-stream", TorusPak.slice(raw, asset));
+                                if (asset.type.equals("TSETexture")) stats[3]++; else stats[2]++;
+                            }
+                            final int written = stats[1] + stats[2] + stats[3];
+                            if (written % 20 == 0) runOnUiThread(() -> detail.setText(written + " assets written..."));
+                        }
+                        stats[0]++;
+                    }
+                    writeDoc(folder, "README.txt", "text/plain", ("Torus PAK extraction.\n" +
+                            "One folder per bundle (hunk), then one folder per asset type.\n" +
+                            "TSETexture: decoded from 3DS ETC1 / ETC1A4 to PNG (largest mip level only).\n" +
+                            "Everything else (.bin): the asset's raw records, each as u32 size, u16 type, u16 flags, data " +
+                            "(little-endian). These formats are not decoded.\n" +
+                            "*.files.txt: the bundle's original text manifest.\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                }
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    String result = stats[0] + " bundle(s): " + stats[1] + " textures saved as PNG, " + stats[2] +
+                            " other assets saved as raw data" + (stats[3] > 0 ? ", " + stats[3] + " textures left raw (unknown format)" : "") + ".";
+                    summary.setText("PAK extraction " + (cancelled.get() ? "cancelled" : "complete"));
+                    detail.setText(result);
+                    new AlertDialog.Builder(this).setTitle(cancelled.get() ? "PAK extraction cancelled" : "PAK extraction complete")
+                            .setMessage(result + "\n\nOriginal file unchanged.").setPositiveButton("OK", null).show();
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("PAK extraction failed"); detail.setText(message(e));
+                    new AlertDialog.Builder(this).setTitle("PAK extraction failed")
+                            .setMessage(message(e)).setPositiveButton("OK", null).show();
                 });
             }
         });

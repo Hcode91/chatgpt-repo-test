@@ -33,6 +33,8 @@ jobs:
         run: bash cci-extractor/tests/run-containers-test.sh
       - name: Test CIA/CCI repackaging and texture conversions
         run: bash cci-extractor/tests/run-converters-test.sh
+      - name: Test Torus PAK container, hunk parsing and ETC1 textures
+        run: bash cci-extractor/tests/run-torus-pak-test.sh
       - name: Test native CIA engine on synthetic titles (CIA -> CCI, DLC refusal)
         run: bash cci-extractor/tests/run-native-engine-test.sh
       - name: Install Android SDK 35 components
@@ -57,6 +59,6 @@ jobs:
         run: gradle --no-daemon -p cci-extractor :app:assembleDebug
       - uses: actions/upload-artifact@v4
         with:
-          name: game-asset-extractor-v0.8-debug-apk
+          name: game-asset-extractor-v0.9-debug-apk
           path: cci-extractor/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
