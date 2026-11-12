@@ -587,6 +587,7 @@ public class MainActivity extends Activity {
         worker.execute(() -> {
             int count = 0, converted = 0, failed = 0;
             long written = 0;
+            final AssetExpander.Stats expanded = new AssetExpander.Stats();
             try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
                 if (descriptor == null) throw new IOException("Unable to reopen selected CCI");
                 try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
@@ -654,9 +655,20 @@ public class MainActivity extends Activity {
                                 failed++;
                             }
                         }
+                        if (!cancelled.get() && e.size >= 8 && e.size <= AssetExpander.MAX_INPUT) {
+                            // Archives, compressed files, textures and audio in known formats are unpacked/converted
+                            // next to the original. A file that can't be parsed is simply left as it is.
+                            try {
+                                byte[] head = readBtex(channel, e.offset, (int) Math.min(16, e.size));
+                                byte[] tail = e.size >= 0x28 ? readBtex(channel, e.offset + e.size - 0x28, 0x28) : null;
+                                if (AssetExpander.worthReading(head, tail, e.size))
+                                    AssetExpander.expand(filename, readBtex(channel, e.offset, (int) e.size),
+                                            expanderSink(path, folders), expanded);
+                            } catch (Exception | OutOfMemoryError unreadable) { /* original already saved */ }
+                        }
                         count++;
                         final int done = count;
-                        final int pngDone = converted;
+                        final int pngDone = converted + expanded.images;
                         final String lastName = filename;
                         if (count % 5 == 0 || count == selection.size()) {
                             runOnUiThread(() -> detail.setText(done + "/" + selection.size() +
@@ -666,11 +678,16 @@ public class MainActivity extends Activity {
                 }
                 final int complete = count, pngs = converted, skipped = failed;
                 final long bytes = written;
+                final String extras = expanded.total() == 0 ? "" : "\n\nAlso unpacked " + expanded.unpacked +
+                        " file(s) from archives into *_contents folders, decompressed " + expanded.decompressed +
+                        ", and converted " + expanded.images + " more texture(s) to PNG and " + expanded.sounds +
+                        " sound(s) to WAV.";
                 final boolean interrupted = cancelled.get();
                 runOnUiThread(() -> {
                     busy = false;
                     summary.setText((interrupted ? "Stopped: " : "Finished: ") + complete +
-                            " files (" + human(bytes) + ") · " + pngs + " textures → PNG");
+                            " files (" + human(bytes) + ") · " + (pngs + expanded.images) + " textures → PNG" +
+                            (expanded.sounds > 0 ? " · " + expanded.sounds + " sounds → WAV" : ""));
                     detail.setText("Original BTEX templates are retained beside each PNG. " +
                             (archive.titleId == null ? "No Title ID in header; original partition paths were kept."
                                 : "For Azahar mods, copy " + archive.titleId + " folder from this extraction.") +
@@ -680,6 +697,7 @@ public class MainActivity extends Activity {
                             .setMessage(complete + " original file(s) extracted. " + pngs +
                                     " BTEX texture(s) converted to PNG." + (skipped > 0 ?
                                     " " + skipped + " texture(s) could not be converted; originals preserved." : "") +
+                                    extras +
                                     "\n\n" + (archive.titleId == null ?
                                         "Title ID unavailable; original partition names preserved." :
                                         "Exported game path: " + archive.titleId + "/romfs/ (inside CCI_Extract_...)." +
@@ -715,7 +733,7 @@ public class MainActivity extends Activity {
         final List<NitroVfs.Node> known=new ArrayList<>(ndsNodes);
         busy=true;cancelled.set(false);render();summary.setText("Extracting DS files and unpacking archives...");
         worker.execute(() -> {
-            int[] stats=new int[4]; // files, pngs, unpacked children, unconverted graphics
+            int[] stats=new int[5]; // files, pngs, unpacked children, unconverted graphics, sounds
             try (ParcelFileDescriptor descriptor=getContentResolver().openFileDescriptor(imageUri,"r")) {
                 if(descriptor==null)throw new IOException("Cannot open DS ROM");
                 try(FileInputStream source=new FileInputStream(descriptor.getFileDescriptor());
@@ -765,19 +783,22 @@ public class MainActivity extends Activity {
                         if(content!=null) unpackExtras(node,content,dir,known,reader,cache,folders,stats);
                         final int progress=stats[0];
                         if(stats[0]%10==0 || stats[0]==selection.size())runOnUiThread(() ->
-                                detail.setText(progress+"/"+selection.size()+" files · "+stats[1]+" PNGs · "+stats[2]+" unpacked"));
+                                detail.setText(progress+"/"+selection.size()+" files · "+stats[1]+" PNGs · "+stats[2]+" unpacked"+
+                                        (stats[4]>0?" · "+stats[4]+" WAVs":"")));
                     }
                 }
                 final boolean wasCancelled=cancelled.get();
                 runOnUiThread(() -> {busy=false;render();
                     summary.setText("Nintendo DS: "+stats[0]+" files, "+stats[2]+" unpacked, "+stats[1]+" PNGs"+
+                            (stats[4]>0?", "+stats[4]+" WAVs":"")+
                             (wasCancelled?" (cancelled)":""));
                     detail.setText("Original DS ROM preserved. NARC contents go in *_contents folders; LZ files get a " +
                             ".decompressed copy; .ncgr graphics get PNG previews using the nearest .nclr palette.");
                     new AlertDialog.Builder(this).setTitle("DS extraction complete")
                             .setMessage(stats[0]+" files copied into NDS_Extract_.../nitrofs.\n"+
                                     stats[2]+" archive/compressed entries unpacked.\n"+
-                                    stats[1]+" Nitro graphics converted to PNG.\n"+
+                                    stats[1]+" graphics converted to PNG (tiles, tilemap screens, NSBTX textures).\n"+
+                                    stats[4]+" sounds converted to WAV (SDAT wave archives and streams).\n"+
                                     stats[3]+" graphics skipped (unsupported format).\n\nOriginal ROM unchanged.")
                             .setPositiveButton("OK",null).show();
                 });
@@ -796,7 +817,29 @@ public class MainActivity extends Activity {
         if(!node.kind.isEmpty()) return true;
         byte[] head=readBtex(channel,node.romEntry.offset,4);
         int t=head[0]&255;
-        return t==NitroLz.TYPE_LZ10 || t==NitroLz.TYPE_LZ11 || !NitroVfs.kindFromMagic(head).isEmpty();
+        return t==NitroLz.TYPE_LZ10 || t==NitroLz.TYPE_LZ11 || !NitroVfs.kindFromMagic(head).isEmpty()
+                || AssetExpander.worthReading(head,null,node.rawSize) || (head[0]=='R'&&head[1]=='C'&&head[2]=='S'&&head[3]=='N');
+    }
+
+    /** Writes {@link AssetExpander} output below {@code basePath} (a folder path already known to {@code folders}). */
+    private AssetExpander.Sink expanderSink(final String basePath, final Map<String, Uri> folders) {
+        return new AssetExpander.Sink() {
+            private Uri dirFor(String relative) throws IOException {
+                int slash = relative.lastIndexOf('/');
+                String sub = slash < 0 ? "" : relative.substring(0, slash);
+                String full = sub.isEmpty() ? basePath : basePath.isEmpty() ? sub : basePath + "/" + sub;
+                try { return ensureFolder(full, folders); }
+                catch (IOException e) { throw e; }
+                catch (Exception e) { throw new IOException(String.valueOf(e.getMessage())); }
+            }
+            @Override public void file(String path, byte[] data) throws IOException {
+                writeDoc(dirFor(path), path.substring(path.lastIndexOf('/') + 1), "application/octet-stream", data);
+            }
+            @Override public void png(String path, int width, int height, int[] argb) throws IOException {
+                writePng(dirFor(path), path.substring(path.lastIndexOf('/') + 1), width, height, argb);
+            }
+            @Override public boolean cancelled() { return cancelled.get(); }
+        };
     }
 
     private void writeDoc(Uri dir,String name,String mime,byte[] data) throws IOException {
@@ -833,6 +876,14 @@ public class MainActivity extends Activity {
                     stats[1]++;
                 } catch(Exception unsupported) {stats[3]++;}
             }
+            if(NdsMedia.isNscr(content)) {
+                renderScreen(node,content,dir,siblings,reader,cache,stats);
+            } else if(!node.isGraphic() && !node.isPalette() && !node.isContainer()) {
+                // NSBTX/NSBMD textures, SDAT sound archives, SWAR/SWAV/STRM audio.
+                AssetExpander.Stats extra=new AssetExpander.Stats();
+                AssetExpander.expandDecompressed(node.name(),content,expanderSink(node.folder(),folders),extra);
+                stats[1]+=extra.images; stats[2]+=extra.unpacked; stats[4]+=extra.sounds;
+            }
             if(node.isContainer() && NarcArchive.isNarc(content)) {
                 List<NitroVfs.Node> kids=NitroVfs.expand(node,content);
                 if(kids.isEmpty()) return;
@@ -852,6 +903,38 @@ public class MainActivity extends Activity {
         } catch(Exception skipped) {
             // An unreadable archive never aborts the whole extraction; its raw file is already saved.
         }
+    }
+    /** NSCR tilemap → assembled PNG, using the matching (or nearest) NCGR tile sheet and its palette. */
+    private void renderScreen(NitroVfs.Node node,byte[] nscr,Uri dir,List<NitroVfs.Node> siblings,
+                              NitroVfs.Reader reader,NitroVfs.Cache cache,int[] stats) {
+        try {
+            String stem=node.path.contains(".")?node.path.substring(0,node.path.lastIndexOf('.')):node.path;
+            NitroVfs.Node tiles=null;
+            for(NitroVfs.Node n:siblings) {
+                if(!n.isGraphic() || !n.folder().equals(node.folder())) continue;
+                String other=n.path.contains(".")?n.path.substring(0,n.path.lastIndexOf('.')):n.path;
+                if(other.equalsIgnoreCase(stem)) { tiles=n; break; }
+                if(tiles==null) tiles=n;
+            }
+            if(tiles==null) { stats[3]++; return; }
+            byte[] ncgr=NitroVfs.content(tiles,reader,cache);
+            NdsGraphics.Layout layout=NdsGraphics.layout(ncgr);
+            NitroVfs.Node pal=NitroVfs.pairPalette(tiles,siblings);
+            byte[] palette=pal==null?NdsGraphics.grayNclr(layout.depth):NitroVfs.content(pal,reader,cache);
+            int available=NdsGraphics.paletteBanks(palette,layout.depth);
+            int[][] sheets=new int[16][];
+            for(int bank:NdsMedia.nscrBanks(nscr)) {
+                if(bank>=available) continue;
+                try { sheets[bank]=NdsGraphics.decode(ncgr,palette,bank).argb; } catch(Exception missingBank) { sheets[bank]=null; }
+            }
+            boolean any=false;
+            for(int[] sheet:sheets) if(sheet!=null) { any=true; break; }
+            if(!any) sheets[0]=NdsGraphics.decode(ncgr,palette,0).argb;
+            NdsMedia.Texture screen=NdsMedia.renderNscr(nscr,sheets,layout.width,layout.height);
+            String name=node.name().contains(".")?node.name().substring(0,node.name().lastIndexOf('.')):node.name();
+            writePng(dir,name+"_screen.png",screen.width,screen.height,screen.argb);
+            stats[1]++;
+        } catch(Exception unsupported) { stats[3]++; }
     }
     private void unpackExtrasChild(NitroVfs.Node kid,byte[] content,Uri dir,List<NitroVfs.Node> siblings,
                                    NitroVfs.Reader reader,NitroVfs.Cache cache,Map<String,Uri> folders,int[] stats) {

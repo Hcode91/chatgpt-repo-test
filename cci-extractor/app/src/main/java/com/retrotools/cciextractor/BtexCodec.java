@@ -101,6 +101,27 @@ public final class BtexCodec {
 
     public static Image decode(byte[] data) throws IOException {
         Header h = inspect(data);
+        return decode(data, h);
+    }
+
+    /** Bits per pixel of a PICA200 texture format (0–13), or -1 when unknown. */
+    static int picaBitsPerPixel(int format) { return bitsPerPixel(format); }
+
+    /**
+     * Decodes raw PICA200 texture data (native 8x8 Morton tile order) found at {@code offset}.
+     * Width and height must be multiples of 8. Used by the CTPK / BCLIM / BFLIM / CGFX / BCH readers.
+     */
+    static int[] decodeTiled(byte[] data, int offset, int width, int height, int format) throws IOException {
+        int bpp = bitsPerPixel(format);
+        if (bpp < 0) throw new IOException("Unsupported texture format " + format);
+        if (width <= 0 || height <= 0 || width % 8 != 0 || height % 8 != 0 || (long) width * height > MAX_PIXELS)
+            throw new IOException("Unsupported texture dimensions " + width + "x" + height);
+        long need = (long) width * height * bpp / 8L;
+        if (offset < 0 || offset + need > data.length) throw new IOException("Texture data is truncated");
+        return decode(data, new Header(format, width, height, (int) need, offset, 1)).argb;
+    }
+
+    private static Image decode(byte[] data, Header h) throws IOException {
         int[] pixels = new int[h.width * h.height];
         if (h.format == 12 || h.format == 13) {
             decodeETC(data, h, pixels);
