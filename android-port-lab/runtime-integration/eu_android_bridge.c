@@ -736,6 +736,7 @@ volatile int g_eu_live_off;
 #define EU_LIVE_PERF_HINT 128
 #define EU_LIVE_SPU_SERIAL 256
 #define EU_LIVE_SHORT_SPIN 512
+#define EU_LIVE_N205 1024
 static int s_main_nice;   /* 0 = main thread not boosted */
 static void eu_prime_sweep(void)
 {
@@ -1176,16 +1177,20 @@ static void eu_perf_hint_tick(void)
  * settings is switched off, then everything is on again, then the next one is off, and so on. Frame rate and
  * the main thread's waiting share are measured for each stretch (its first 4 s are left out, things settle),
  * so both states see the same scenes and the same phone temperature.
- * EU_AB=name,name,...  (default EU_SHORT_SPIN,EU_SPU_NICE; also EU_LL_YIELD, EU_MAIN_BOOST, EU_PERF_HINT, EU_SPU_SERIAL,
+ * EU_AB=name,name,...  (default EU_N205,EU_SHORT_SPIN; also EU_SPU_NICE, EU_LL_YIELD, EU_MAIN_BOOST, EU_PERF_HINT, EU_SPU_SERIAL,
  *                        EU_CORE_SPLIT, EU_SPURS_PARK, EU_INDEX_FAST, EU_VK_CB_USED). Which one goes first varies from run to run.
  * EU_AB=0 = no switching. */
-#define EU_AB_MAX 10
+#define EU_AB_MAX 11
 static struct { const char* name; int bit; } s_ab_known[] = {
     {"EU_CORE_SPLIT", EU_LIVE_CORE_SPLIT}, {"EU_MAIN_BOOST", EU_LIVE_MAIN_BOOST}, {"EU_SPURS_PARK", EU_LIVE_SPURS_PARK},
     {"EU_INDEX_FAST", EU_LIVE_INDEX_FAST}, {"EU_VK_CB_USED", EU_LIVE_CB_USED}, {"EU_LL_YIELD", EU_LIVE_LL_YIELD},
     {"EU_SPU_NICE", EU_LIVE_SPU_NICE}, {"EU_PERF_HINT", EU_LIVE_PERF_HINT},
     {"EU_SPU_SERIAL", EU_LIVE_SPU_SERIAL}, {"EU_SHORT_SPIN", EU_LIVE_SHORT_SPIN},
+    {"EU_N205", EU_LIVE_N205},
 };
+extern volatile long long g_eu_job_watch_ns __attribute__((weak));
+extern volatile long g_eu_job_watch_runs __attribute__((weak));
+extern volatile unsigned long g_eu_n205_boxes __attribute__((weak)), g_eu_n205_items __attribute__((weak)), g_eu_n205_runs __attribute__((weak));
 extern volatile unsigned long g_eu_short_spins __attribute__((weak));
 extern volatile unsigned long g_eu_ll_yields __attribute__((weak));
 static int s_ab_n, s_ab_item[EU_AB_MAX];
@@ -1216,13 +1221,14 @@ static void eu_ab_tick(void)
 {
     static int init, secs = 20, t = -45, seg, first;   /* the first 45 s (start-up) are not compared */
     static unsigned long long f0, w0;
+    static long long jn0; static long jr0;
     if (!init) {
         init = 1;
         const char* e = getenv("EU_AB");
         const char* sv = getenv("EU_AB_SECS");
         if (sv && atoi(sv) >= 8) secs = atoi(sv);
         if (secs > 300) secs = 300;
-        if (!e || !*e) e = "EU_SHORT_SPIN,EU_SPU_NICE";
+        if (!e || !*e) e = "EU_N205,EU_SHORT_SPIN";
         if (&g_eu_frames_total && strcmp(e, "0")) {
             for (unsigned k = 0; k < sizeof s_ab_known / sizeof s_ab_known[0] && s_ab_n < EU_AB_MAX; k++) {
                 const char* hit = strstr(e, s_ab_known[k].name);
@@ -1249,7 +1255,8 @@ static void eu_ab_tick(void)
         if (s_main_nice && ((old ^ now) & EU_LIVE_MAIN_BOOST))
             setpriority(PRIO_PROCESS, (id_t)getpid(), (now & EU_LIVE_MAIN_BOOST) ? 0 : s_main_nice);
     }
-    if (at == 4) { f0 = g_eu_frames_total; w0 = eu_main_wait_ns(NULL); }
+    if (at == 4) { f0 = g_eu_frames_total; w0 = eu_main_wait_ns(NULL);
+                   if (&g_eu_job_watch_ns) { jn0 = g_eu_job_watch_ns; jr0 = g_eu_job_watch_runs; } }
     if (at == secs - 1) {
         const double span = (double)(secs - 5);
         const double fps = (double)(g_eu_frames_total - f0) / span;
@@ -1259,9 +1266,15 @@ static void eu_ab_tick(void)
         s_ab_acc[slot].fps_sum += fps; s_ab_acc[slot].wait_sum += wait; s_ab_acc[slot].n++;
         char line[900];
         eu_ab_table(line, sizeof line);
-        fprintf(stderr, "[ab] %d s with %s%s: %.1f frames/s, main thread waiting %.0f%% | averages so far (stretches): %s\n",
+        char job[96] = "";
+        if (&g_eu_job_watch_ns) {
+            const long long dn = g_eu_job_watch_ns - jn0; const long dr = g_eu_job_watch_runs - jr0;
+            if (dr > 0) snprintf(job, sizeof job, ", visibility job %.0f us a run (%ld runs, %.0f%% of a core)",
+                                 (double)dn / 1000.0 / (double)dr, dr, (double)dn / (span * 1e7));
+        }
+        fprintf(stderr, "[ab] %d s with %s%s: %.1f frames/s, main thread waiting %.0f%%%s | averages so far (stretches): %s\n",
                 secs, off_item < 0 ? "everything on" : s_ab_known[s_ab_item[off_item]].name, off_item < 0 ? "" : " OFF",
-                fps, wait, line);
+                fps, wait, job, line);
     }
 }
 
@@ -1312,6 +1325,13 @@ static void eu_summary(long hz, uint64_t all_ticks, uint64_t spu_ticks, int nspu
         }
         fprintf(stderr, "[summary] fastest core allowed %ld of %ld MHz%s; hottest chip sensor %ld C\n", best_cap / 1000,
                 best_top / 1000, best_cap > 0 && best_cap < best_top ? " (phone is holding it back)" : "", hottest);
+    }
+    if (&g_eu_n205_runs) {
+        static unsigned long b_prev, i_prev, r_prev;
+        const unsigned long b = g_eu_n205_boxes, i = g_eu_n205_items, r = g_eu_n205_runs;
+        fprintf(stderr, "[summary] visibility job, native code: %lu box tests and %lu item placements in %lu entries this minute\n",
+                b - b_prev, i - i_prev, r - r_prev);
+        b_prev = b; i_prev = i; r_prev = r;
     }
     if (&g_eu_short_spins) {
         static unsigned long sp_prev;

@@ -2394,6 +2394,7 @@ static void eu_jobrec_end(spu_context* ctx, uint32_t pc)
     __atomic_store_n(&g_eu_jobrec_live, 0, __ATOMIC_RELEASE);
 }
 #define EU_JOBTIME_SLOTS 66   /* 0..63 = overlay ids 200..263, 64 = job code that is not a lifted module, 65 = spare */
+volatile long long g_eu_job_watch_ns; volatile long g_eu_job_watch_runs;
 static volatile long long s_eu_job_ns[EU_JOBTIME_SLOTS];
 static volatile long s_eu_job_runs[EU_JOBTIME_SLOTS];
 static int s_eu_jobtime = -1;
@@ -2416,6 +2417,12 @@ void eu_jobtime_edge(spu_context* ctx, uint32_t pc)
         const int slot = (id >= 200 && id < 264) ? id - 200 : 64;
         __atomic_fetch_add(&s_eu_job_ns[slot], now - t_eu_job_t0, __ATOMIC_RELAXED);
         __atomic_fetch_add(&s_eu_job_runs[slot], 1, __ATOMIC_RELAXED);
+        /* running totals of the visibility job (signature 43 4e c2 02), never reset: the bridge's in-run
+         * comparison reads them at the ends of a stretch */
+        if (ctx->ls[0x4000] == 0x43 && ctx->ls[0x4001] == 0x4e && ctx->ls[0x4002] == 0xc2 && ctx->ls[0x4003] == 0x02) {
+            __atomic_fetch_add(&g_eu_job_watch_ns, now - t_eu_job_t0, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&g_eu_job_watch_runs, 1, __ATOMIC_RELAXED);
+        }
     }
     t_eu_in_job = in;
 }
