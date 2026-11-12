@@ -737,6 +737,7 @@ volatile int g_eu_live_off;
 #define EU_LIVE_SPU_SERIAL 256
 #define EU_LIVE_SHORT_SPIN 512
 #define EU_LIVE_N205 1024
+#define EU_LIVE_PPU_INLINE 2048
 static int s_main_nice;   /* 0 = main thread not boosted */
 static void eu_prime_sweep(void)
 {
@@ -894,6 +895,108 @@ static void eu_wait_print(const char* tag, eu_wait_site* t, int total_mode, int 
     }
     for (int i = 0; i < EU_WAIT_SITES; i++) { if (total_mode) { if (t[i].hits_total < 0) t[i].hits_total = -t[i].hits_total; } else t[i].hits = 0; }
 }
+/* ---- where the main thread's own work goes ([main-prof]) ----
+ * Once the SPU jobs got cheaper the main thread stopped waiting and became the limit: it is awake about nine
+ * tenths of the time, and the call-chain table above cannot say in what (too many distinct chains). The same
+ * samples, taken more often (EU_MAIN_PROF_HZ, default 50 a second), counted three ways while it is awake:
+ *   self       the function the thread was in
+ *   inclusive  every function on its call chain, once per sample
+ *   addresses  the exact instruction, for finding the hot spot inside a large translated function
+ * Printed each minute for the whole run. EU_MAIN_PROF=0 = off (the [main-wait] tables stay). */
+typedef struct { uintptr_t key; char name[60]; int self, incl; } eu_prof_fn;
+typedef struct { uintptr_t pc; int n; } eu_prof_pc;
+enum { EU_PROF_FNS = 8192, EU_PROF_PCS = 32768 };
+static eu_prof_fn* s_mp_fn;
+static eu_prof_pc* s_mp_pc;
+static int s_mp_samples, s_mp_on = -1, s_mp_fn_full, s_mp_pc_full;
+static eu_prof_fn* eu_prof_lookup(uintptr_t pc)
+{
+    uintptr_t off = 0, key; char nm[60];
+    const char* own = eu_own_symbol(pc, &off);
+    if (own) { key = pc - off; snprintf(nm, sizeof nm, "%.59s", own); }
+    else {
+        Dl_info di; memset(&di, 0, sizeof di);
+        if (dladdr((void*)pc, &di) && di.dli_sname) { key = (uintptr_t)di.dli_saddr; snprintf(nm, sizeof nm, "%.40s (%.16s)", di.dli_sname, eu_basename(di.dli_fname)); }
+        else if (di.dli_fname) { key = pc & ~(uintptr_t)0xFFF; snprintf(nm, sizeof nm, "%.30s+0x%lx", eu_basename(di.dli_fname), (unsigned long)(key - (uintptr_t)di.dli_fbase)); }
+        else { key = 1; snprintf(nm, sizeof nm, "(unknown address)"); }
+    }
+    for (unsigned h = (unsigned)((key >> 2) * 2654435761u) % EU_PROF_FNS, probe = 0; probe < 64; probe++, h = (h + 1) % EU_PROF_FNS) {
+        if (s_mp_fn[h].key == key) return &s_mp_fn[h];
+        if (!s_mp_fn[h].key) { s_mp_fn[h].key = key; memcpy(s_mp_fn[h].name, nm, sizeof nm); return &s_mp_fn[h]; }
+    }
+    s_mp_fn_full++;
+    return NULL;
+}
+static void eu_prof_sample(int np)
+{
+    if (s_mp_on < 0) {
+        const char* e = getenv("EU_MAIN_PROF");
+        s_mp_on = !(e && e[0] == '0');
+        if (s_mp_on) {
+            s_mp_fn = (eu_prof_fn*)calloc(EU_PROF_FNS, sizeof *s_mp_fn);
+            s_mp_pc = (eu_prof_pc*)calloc(EU_PROF_PCS, sizeof *s_mp_pc);
+            if (!s_mp_fn || !s_mp_pc) s_mp_on = 0;
+        }
+    }
+    if (!s_mp_on || np <= 0) return;
+    s_mp_samples++;
+    eu_prof_fn* seen[EU_WAIT_FRAMES]; int ns = 0;
+    for (int k = 0; k < np && k < EU_WAIT_FRAMES; k++) {
+        eu_prof_fn* f = eu_prof_lookup(s_wait_pcs[k] - (k ? 4 : 0));
+        if (!f) continue;
+        if (k == 0) f->self++;
+        int dup = 0;
+        for (int j = 0; j < ns; j++) if (seen[j] == f) dup = 1;
+        if (!dup) { f->incl++; seen[ns++] = f; }
+    }
+    const uintptr_t pc = s_wait_pcs[0];
+    for (unsigned h = (unsigned)((pc >> 2) * 2654435761u) % EU_PROF_PCS, probe = 0; ; probe++, h = (h + 1) % EU_PROF_PCS) {
+        if (probe >= 64) { s_mp_pc_full++; break; }
+        if (s_mp_pc[h].pc == pc) { s_mp_pc[h].n++; break; }
+        if (!s_mp_pc[h].pc) { s_mp_pc[h].pc = pc; s_mp_pc[h].n = 1; break; }
+    }
+}
+static void eu_prof_print(void)
+{
+    if (s_mp_on <= 0 || s_mp_samples < 50) return;
+    const int top = 45;
+    fprintf(stderr, "[main-prof] whole run, %d samples of the main thread while awake (%d + %d not counted: tables full)\n", s_mp_samples, s_mp_fn_full, s_mp_pc_full);
+    for (int mode = 0; mode < 2; mode++) {
+        fprintf(stderr, "[main-prof] %s:\n", mode ? "inclusive (function anywhere on the call chain)" : "self (function the thread was in)");
+        int last = 0x7FFFFFFF; uintptr_t last_key = 0;
+        for (int shown = 0; shown < top; shown++) {
+            int best = -1;
+            for (int i = 0; i < EU_PROF_FNS; i++) {
+                if (!s_mp_fn[i].key) continue;
+                const int v = mode ? s_mp_fn[i].incl : s_mp_fn[i].self;
+                if (v <= 0 || v > last || (v == last && s_mp_fn[i].key <= last_key)) continue;
+                if (best < 0) { best = i; continue; }
+                const int bv = mode ? s_mp_fn[best].incl : s_mp_fn[best].self;
+                if (v > bv || (v == bv && s_mp_fn[i].key < s_mp_fn[best].key)) best = i;
+            }
+            if (best < 0) break;
+            last = mode ? s_mp_fn[best].incl : s_mp_fn[best].self; last_key = s_mp_fn[best].key;
+            fprintf(stderr, "[main-prof]   %5.1f%%  %s\n", 100.0 * last / s_mp_samples, s_mp_fn[best].name);
+        }
+    }
+    fprintf(stderr, "[main-prof] addresses:\n");
+    int last = 0x7FFFFFFF; uintptr_t last_pc = 0;
+    for (int shown = 0; shown < top; shown++) {
+        int best = -1;
+        for (int i = 0; i < EU_PROF_PCS; i++) {
+            if (!s_mp_pc[i].pc) continue;
+            const int v = s_mp_pc[i].n;
+            if (v > last || (v == last && s_mp_pc[i].pc <= last_pc)) continue;
+            if (best < 0 || v > s_mp_pc[best].n || (v == s_mp_pc[best].n && s_mp_pc[i].pc < s_mp_pc[best].pc)) best = i;
+        }
+        if (best < 0 || s_mp_pc[best].n < 2) break;
+        last = s_mp_pc[best].n; last_pc = s_mp_pc[best].pc;
+        uintptr_t off = 0; const char* own = eu_own_symbol(last_pc, &off);
+        if (own) fprintf(stderr, "[main-prof]   %5.2f%%  %.56s+0x%lx  (file offset 0x%lx)\n", 100.0 * last / s_mp_samples, own, (unsigned long)off, (unsigned long)(last_pc - s_self_base));
+        else { eu_prof_fn* f = eu_prof_lookup(last_pc); fprintf(stderr, "[main-prof]   %5.2f%%  %s\n", 100.0 * last / s_mp_samples, f ? f->name : "?"); }
+    }
+}
+
 static void* eu_wait_thread(void* arg)
 {
     (void)arg;
@@ -904,8 +1007,12 @@ static void* eu_wait_thread(void* arg)
     int n = 0, asleep = 0, lost = 0, n_total = 0, asleep_total = 0, rounds = 0;
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    int hz = 50;
+    { const char* e = getenv("EU_MAIN_PROF_HZ"); if (e && atoi(e) > 0) hz = atoi(e); if (hz > 500) hz = 500;
+      const char* o = getenv("EU_MAIN_PROF"); if (o && o[0] == '0') hz = 10; }
+    const useconds_t period = (useconds_t)(1000000 / hz) - (hz > 20 ? 300 : 3000);
     for (;;) {
-        usleep(97000);
+        usleep(period);
         char path[64], line[256] = "";
         snprintf(path, sizeof path, "/proc/self/task/%d/stat", tid);
         FILE* f = fopen(path, "r");
@@ -937,7 +1044,7 @@ static void* eu_wait_thread(void* arg)
         const int is_asleep = state == 'S' || state == 'D';
         n++; n_total++;
         if (is_asleep) { asleep++; asleep_total++; eu_wait_add(s_wait_asleep, chain); }
-        else eu_wait_add(s_wait_awake, chain);
+        else { eu_wait_add(s_wait_awake, chain); eu_prof_sample(np); }
         struct timespec t1;
         clock_gettime(CLOCK_MONOTONIC, &t1);
         if (t1.tv_sec - t0.tv_sec >= 10) {
@@ -952,6 +1059,7 @@ static void* eu_wait_thread(void* arg)
                 eu_wait_print("main-wait-total", s_wait_asleep, 1, n_total, 12);
                 fprintf(stderr, "[main-wait-total] awake in:\n");
                 eu_wait_print("main-wait-total", s_wait_awake, 1, n_total, 8);
+                eu_prof_print();
             }
             n = asleep = lost = 0;
         }
@@ -1177,16 +1285,30 @@ static void eu_perf_hint_tick(void)
  * settings is switched off, then everything is on again, then the next one is off, and so on. Frame rate and
  * the main thread's waiting share are measured for each stretch (its first 4 s are left out, things settle),
  * so both states see the same scenes and the same phone temperature.
- * EU_AB=name,name,...  (default EU_N205,EU_SHORT_SPIN; also EU_SPU_NICE, EU_LL_YIELD, EU_MAIN_BOOST, EU_PERF_HINT, EU_SPU_SERIAL,
+ * EU_AB=name,name,...  (default EU_PPU_INLINE,EU_N205; also EU_SHORT_SPIN, EU_SPU_NICE, EU_LL_YIELD, EU_MAIN_BOOST, EU_PERF_HINT, EU_SPU_SERIAL,
  *                        EU_CORE_SPLIT, EU_SPURS_PARK, EU_INDEX_FAST, EU_VK_CB_USED). Which one goes first varies from run to run.
  * EU_AB=0 = no switching. */
 #define EU_AB_MAX 11
+/* EU_PPU_INLINE: the translated game code reads and writes guest memory inline (CMake INFAMOUS_PPU_INLINE,
+ * -DPPU_INLINE_LOADS) and only calls vm_read / vm_write for the special cases. The runtime gates that with
+ * limits it recomputes in ppu_vm_gate_update(); zero limits send every access out of line again, which is
+ * exactly how builds before this one ran. Used by the in-run comparison. */
+extern int g_vm_fast_inline __attribute__((weak));
+extern void ppu_vm_gate_update(void) __attribute__((weak));
+static void eu_ppu_inline_set(int on)
+{
+    static int saved = -1;
+    if (!&g_vm_fast_inline || !ppu_vm_gate_update) return;
+    if (!on) { if (saved < 0) saved = g_vm_fast_inline; g_vm_fast_inline = 0; }
+    else if (saved >= 0) { g_vm_fast_inline = saved; saved = -1; }
+    ppu_vm_gate_update();
+}
 static struct { const char* name; int bit; } s_ab_known[] = {
     {"EU_CORE_SPLIT", EU_LIVE_CORE_SPLIT}, {"EU_MAIN_BOOST", EU_LIVE_MAIN_BOOST}, {"EU_SPURS_PARK", EU_LIVE_SPURS_PARK},
     {"EU_INDEX_FAST", EU_LIVE_INDEX_FAST}, {"EU_VK_CB_USED", EU_LIVE_CB_USED}, {"EU_LL_YIELD", EU_LIVE_LL_YIELD},
     {"EU_SPU_NICE", EU_LIVE_SPU_NICE}, {"EU_PERF_HINT", EU_LIVE_PERF_HINT},
     {"EU_SPU_SERIAL", EU_LIVE_SPU_SERIAL}, {"EU_SHORT_SPIN", EU_LIVE_SHORT_SPIN},
-    {"EU_N205", EU_LIVE_N205},
+    {"EU_N205", EU_LIVE_N205}, {"EU_PPU_INLINE", EU_LIVE_PPU_INLINE},
 };
 extern volatile long long g_eu_job_watch_ns __attribute__((weak));
 extern volatile long g_eu_job_watch_runs __attribute__((weak));
@@ -1228,7 +1350,7 @@ static void eu_ab_tick(void)
         const char* sv = getenv("EU_AB_SECS");
         if (sv && atoi(sv) >= 8) secs = atoi(sv);
         if (secs > 300) secs = 300;
-        if (!e || !*e) e = "EU_N205,EU_SHORT_SPIN";
+        if (!e || !*e) e = "EU_PPU_INLINE,EU_N205";
         if (&g_eu_frames_total && strcmp(e, "0")) {
             for (unsigned k = 0; k < sizeof s_ab_known / sizeof s_ab_known[0] && s_ab_n < EU_AB_MAX; k++) {
                 const char* hit = strstr(e, s_ab_known[k].name);
@@ -1254,6 +1376,7 @@ static void eu_ab_tick(void)
         g_eu_live_off = now;
         if (s_main_nice && ((old ^ now) & EU_LIVE_MAIN_BOOST))
             setpriority(PRIO_PROCESS, (id_t)getpid(), (now & EU_LIVE_MAIN_BOOST) ? 0 : s_main_nice);
+        if ((old ^ now) & EU_LIVE_PPU_INLINE) eu_ppu_inline_set(!(now & EU_LIVE_PPU_INLINE));
     }
     if (at == 4) { f0 = g_eu_frames_total; w0 = eu_main_wait_ns(NULL);
                    if (&g_eu_job_watch_ns) { jn0 = g_eu_job_watch_ns; jr0 = g_eu_job_watch_runs; } }

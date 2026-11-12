@@ -90,6 +90,17 @@ if(INFAMOUS_PRIVATE_RECOMP)
     # from the console (a PPC fmadd is emitted as an explicit fma() call).
     set_source_files_properties(${PRIVATE_PPU_SOURCES} PROPERTIES
         COMPILE_OPTIONS "-w;-ffp-contract=off")
+    # Inline guest-memory accesses in the translated game code. Upstream's CMakeLists defines
+    # PPU_INLINE_LOADS for these files only in its MSVC branch, so off Windows every load and store
+    # was a call into vm_read* / vm_write* (about 30% of the main thread's samples on the phone were
+    # inside those functions). The inline paths are the ones the PC build has always used; anything
+    # special (bounds, null page, SPU reservations, raw-SPU window, GCM put/ref words) still goes out
+    # of line. PPU_NO_PRESERVE_MOST: plain calls for that fallback. -DINFAMOUS_PPU_INLINE=OFF = as before.
+    option(INFAMOUS_PPU_INLINE "Inline guest-memory accesses in the translated PPU code" ON)
+    if(INFAMOUS_PPU_INLINE)
+        set_source_files_properties(${PRIVATE_PPU_SOURCES} PROPERTIES
+            COMPILE_DEFINITIONS "PPU_INLINE_LOADS;PPU_NO_PRESERVE_MOST")
+    endif()
     if(EXISTS "${INFAMOUS_PRIVATE_RECOMP}/ppu_hle_nids.cpp")
         set(PRIVATE_HLE_NID_TABLE "${INFAMOUS_PRIVATE_RECOMP}/ppu_hle_nids.cpp")
     else()
