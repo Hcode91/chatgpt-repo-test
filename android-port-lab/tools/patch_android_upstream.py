@@ -1238,6 +1238,32 @@ change("runtime/spu/spu_helpers.h",
 #else
 #define SPU__FSIMD 0
 #endif""")
+# Scheduler switches of the SPURS runtime, changeable while running: the in-run comparison
+# (eu_android_bridge.c, g_eu_feat_flip / g_eu_lean_flip) inverts one V242A_* switch by name or
+# some lean-mode component bits for a stretch. Nothing changes while both are zero.
+change("libs/spurs/cellSpurs.c",
+"""    return on && (f->phase < 0 || (f->phase < 2 ? ((g_ab_phase & 1) == f->phase) : (((g_ab_phase >> 1) & 1) == (f->phase & 1))));
+}""",
+"""    int eu_r = on && (f->phase < 0 || (f->phase < 2 ? ((g_ab_phase & 1) == f->phase) : (((g_ab_phase >> 1) & 1) == (f->phase & 1))));
+#if defined(__ANDROID__)
+    { extern const char* volatile g_eu_feat_flip __attribute__((weak));
+      const char* eu_fl = &g_eu_feat_flip ? g_eu_feat_flip : 0;
+      if (__builtin_expect(eu_fl != 0, 0) && !strcmp(eu_fl, f->name)) eu_r = !eu_r; }
+#endif
+    return eu_r;
+}""")
+change("libs/spurs/cellSpurs.c",
+"""            if (v242a_ncpu_cached() >= s_ak && v242a_feat(&s_v242a_audkeep, 1)) return 0;
+        }
+        return (s_lb & bit) != 0;""",
+"""            if (v242a_ncpu_cached() >= s_ak && v242a_feat(&s_v242a_audkeep, 1)) return 0;
+        }
+#if defined(__ANDROID__)
+        { extern volatile int g_eu_lean_flip __attribute__((weak));
+          if (&g_eu_lean_flip) return ((s_lb ^ g_eu_lean_flip) & bit) != 0; }
+#endif
+        return (s_lb & bit) != 0;""")
+
 # The remaining single-precision helpers (fi, the float compares and the
 # int<->float conversions) as packed operations on ARM64. spu_fi alone called
 # ldexpf() eight times per instruction and sits in every division the job code
