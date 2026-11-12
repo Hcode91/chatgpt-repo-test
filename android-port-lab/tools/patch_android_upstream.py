@@ -1304,6 +1304,26 @@ change("runtime/ppu/ppu_fs.cpp",
 change("libs/system/cellSaveData.c",
 '        DIR* dp = opendir(s_save_root);\n        if (!dp)\n            return 0;\n\n        struct dirent* de;\n        while ((de = readdir(dp)) != NULL) {\n            if (de->d_name[0] == \'.\')\n                continue;\n            /* Check it\'s a directory */\n            char full[1024];\n            snprintf(full, sizeof(full), "%s/%s", s_save_root, de->d_name);\n            if (!dir_exists(full))\n                continue;\n            if (prefix && prefix[0] && strncmp(de->d_name, prefix, strlen(prefix)) != 0)\n                continue;\n            if (count < max && dirList) {\n                memset(&dirList[count], 0, sizeof(CellSaveDataDirList));\n                strncpy(dirList[count].dirName, de->d_name,\n                        CELL_SAVEDATA_DIRNAME_SIZE - 1);\n            }\n            count++;\n        }\n        closedir(dp);\n',
 '        /* Android port: the save folders newest first (the order the console\'s own list has by default --\n         * a title that auto-loads "the first entry" means its most recent save), each with the list\n         * parameter from its PARAM.SFO, and a log line per folder so a save that is written but not found\n         * again can be traced from the log alone. */\n        struct { char name[CELL_SAVEDATA_DIRNAME_SIZE]; long long mt; } ent[64]; int ne = 0;\n        { char rp[1024]; if (!realpath(s_save_root, rp)) snprintf(rp, sizeof rp, "%s (unresolved)", s_save_root);\n          printf("[cellSaveData] list: root \'%s\', prefix \'%s\', room for %u\\n", rp, prefix ? prefix : "", (unsigned)max); }\n        DIR* dp = opendir(s_save_root);\n        if (!dp) { printf("[cellSaveData] list: cannot open the save root\\n"); return 0; }\n\n        struct dirent* de;\n        while ((de = readdir(dp)) != NULL) {\n            if (de->d_name[0] == \'.\')\n                continue;\n            char full[1024];\n            snprintf(full, sizeof(full), "%s/%s", s_save_root, de->d_name);\n            if (!dir_exists(full))\n                continue;\n            const int match = !(prefix && prefix[0] && strncmp(de->d_name, prefix, strlen(prefix)) != 0);\n            long long newest = 0; int nfiles = 0; long long bytes = 0;\n            { DIR* sd = opendir(full); struct dirent* fe;\n              if (sd) { while ((fe = readdir(sd)) != NULL) { if (fe->d_name[0] == \'.\') continue;\n                            char fp[1300]; snprintf(fp, sizeof fp, "%s/%s", full, fe->d_name);\n                            HOST_STAT_T fs; if (HOST_STAT(fp, &fs) == 0) { nfiles++; bytes += (long long)fs.st_size;\n                                if ((long long)fs.st_mtim.tv_sec > newest) newest = (long long)fs.st_mtim.tv_sec; } }\n                        closedir(sd); } }\n            printf("[cellSaveData] list:   %s  %s, %d file(s), %lld bytes, descriptor %s, last written %lld s ago\\n",\n                   de->d_name, match ? "offered" : "not offered (prefix)", nfiles, bytes,\n                   dir_has_save(full) ? "present" : "MISSING", newest ? (long long)time(NULL) - newest : -1LL);\n            if (!match) continue;\n            if (ne < 64) { snprintf(ent[ne].name, sizeof ent[ne].name, "%s", de->d_name); ent[ne].mt = newest; ne++; }\n            count++;\n        }\n        closedir(dp);\n        for (int i = 1; i < ne; i++)            /* newest first */\n            for (int j = i; j > 0 && ent[j].mt > ent[j - 1].mt; j--) {\n                char tn[CELL_SAVEDATA_DIRNAME_SIZE]; long long tm = ent[j].mt;\n                memcpy(tn, ent[j].name, sizeof tn); memcpy(ent[j].name, ent[j - 1].name, sizeof tn); memcpy(ent[j - 1].name, tn, sizeof tn);\n                ent[j].mt = ent[j - 1].mt; ent[j - 1].mt = tm; }\n        for (int i = 0; i < ne && (u32)i < max && dirList; i++) {\n            memset(&dirList[i], 0, sizeof(CellSaveDataDirList));\n            strncpy(dirList[i].dirName, ent[i].name, CELL_SAVEDATA_DIRNAME_SIZE - 1);\n            char full[1024]; CellSaveDataSystemFileParam sp;\n            snprintf(full, sizeof(full), "%s/%s", s_save_root, ent[i].name);\n            read_param_sfo(full, &sp);\n            memcpy(dirList[i].listParam, sp.listParam, sizeof dirList[i].listParam);\n        }\n')
+# A folder that holds save files but no descriptor is still a save: without this, an autosave whose
+# descriptor was never written is reported to the game as "new" on every later run and its data is not
+# offered for loading. An EMPTY folder stays "new" (upstream's Virtua Fighter 5 case).
+change("libs/system/cellSaveData.c",
+"""    snprintf(sfo, sizeof(sfo), "%s/PARAM.SFO", path);
+    HOST_STAT_T st;
+    return HOST_STAT(sfo, &st) == 0;
+}""",
+"""    snprintf(sfo, sizeof(sfo), "%s/PARAM.SFO", path);
+    HOST_STAT_T st;
+    if (HOST_STAT(sfo, &st) == 0) return 1;
+#if defined(__ANDROID__)
+    { DIR* sd = opendir(path); struct dirent* fe; int files = 0;
+      if (sd) { while ((fe = readdir(sd)) != NULL) if (fe->d_name[0] != '.') files++;
+                closedir(sd); }
+      return files > 0; }
+#else
+    return 0;
+#endif
+}""")
 change("libs/system/cellSaveData.c",
 """/* Enumerate save directories matching a prefix. Returns count, fills dirList up to max. */""",
 """static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* param);
