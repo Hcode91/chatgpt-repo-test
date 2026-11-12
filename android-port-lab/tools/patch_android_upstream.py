@@ -1192,7 +1192,7 @@ change("libs/video/rsx_draw_engine.c",
 # twin (runtime-integration/spu_helpers_vec_arm64.h; checked bit-for-bit against
 # the references by tools/test_spu_vec_arm64.py) instead.
 import shutil as _shutil
-for _h in ("spu_helpers_vec_arm64.h", "spu_fsimd_arm64.h"):
+for _h in ("spu_helpers_vec_arm64.h", "spu_fsimd_arm64.h", "spu_fext_arm64.h"):
     _shutil.copyfile(pathlib.Path(__file__).resolve().parent.parent / "runtime-integration" / _h,
                      root / "runtime" / "spu" / _h)
 change("runtime/spu/spu_helpers_vec.h",
@@ -1238,6 +1238,23 @@ change("runtime/spu/spu_helpers.h",
 #else
 #define SPU__FSIMD 0
 #endif""")
+# The remaining single-precision helpers (fi, the float compares and the
+# int<->float conversions) as packed operations on ARM64. spu_fi alone called
+# ldexpf() eight times per instruction and sits in every division the job code
+# does. Appended to spu_helpers.h so the references stay defined above it.
+change("runtime/spu/spu_helpers.h",
+"""#ifdef __cplusplus
+}
+#endif
+
+#endif /* SPU_HELPERS_H */""",
+"""#include "spu_fext_arm64.h"
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* SPU_HELPERS_H */""")
 # Sound. The audio module only has WASAPI (Windows) and SDL2 outputs; the
 # Android app never starts SDL, so cellAudio "continued silently": the game
 # mixed every block and threw it away. Android output through AAudio (loaded
