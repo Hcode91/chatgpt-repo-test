@@ -39,7 +39,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 final class ConvertTab {
     static final int PICK_CIA = 401, SAVE_CCI = 402, PICK_CCI = 403, SAVE_CIA = 404, PICK_CERT_CIA = 405,
             PICK_TEXTURES = 406, PICK_TEXTURE_DIR = 407, PICK_CERT_FILE = 408, PICK_RPA_SOURCE = 409, SAVE_RPA = 410,
-            PICK_TRP_SOURCE = 411, SAVE_TRP = 412;
+            PICK_TRP_SOURCE = 411, SAVE_TRP = 412, PICK_TRP_EDIT = 413, PICK_TROPHY_ICON = 414, SAVE_TRP_EDIT = 415,
+            PICK_TROPUSR = 416, SAVE_TROPUSR = 417, SAVE_TROPHY_MOD = 418, PICK_TRP_FOR_MOD = 419, PICK_TROPHY_MOD = 420;
 
     private static final String[] OUTPUTS = {"PNG", "DDS · RGBA8 (uncompressed)", "DDS · BC1 / DXT1", "DDS · BC3 / DXT5",
             "KTX · RGBA8", "KTX · ETC1", "DS NCGR + NCLR · 4bpp (16 colours)", "DS NCGR + NCLR · 8bpp (256 colours)"};
@@ -54,7 +55,14 @@ final class ConvertTab {
     private int textureOutput, textureResize;
     private boolean busy;
     private TextView status, certStatus, log;
-    private Button ciaToCci, cciToCia, saveCert, textures, folderToRpa, folderToTrp, cancel;
+    private Button ciaToCci, cciToCia, saveCert, textures, folderToRpa, folderToTrp, addTrophies, applyTrophyMod, cancel;
+    // Trophy editor session
+    private Ps3TrophyMod.Pack trophyPack;
+    private boolean trophyFromMod;
+    private byte[] draftIcon, existingTropusr;
+    private String draftName = "", draftDetail = "";
+    private int draftGrade;
+    private boolean draftHidden;
     final View view;
 
     ConvertTab(Activity activity) {
@@ -108,6 +116,13 @@ final class ConvertTab {
                 "after editing. Works in RPCS3; a real PS3 rejects edited trophy files.", 12, Color.DKGRAY));
         folderToTrp = button("Folder → TROPHY.TRP");
         box.addView(folderToTrp, new LinearLayout.LayoutParams(-1, dp(52)));
+        box.addView(text("Add your own trophies to a game's TROPHY.TRP for RPCS3, or apply a trophy mod someone shared. " +
+                "Custom trophies never count towards the platinum. The game won't award them by itself: unlocking needs a " +
+                "game patch or a manual unlock.", 12, Color.DKGRAY));
+        addTrophies = button("Add custom trophies…");
+        box.addView(addTrophies, new LinearLayout.LayoutParams(-1, dp(52)));
+        applyTrophyMod = button("Apply a trophy mod (.zip)…");
+        box.addView(applyTrophyMod, new LinearLayout.LayoutParams(-1, dp(52)));
 
         cancel = button("Cancel");
         box.addView(cancel, new LinearLayout.LayoutParams(-1, dp(46)));
@@ -133,6 +148,8 @@ final class ConvertTab {
         });
         saveCert.setOnClickListener(v -> pick(PICK_CERT_CIA, "*/*", false));
         textures.setOnClickListener(v -> pick(PICK_TEXTURES, "*/*", true));
+        addTrophies.setOnClickListener(v -> pick(PICK_TRP_EDIT, "*/*", false));
+        applyTrophyMod.setOnClickListener(v -> pick(PICK_TRP_FOR_MOD, "*/*", false));
         folderToTrp.setOnClickListener(v -> {
             if (busy) return;
             Intent tree = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
@@ -154,7 +171,7 @@ final class ConvertTab {
 
     private void refresh() {
         ciaToCci.setEnabled(!busy); cciToCia.setEnabled(!busy); saveCert.setEnabled(!busy); textures.setEnabled(!busy);
-        folderToRpa.setEnabled(!busy); folderToTrp.setEnabled(!busy);
+        folderToRpa.setEnabled(!busy); folderToTrp.setEnabled(!busy); addTrophies.setEnabled(!busy); applyTrophyMod.setEnabled(!busy);
         cancel.setEnabled(busy);
         certStatus.setText(loadCertChain() != null ? "Certificate chain: saved ✓ (CCI → CIA is ready)"
                 : "Certificate chain: not saved yet (needed for CCI → CIA)");
@@ -190,7 +207,7 @@ final class ConvertTab {
     private static String message(Exception e) { return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(); }
 
     // ---------------------------------------------------------------- results
-    boolean handles(int request) { return request >= 401 && request <= 412; }
+    boolean handles(int request) { return request >= 401 && request <= 420; }
 
     void onResult(int request, Intent data) {
         if (request == PICK_TEXTURES) {
@@ -226,6 +243,14 @@ final class ConvertTab {
             case SAVE_RPA: runFolderToRpa(sourceUri, uri); break;
             case PICK_TRP_SOURCE: sourceUri = uri; save(SAVE_TRP, "TROPHY.TRP"); break;
             case SAVE_TRP: runFolderToTrp(sourceUri, uri); break;
+            case PICK_TRP_EDIT: loadTrophyPack(uri, false); break;
+            case PICK_TRP_FOR_MOD: loadTrophyPack(uri, true); break;
+            case PICK_TROPHY_MOD: applyMod(uri); break;
+            case PICK_TROPHY_ICON: pickedIcon(uri); break;
+            case SAVE_TRP_EDIT: saveEditedPack(uri); break;
+            case PICK_TROPUSR: pickedTropusr(uri); break;
+            case SAVE_TROPUSR: saveTropusr(uri); break;
+            case SAVE_TROPHY_MOD: saveTrophyMod(uri); break;
         }
     }
 
@@ -317,6 +342,228 @@ final class ConvertTab {
                 activity.runOnUiThread(() -> { busy = false; refresh(); error("Folder → RPA failed", e); });
             }
         });
+    }
+
+    // ---------------------------------------------------------------- PS3 trophy editor
+
+    private byte[] readUri(Uri uri, int max) throws IOException {
+        try (InputStream in = activity.getContentResolver().openInputStream(uri)) {
+            if (in == null) throw new IOException("Cannot open file");
+            return readAll(in, max);
+        }
+    }
+    private void writeUri(Uri uri, byte[] data) throws IOException {
+        try (OutputStream out = activity.getContentResolver().openOutputStream(uri, "w")) {
+            if (out == null) throw new IOException("Cannot write file");
+            out.write(data);
+        }
+    }
+
+    private void loadTrophyPack(Uri uri, boolean forMod) {
+        try (ParcelFileDescriptor pfd = activity.getContentResolver().openFileDescriptor(uri, "r");
+             FileInputStream in = new FileInputStream(pfd.getFileDescriptor()); FileChannel ch = in.getChannel()) {
+            trophyPack = Ps3TrophyMod.Pack.load(ch);
+            trophyPack.conf();
+            trophyFromMod = forMod;
+            existingTropusr = null;
+            status.setText(trophyPack.gameTitle() + " · " + trophyPack.count() + " trophies");
+            log.setText("");
+            if (forMod) {
+                new AlertDialog.Builder(activity).setTitle("Now pick the trophy mod")
+                        .setMessage("Pack loaded: " + trophyPack.gameTitle() + " (" + trophyPack.count() + " trophies). Next, pick the mod's .zip file.")
+                        .setNegativeButton("Cancel", null)
+                        .setPositiveButton("Pick mod", (d, w) -> pick(PICK_TROPHY_MOD, "*/*", false)).show();
+            } else {
+                draftName = ""; draftDetail = ""; draftGrade = 0; draftHidden = false; draftIcon = null;
+                showTrophyDialog(null);
+            }
+        } catch (Exception e) { trophyPack = null; error("Couldn't open the trophy pack", e); }
+    }
+
+    /** Name, description, grade, hidden and icon for one new trophy. Reopens with the draft after picking an icon. */
+    private void showTrophyDialog(String problem) {
+        if (trophyPack == null) return;
+        LinearLayout form = new LinearLayout(activity);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(20), dp(8), dp(20), 0);
+        if (problem != null) form.addView(text(problem, 13, Color.rgb(170, 30, 30)));
+        final android.widget.EditText name = new android.widget.EditText(activity);
+        name.setHint("Trophy name"); name.setSingleLine(true); name.setText(draftName);
+        final android.widget.EditText detail = new android.widget.EditText(activity);
+        detail.setHint("Description (how to earn it)"); detail.setText(draftDetail);
+        final android.widget.Spinner grade = new android.widget.Spinner(activity);
+        grade.setAdapter(new android.widget.ArrayAdapter<>(activity, android.R.layout.simple_spinner_dropdown_item,
+                new String[]{"Bronze", "Silver", "Gold"}));
+        grade.setSelection(draftGrade);
+        final android.widget.CheckBox hidden = new android.widget.CheckBox(activity);
+        hidden.setText("Hidden until earned"); hidden.setChecked(draftHidden);
+        Button icon = button(draftIcon == null ? "Choose icon (optional)" : "Icon chosen ✓ (change)");
+        form.addView(name); form.addView(detail); form.addView(grade); form.addView(hidden); form.addView(icon);
+        form.addView(text("Icons are cropped square and resized to 240×240. Without one, a plain icon is made.", 12, Color.DKGRAY));
+        final Runnable keep = () -> {
+            draftName = name.getText().toString(); draftDetail = detail.getText().toString();
+            draftGrade = grade.getSelectedItemPosition(); draftHidden = hidden.isChecked();
+        };
+        int next;
+        try { next = trophyPack.count(); } catch (IOException e) { next = 0; }
+        final AlertDialog dialog = new AlertDialog.Builder(activity)
+                .setTitle(String.format(Locale.ROOT, "New trophy #%03d", next))
+                .setView(form)
+                .setNegativeButton(trophyPack.added.trophies.isEmpty() ? "Cancel" : "Finish", (d, w) -> finishTrophyEditing())
+                .setPositiveButton("Add trophy", (d, w) -> {
+                    keep.run();
+                    try {
+                        Ps3TrophyMod.Trophy t = new Ps3TrophyMod.Trophy();
+                        t.name = draftName; t.detail = draftDetail; t.grade = "BSG".charAt(draftGrade); t.hidden = draftHidden;
+                        t.iconPng = draftIcon != null ? draftIcon : defaultIcon(t.grade);
+                        int id = trophyPack.add(t);
+                        draftName = ""; draftDetail = ""; draftIcon = null; draftHidden = false;
+                        new AlertDialog.Builder(activity).setTitle("Trophy added")
+                                .setMessage(String.format(Locale.ROOT, "\"%s\" is trophy #%03d. %d added so far.", t.name.trim(), id, trophyPack.added.trophies.size()))
+                                .setNegativeButton("Add another", (d2, w2) -> showTrophyDialog(null))
+                                .setPositiveButton("Finish & save", (d2, w2) -> finishTrophyEditing())
+                                .setCancelable(false).show();
+                    } catch (Exception e) { showTrophyDialog(e.getMessage()); }
+                })
+                .setCancelable(false).create();
+        icon.setOnClickListener(v -> { keep.run(); dialog.dismiss(); pick(PICK_TROPHY_ICON, "image/*", false); });
+        dialog.show();
+    }
+
+    private void pickedIcon(Uri uri) {
+        try {
+            byte[] raw = readUri(uri, 32 << 20);
+            Bitmap src = BitmapFactory.decodeByteArray(raw, 0, raw.length);
+            if (src == null) throw new IOException("That file isn't an image this device can read");
+            int side = Math.min(src.getWidth(), src.getHeight());
+            Bitmap square = Bitmap.createBitmap(src, (src.getWidth() - side) / 2, (src.getHeight() - side) / 2, side, side);
+            Bitmap scaled = Bitmap.createScaledBitmap(square, Ps3TrophyMod.ICON_SIZE, Ps3TrophyMod.ICON_SIZE, true);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            scaled.compress(Bitmap.CompressFormat.PNG, 100, out);
+            draftIcon = out.toByteArray();
+            showTrophyDialog(null);
+        } catch (Exception | OutOfMemoryError e) {
+            showTrophyDialog("Couldn't use that image: " + (e.getMessage() == null ? "not enough memory" : e.getMessage()));
+        }
+    }
+
+    /** A plain icon in the grade's colour, for trophies added without one. */
+    private byte[] defaultIcon(char grade) {
+        int size = Ps3TrophyMod.ICON_SIZE;
+        Bitmap bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
+        android.graphics.Canvas c = new android.graphics.Canvas(bmp);
+        c.drawColor(Color.rgb(28, 32, 64));
+        android.graphics.Paint p = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+        p.setColor(grade == 'G' ? Color.rgb(240, 196, 60) : grade == 'S' ? Color.rgb(200, 204, 214) : Color.rgb(196, 128, 72));
+        c.drawCircle(size / 2f, size / 2f, size * 0.36f, p);
+        p.setColor(Color.rgb(28, 32, 64));
+        c.drawCircle(size / 2f, size / 2f, size * 0.24f, p);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        bmp.compress(Bitmap.CompressFormat.PNG, 100, out);
+        return out.toByteArray();
+    }
+
+    private void applyMod(Uri uri) {
+        if (trophyPack == null) return;
+        try {
+            Ps3TrophyMod mod;
+            try (InputStream in = activity.getContentResolver().openInputStream(uri)) {
+                if (in == null) throw new IOException("Cannot open the mod file");
+                mod = Ps3TrophyMod.fromZip(in);
+            }
+            trophyPack.apply(mod);
+            StringBuilder list = new StringBuilder();
+            for (Ps3TrophyMod.Trophy t : mod.trophies) list.append("\n• ").append(t.name);
+            new AlertDialog.Builder(activity).setTitle(mod.title.isEmpty() ? "Trophy mod" : mod.title)
+                    .setMessage((mod.author.isEmpty() ? "" : "By " + mod.author + "\n\n") + mod.trophies.size() + " trophies will be added:" + list)
+                    .setNegativeButton("Cancel", (d, w) -> trophyPack = null)
+                    .setPositiveButton("Save pack", (d, w) -> finishTrophyEditing()).show();
+        } catch (Exception e) { trophyPack = null; error("Couldn't apply the trophy mod", e); }
+    }
+
+    private void finishTrophyEditing() {
+        if (trophyPack == null || trophyPack.added.trophies.isEmpty()) { trophyPack = null; status.setText("No trophies added."); return; }
+        save(SAVE_TRP_EDIT, "TROPHY.TRP");
+    }
+
+    private void saveEditedPack(Uri dest) {
+        if (trophyPack == null) return;
+        try {
+            writeUri(dest, trophyPack.toTrp());
+            status.setText("Trophy pack saved · " + trophyPack.count() + " trophies");
+            log.setText("Replace PS3_GAME/TROPDIR/" + trophyPack.added.commId + "/TROPHY.TRP in the game folder (keep a backup of the original).");
+            new AlertDialog.Builder(activity).setTitle("Update the progress file")
+                    .setMessage("RPCS3 keeps earned trophies in TROPUSR.DAT, sized for the old trophy count, so it needs rebuilding. " +
+                            "It's in RPCS3's folder: dev_hdd0/home/00000001/trophy/" + trophyPack.added.commId + "/\n\n" +
+                            "Pick your current one to keep what you've earned, or make a fresh one with everything locked.")
+                    .setPositiveButton("Pick my TROPUSR.DAT", (d, w) -> pick(PICK_TROPUSR, "*/*", false))
+                    .setNeutralButton("Fresh one", (d, w) -> { existingTropusr = null; save(SAVE_TROPUSR, "TROPUSR.DAT"); })
+                    .setNegativeButton("Skip", (d, w) -> offerModExport())
+                    .setCancelable(false).show();
+        } catch (Exception e) {
+            try { DocumentsContract.deleteDocument(activity.getContentResolver(), dest); } catch (Exception ignored) { }
+            error("Couldn't save the trophy pack", e);
+        }
+    }
+
+    private void pickedTropusr(Uri uri) {
+        try {
+            byte[] d = readUri(uri, 4 << 20);
+            if (!Ps3TrophyProgress.isProgress(d)) throw new IOException("That isn't a TROPUSR.DAT file");
+            Ps3TrophyProgress.parse(d);
+            existingTropusr = d;
+            save(SAVE_TROPUSR, "TROPUSR.DAT");
+        } catch (Exception e) { error("Couldn't read the progress file", e); offerModExport(); }
+    }
+
+    private void saveTropusr(Uri dest) {
+        if (trophyPack == null) return;
+        try {
+            byte[] out = trophyPack.toTropusr(existingTropusr);
+            writeUri(dest, out);
+            int earned = 0;
+            for (Ps3TrophyProgress.Trophy t : Ps3TrophyProgress.parse(out).trophies) if (t.unlocked) earned++;
+            log.setText(log.getText() + "\nProgress file saved (" + earned + " earned trophies kept). With RPCS3 closed, put it in " +
+                    "dev_hdd0/home/00000001/trophy/" + trophyPack.added.commId + "/ as TROPUSR.DAT.");
+        } catch (Exception e) {
+            try { DocumentsContract.deleteDocument(activity.getContentResolver(), dest); } catch (Exception ignored) { }
+            error("Couldn't save the progress file", e);
+        }
+        offerModExport();
+    }
+
+    private void offerModExport() {
+        if (trophyPack == null || trophyFromMod || trophyPack.added.trophies.isEmpty()) { trophyPack = null; return; }
+        LinearLayout form = new LinearLayout(activity);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(20), dp(8), dp(20), 0);
+        final android.widget.EditText title = new android.widget.EditText(activity);
+        title.setHint("Mod title"); title.setSingleLine(true);
+        title.setText(trophyPack.gameTitle().isEmpty() ? "" : trophyPack.gameTitle() + " custom trophies");
+        final android.widget.EditText author = new android.widget.EditText(activity);
+        author.setHint("Your name (optional)"); author.setSingleLine(true);
+        form.addView(text("Save your " + trophyPack.added.trophies.size() + " new trophies as a mod file others can apply to their " +
+                "own copy of the game. It contains only your names, descriptions and icons, nothing from the game.", 13, Color.DKGRAY));
+        form.addView(title); form.addView(author);
+        new AlertDialog.Builder(activity).setTitle("Share as a trophy mod?").setView(form)
+                .setNegativeButton("Not now", (d, w) -> trophyPack = null)
+                .setPositiveButton("Save mod", (d, w) -> {
+                    trophyPack.added.title = title.getText().toString().trim();
+                    trophyPack.added.author = author.getText().toString().trim();
+                    save(SAVE_TROPHY_MOD, trophyPack.added.commId + "_trophy_mod.zip");
+                }).setCancelable(false).show();
+    }
+
+    private void saveTrophyMod(Uri dest) {
+        if (trophyPack == null) return;
+        try {
+            writeUri(dest, trophyPack.added.toZip());
+            log.setText(log.getText() + "\nTrophy mod saved.");
+        } catch (Exception e) {
+            try { DocumentsContract.deleteDocument(activity.getContentResolver(), dest); } catch (Exception ignored) { }
+            error("Couldn't save the trophy mod", e);
+        }
+        trophyPack = null;
     }
 
     // ---------------------------------------------------------------- PS3 trophy packing

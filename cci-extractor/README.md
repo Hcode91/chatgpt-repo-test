@@ -1,4 +1,22 @@
-# Game Asset Extractor (Android v0.14.0)
+# Game Asset Extractor (Android v0.15.0)
+
+## New in v0.15: custom PS3 trophies and trophy mods (for RPCS3)
+
+**Convert → Add custom trophies…**
+1. Pick the game's `TROPHY.TRP`.
+2. For each trophy enter a name, description, grade (bronze, silver or gold), hidden or not, and optionally an icon (cropped square and resized to 240×240).
+3. Save the new `TROPHY.TRP` and put it in the game's `PS3_GAME/TROPDIR/<id>/` folder (keep a backup).
+4. Rebuild the progress file: pick your current `TROPUSR.DAT` (in RPCS3's `dev_hdd0/home/00000001/trophy/<id>/`) to keep earned trophies, or make a fresh one. Put the result back there with RPCS3 closed.
+5. Optionally save your additions as a **trophy mod** to share.
+
+**Convert → Apply a trophy mod (.zip)…** adds someone else's trophies to your own `TROPHY.TRP`. A mod holds only its creator's names, descriptions and icons (`trophymod.xml` + `icons/`), nothing from the game. It records which trophy set and original trophy list it was made for, and is refused on any other pack.
+
+Limits:
+- Custom trophies never count towards the platinum, and a platinum can't be added.
+- The game won't award them by itself. That needs a per-game RPCS3 patch (not part of the app) or a manual unlock; the app has no unlock button yet.
+- RPCS3 only. A real PS3 rejects edited trophy files. If you use RPCN, be aware RPCS3 syncs unlocked trophies with it.
+
+**How it was checked:** a pack with one added trophy and a rebuilt `TROPUSR.DAT` were loaded in RPCS3, where the trophy appeared with its icon and a manual unlock showed as earned. The editor reproduces both of those files byte-for-byte. The `TROPUSR.DAT` writer also reproduces RPCS3's own 14-trophy file byte-for-byte. The editor screens themselves haven't been run on a device.
 
 ## New in v0.14: PS3 trophy packs (TROPHY.TRP), extract and rebuild
 
