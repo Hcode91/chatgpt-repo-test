@@ -1253,7 +1253,7 @@ static void eu_skip_movie_open(int fd, const char* gpath, FILE* f)
     static int s_on = -1; static uint32_t s_keep = 1;
     if (s_on < 0) { const char* e = getenv("EU_SKIP_MOVIES"); s_on = (e && *e == '1') ? 1 : 0;
                     const char* k = getenv("EU_SKIP_MOVIES_FRAMES"); if (k && atoi(k) > 0) s_keep = (uint32_t)atoi(k);
-                    if (s_on) fprintf(stderr, "[skip-movie] cutscene videos are cut to %u frame(s) (EU_SKIP_MOVIES)\\\\n", (unsigned)s_keep); }
+                    if (s_on) fprintf(stderr, "[skip-movie] cutscene videos are cut to %u frame(s) (EU_SKIP_MOVIES)\\n", (unsigned)s_keep); }
     if (!s_on || !f) return;
     const char* d = strstr(gpath, "/movies/cutscene/");
     if (!d || !strstr(d, ".bik")) return;
@@ -1263,13 +1263,13 @@ static void eu_skip_movie_open(int fd, const char* gpath, FILE* f)
     const size_t got = fread(h, 1, sizeof h, f);
     fseek(f, pos, SEEK_SET);
     if (got != sizeof h || memcmp(h, "BIK", 3) != 0) {
-        fprintf(stderr, "[skip-movie] %s: not a Bink 1 file (starts %02X %02X %02X %02X), left alone\\\\n", d + 17, h[0], h[1], h[2], h[3]);
+        fprintf(stderr, "[skip-movie] %s: not a Bink 1 file (starts %02X %02X %02X %02X), left alone\\n", d + 17, h[0], h[1], h[2], h[3]);
         return; }
     const uint32_t frames = (uint32_t)h[8] | ((uint32_t)h[9] << 8) | ((uint32_t)h[10] << 16) | ((uint32_t)h[11] << 24);
     const uint32_t again  = (uint32_t)h[16] | ((uint32_t)h[17] << 8) | ((uint32_t)h[18] << 16) | ((uint32_t)h[19] << 24);
     if (frames <= s_keep) return;
     g_eu_skipmv[fd].on = 1; g_eu_skipmv[fd].dup = (again == frames); g_eu_skipmv[fd].keep = s_keep;
-    fprintf(stderr, "[skip-movie] %s: %u frames -> %u\\\\n", d + 17, (unsigned)frames, (unsigned)s_keep);
+    fprintf(stderr, "[skip-movie] %s: %u frames -> %u\\n", d + 17, (unsigned)frames, (unsigned)s_keep);
 }
 /* patch the frame count where a read covers it: file offsets 8..11, and 16..19 when that word repeats it */
 static void eu_skip_movie_fix(int fd, long long pos, unsigned char* buf, size_t n)

@@ -252,6 +252,18 @@ public final class EuBootActivity extends Activity {
         logButtons.addView(share);
         root.addView(logButtons);
 
+        LinearLayout saveButtons = new LinearLayout(this);
+        saveButtons.setOrientation(LinearLayout.HORIZONTAL);
+        Button saveOut = button("Export saves");
+        saveOut.setOnClickListener(v -> copySaves(true));
+        Button saveIn = button("Import saves");
+        saveIn.setOnClickListener(v -> copySaves(false));
+        saveButtons.addView(saveOut);
+        saveButtons.addView(saveIn);
+        root.addView(saveButtons);
+        root.addView(text("Saves are copied to and from Download/InfamousPort-saves. Copy that folder to "
+                + "another device to carry a save across.", 12, Color.rgb(170, 180, 190), false));
+
         root.addView(heading("Runner output (last " + TAIL_LINES + " lines; full log is saved)"));
         logView = text("", 11, Color.rgb(180, 239, 204), false);
         logView.setTypeface(Typeface.MONOSPACE);
@@ -317,6 +329,86 @@ public final class EuBootActivity extends Activity {
         //noinspection ResultOfMethodCallIgnored
         d.mkdirs();
         return d;
+    }
+
+    /* The game's saves live in app-private storage (lost on uninstall, not visible to
+     * other devices). Export copies every save folder to Download/InfamousPort-saves;
+     * import copies them back, replacing folders of the same name. File times are kept:
+     * the game loads the most recently written save. */
+    private File saveRoot() {
+        return new File(workDir(), "gamedata/dev_hdd0/home/00000001/savedata");
+    }
+
+    private File sharedSaveDir() {
+        return new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                "InfamousPort-saves");
+    }
+
+    private void copySaves(boolean export) {
+        if (child != null) { toast("Stop the game first"); return; }
+        if (!hasFileAccess()) { toast("Allow file access first"); return; }
+        File from = export ? saveRoot() : sharedSaveDir();
+        File to = export ? sharedSaveDir() : saveRoot();
+        File[] dirs = from.listFiles(File::isDirectory);
+        if (dirs == null || dirs.length == 0) {
+            toast(export ? "No saves on this device yet" : "Nothing in Download/InfamousPort-saves");
+            return;
+        }
+        int folders = 0, files = 0;
+        /* shared storage does not always keep a file time that is set on it, so the
+         * times also travel in a list beside the folders */
+        java.util.HashMap<String, Long> times = new java.util.HashMap<>();
+        StringBuilder timeList = new StringBuilder();
+        if (!export) {
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(
+                    new FileInputStream(new File(from, "times.txt")), StandardCharsets.UTF_8))) {
+                String l;
+                while ((l = r.readLine()) != null) {
+                    int k = l.lastIndexOf('\t');
+                    if (k > 0) times.put(l.substring(0, k), Long.parseLong(l.substring(k + 1).trim()));
+                }
+            } catch (IOException | NumberFormatException ignored) {
+            }
+        }
+        try {
+            for (File d : dirs) {
+                File[] fs = d.listFiles(File::isFile);
+                if (fs == null || fs.length == 0) continue;
+                File out = new File(to, d.getName());
+                //noinspection ResultOfMethodCallIgnored
+                out.mkdirs();
+                if (!out.isDirectory()) throw new IOException("cannot create " + out);
+                File[] old = out.listFiles(File::isFile);
+                if (old != null) for (File o : old) {
+                    //noinspection ResultOfMethodCallIgnored
+                    o.delete();
+                }
+                for (File f : fs) {
+                    File g = new File(out, f.getName());
+                    try (FileInputStream in = new FileInputStream(f); FileOutputStream os = new FileOutputStream(g)) {
+                        byte[] buf = new byte[65536];
+                        int n;
+                        while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
+                    }
+                    //noinspection ResultOfMethodCallIgnored
+                    String key = d.getName() + "/" + f.getName();
+                    Long t = times.get(key);
+                    g.setLastModified(t != null ? t : f.lastModified());
+                    timeList.append(key).append('\t').append(f.lastModified()).append('\n');
+                    files++;
+                }
+                folders++;
+            }
+            if (export) {
+                try (FileOutputStream os = new FileOutputStream(new File(to, "times.txt"))) {
+                    os.write(timeList.toString().getBytes(StandardCharsets.UTF_8));
+                }
+            }
+            toast((export ? "Exported " : "Imported ") + folders + " save(s), " + files + " files"
+                    + (export ? " to Download/InfamousPort-saves" : ""));
+        } catch (IOException e) {
+            toast("Save copy failed: " + e.getMessage());
+        }
     }
 
     private File runner() {
