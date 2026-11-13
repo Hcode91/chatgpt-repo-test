@@ -1,4 +1,14 @@
-# Game Asset Extractor (Android v0.11.0)
+# Game Asset Extractor (Android v0.12.0)
+
+## New in v0.12: Metal Gear Solid voice files (VOX.DAT)
+
+Metal Gear Solid (PS1) keeps its codec calls and cutscene dialogue in `VOX.DAT` (`VOX_1.DAT` / `VOX_2.DAT` on the two discs). Extract it from the disc, then open it with **Open ROM**.
+
+- The list shows every clip with its length and first subtitle line. **Extract all** converts everything; tap a clip for just that one.
+- Each clip becomes `vox_NNNN.wav` (22050 Hz; mono, or stereo for the clips that have music), plus `vox_NNNN.srt` subtitles timed to the WAV, so most media players show them together.
+- `script.txt` lists every subtitle line, clip by clip, to make finding a scene easy.
+
+How it was checked: the format was worked out from a retail `VOX_1.DAT` (1,107 clips, 4.3 hours, 2,675 subtitle lines), and all of it converts without errors. The sample rate isn't stored in the file. 22,050 Hz was chosen because it puts the voices at normal speaking pitch (median about 125 Hz), and the subtitle timing lines up with the speech. Subtitle timing for the 33 stereo clips is less certain, because music under the dialogue makes it harder to check. Only English text has been seen; other language versions may show garbled subtitles. CI runs `tests/MgsVoxTest.java` on a synthetic file.
 
 ## New in v0.11: PlayStation disc images
 
