@@ -38,7 +38,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /** The "Convert" tab: 3DS container conversion and batch texture conversion. */
 final class ConvertTab {
     static final int PICK_CIA = 401, SAVE_CCI = 402, PICK_CCI = 403, SAVE_CIA = 404, PICK_CERT_CIA = 405,
-            PICK_TEXTURES = 406, PICK_TEXTURE_DIR = 407, PICK_CERT_FILE = 408;
+            PICK_TEXTURES = 406, PICK_TEXTURE_DIR = 407, PICK_CERT_FILE = 408, PICK_RPA_SOURCE = 409, SAVE_RPA = 410;
 
     private static final String[] OUTPUTS = {"PNG", "DDS · RGBA8 (uncompressed)", "DDS · BC1 / DXT1", "DDS · BC3 / DXT5",
             "KTX · RGBA8", "KTX · ETC1", "DS NCGR + NCLR · 4bpp (16 colours)", "DS NCGR + NCLR · 8bpp (256 colours)"};
@@ -53,7 +53,7 @@ final class ConvertTab {
     private int textureOutput, textureResize;
     private boolean busy;
     private TextView status, certStatus, log;
-    private Button ciaToCci, cciToCia, saveCert, textures, cancel;
+    private Button ciaToCci, cciToCia, saveCert, textures, folderToRpa, cancel;
     final View view;
 
     ConvertTab(Activity activity) {
@@ -96,6 +96,12 @@ final class ConvertTab {
         textures = button("Convert textures…");
         box.addView(textures, new LinearLayout.LayoutParams(-1, dp(52)));
 
+        box.addView(text("Ren'Py", 17, Color.rgb(35, 45, 91)));
+        box.addView(text("Pack a folder back into a Ren'Py archive (.rpa, RPA-3.0) after editing files extracted from one. " +
+                "Paths inside the archive are the paths inside the folder you pick.", 12, Color.DKGRAY));
+        folderToRpa = button("Folder → RPA");
+        box.addView(folderToRpa, new LinearLayout.LayoutParams(-1, dp(52)));
+
         cancel = button("Cancel");
         box.addView(cancel, new LinearLayout.LayoutParams(-1, dp(46)));
         status = text("Ready.", 14, Color.rgb(36, 49, 105));
@@ -120,6 +126,12 @@ final class ConvertTab {
         });
         saveCert.setOnClickListener(v -> pick(PICK_CERT_CIA, "*/*", false));
         textures.setOnClickListener(v -> pick(PICK_TEXTURES, "*/*", true));
+        folderToRpa.setOnClickListener(v -> {
+            if (busy) return;
+            Intent tree = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+            tree.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            activity.startActivityForResult(tree, PICK_RPA_SOURCE);
+        });
         cancel.setOnClickListener(v -> { cancelled.set(true); NativeCia.cancel(); status.setText("Cancelling…"); });
 
         ScrollView scroll = new ScrollView(activity);
@@ -129,6 +141,7 @@ final class ConvertTab {
 
     private void refresh() {
         ciaToCci.setEnabled(!busy); cciToCia.setEnabled(!busy); saveCert.setEnabled(!busy); textures.setEnabled(!busy);
+        folderToRpa.setEnabled(!busy);
         cancel.setEnabled(busy);
         certStatus.setText(loadCertChain() != null ? "Certificate chain: saved ✓ (CCI → CIA is ready)"
                 : "Certificate chain: not saved yet (needed for CCI → CIA)");
@@ -164,7 +177,7 @@ final class ConvertTab {
     private static String message(Exception e) { return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(); }
 
     // ---------------------------------------------------------------- results
-    boolean handles(int request) { return request >= 401 && request <= 408; }
+    boolean handles(int request) { return request >= 401 && request <= 410; }
 
     void onResult(int request, Intent data) {
         if (request == PICK_TEXTURES) {
@@ -196,7 +209,99 @@ final class ConvertTab {
             case PICK_CERT_CIA: saveCertFromCia(uri); break;
             case PICK_CERT_FILE: saveCertFile(uri); break;
             case PICK_TEXTURE_DIR: runTextures(uri); break;
+            case PICK_RPA_SOURCE: sourceUri = uri; save(SAVE_RPA, rpaName(uri)); break;
+            case SAVE_RPA: runFolderToRpa(sourceUri, uri); break;
         }
+    }
+
+    // ---------------------------------------------------------------- Ren'Py archive packing
+
+    /** Suggested archive name: "archive.rpa" for a folder called RPA_archive_20261113_101500, else "<folder>.rpa". */
+    private String rpaName(Uri tree) {
+        String id = DocumentsContract.getTreeDocumentId(tree);
+        String name = id.substring(id.lastIndexOf('/') + 1);
+        name = name.substring(name.lastIndexOf(':') + 1);
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("RPA_(.+)_\\d{8}_\\d{6}").matcher(name);
+        if (m.matches()) name = m.group(1);
+        return (name.isEmpty() ? "archive" : name) + ".rpa";
+    }
+
+    /** Every file under a picked folder, with its path relative to that folder. */
+    private List<RenpyArchive.Source> listTree(Uri tree) throws IOException {
+        List<RenpyArchive.Source> out = new ArrayList<>();
+        ArrayList<String[]> pending = new ArrayList<>();
+        pending.add(new String[]{DocumentsContract.getTreeDocumentId(tree), ""});
+        String[] columns = {DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.COLUMN_SIZE};
+        while (!pending.isEmpty()) {
+            String[] dir = pending.remove(pending.size() - 1);
+            Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, dir[0]);
+            try (Cursor c = activity.getContentResolver().query(children, columns, null, null, null)) {
+                if (c == null) throw new IOException("Cannot list the folder");
+                while (c.moveToNext()) {
+                    String id = c.getString(0), name = c.getString(1), mime = c.getString(2);
+                    String path = dir[1].isEmpty() ? name : dir[1] + "/" + name;
+                    if (DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) { pending.add(new String[]{id, path}); continue; }
+                    final Uri doc = DocumentsContract.buildDocumentUriUsingTree(tree, id);
+                    long known = c.isNull(3) ? -1 : c.getLong(3);
+                    if (known < 0) {
+                        // Some storage providers don't report sizes in listings; ask the file itself.
+                        try (ParcelFileDescriptor pfd = activity.getContentResolver().openFileDescriptor(doc, "r")) {
+                            known = pfd == null ? -1 : pfd.getStatSize();
+                        }
+                    }
+                    if (known < 0) throw new IOException("Can't tell the size of " + path);
+                    final long size = known;
+                    out.add(new RenpyArchive.Source() {
+                        public String path() { return path; }
+                        public long size() { return size; }
+                        public InputStream open() throws IOException {
+                            InputStream in = activity.getContentResolver().openInputStream(doc);
+                            if (in == null) throw new IOException("Cannot read " + path);
+                            return in;
+                        }
+                    });
+                }
+            }
+        }
+        return out;
+    }
+
+    private void runFolderToRpa(Uri tree, Uri dest) {
+        busy = true; cancelled.set(false); refresh();
+        status.setText("Packing Ren'Py archive…"); log.setText("");
+        worker.execute(() -> {
+            try {
+                List<RenpyArchive.Source> files = listTree(tree);
+                if (files.isEmpty()) throw new IOException("The folder is empty");
+                long total = 0;
+                for (RenpyArchive.Source f : files) total += Math.max(0, f.size());
+                final long bytes = total;
+                long size;
+                try (OutputStream raw = activity.getContentResolver().openOutputStream(dest, "w")) {
+                    if (raw == null) throw new IOException("Cannot write the archive");
+                    java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(raw, 1 << 20);
+                    size = RenpyArchive.write(files, out, new RenpyArchive.Progress() {
+                        public void file(int index, int count, String path) {
+                            activity.runOnUiThread(() -> { status.setText("Packing " + index + "/" + count + "…"); log.setText(path); });
+                        }
+                        public boolean cancelled() { return cancelled.get(); }
+                    });
+                    out.flush();
+                }
+                final long archiveSize = size;
+                final int count = files.size();
+                activity.runOnUiThread(() -> {
+                    busy = false; refresh();
+                    status.setText("Folder → RPA done");
+                    log.setText(count + " files · " + (bytes >> 20) + " MB of data · archive " + (archiveSize >> 20) + " MB\n" +
+                            "Put the .rpa in the game's game/ folder in place of the original (keep a backup of the original).");
+                });
+            } catch (Exception e) {
+                try { DocumentsContract.deleteDocument(activity.getContentResolver(), dest); } catch (Exception ignored) { }
+                activity.runOnUiThread(() -> { busy = false; refresh(); error("Folder → RPA failed", e); });
+            }
+        });
     }
 
     // ---------------------------------------------------------------- certificate chain (kept privately)
