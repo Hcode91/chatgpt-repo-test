@@ -1016,6 +1016,7 @@ int sampler_slot(const rsx_be_sampler_desc* d)
 }
 
 /* ------------------------------------------------------------------ pipelines */
+int g_pull_broken;   /* a GPU-fetch pipeline was refused by the driver: CPU decode for the rest of the run */
 struct Pipe {
     bool live = false;
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
@@ -1217,9 +1218,27 @@ VkPipeline build_variant(Pipe& p, int cls, bool depth_only)
     gi.pDynamicState = &dy;
     gi.layout = p.layout;
     VkPipeline pl = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(g_dev, VK_NULL_HANDLE, 1, &gi, nullptr, &pl) != VK_SUCCESS) {
+    const VkResult pr = vkCreateGraphicsPipelines(g_dev, VK_NULL_HANDLE, 1, &gi, nullptr, &pl);
+    if (pr != VK_SUCCESS) {
         static int said;
-        if (said++ < 8) fprintf(stderr, "[RSX vulkan] graphics pipeline creation failed\n");
+        if (said++ < 8) {
+            u32 nb[4] = {0, 0, 0, 0};   /* uniform buffers, storage buffers, sampled images, other */
+            for (const ResBinding& b : p.bindings)
+                nb[b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? 0 : b.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? 1
+                   : b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ? 2 : 3] += b.count;
+            fprintf(stderr, "[RSX vulkan] graphics pipeline creation failed: result %d, %s vertex fetch, %u attribute(s), "
+                            "stride %u, %u colour target(s) format %d, depth format %d, class %d%s, bindings: %u uniform "
+                            "buffer(s), %u storage buffer(s), %u texture(s), %u other | driver version 0x%08X\n",
+                    (int)pr, p.pull ? "GPU" : "CPU", p.attr_count, p.stride, ncol, (int)p.rt_fmt, (int)g_depth_fmt, cls,
+                    depth_only ? " depth-only" : "", nb[0], nb[1], nb[2], nb[3], (unsigned)g_props.driverVersion);
+        }
+        if (p.pull && !g_pull_broken) {
+            /* this driver does not take the GPU-fetch programs (Adreno 750, Android 16: every one refused):
+             * decode vertices on the CPU from here on, so the world is drawn instead of dropped */
+            g_pull_broken = 1;
+            fprintf(stderr, "[RSX vulkan] vertex fetch on the GPU: switched OFF for this run, the driver refused its "
+                            "pipeline (same as EU_VK_PULL=0)\n");
+        }
         return VK_NULL_HANDLE;
     }
     return pl;
@@ -2935,7 +2954,7 @@ extern "C" int eu_vk_pull_ok(void)
         on = (e && *e == '0') ? 0 : 1;   /* default on since boot-20261111-004009: 16-18 us per draw against 23-25 on the CPU */
         fprintf(stderr, "[RSX vulkan] vertex fetch on the GPU: %s (EU_VK_PULL=0 turns it off)\n", on ? "on" : "off");
     }
-    return on && g_active;
+    return on && g_active && !g_pull_broken;
 }
 
 /* Stage one pulled draw: the raw bytes of its attributes (overlapping or touching ranges merged, so only memory
