@@ -1,4 +1,8 @@
-# Game Asset Extractor (Android v0.12.0)
+# Game Asset Extractor (Android v0.12.1)
+
+## v0.12.1: Metal Gear Solid cutscene audio (DEMO.DAT) too
+
+`DEMO.DAT` (the cutscenes) uses the same container as `VOX.DAT`, with extra animation data in each clip. Open it the same way and you get `demo_NNNN.wav` + `.srt` for each cutscene. A retail `DEMO.DAT` gives 79 cutscenes, about 2.2 hours, mostly stereo, with 1,430 subtitle lines; all of it converts. The animation data itself isn't exported. 22,050 Hz was chosen for the same reason as for VOX: the voices come out at a normal male pitch (median about 112 Hz). One forum post suggests 33,075 Hz for the PC version's files, and at that rate the cutscene animation would run at a round 25 fps, so if the cutscene audio sounds slow or deep, that is the likely cause.
 
 ## New in v0.12: Metal Gear Solid voice files (VOX.DAT)
 

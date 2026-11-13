@@ -1603,8 +1603,7 @@ public class MainActivity extends Activity {
                         runOnUiThread(() -> summary.setText("Converting clip " + position + "/" + total + "..."));
                         try {
                             MgsVox.Clip clip = MgsVox.convert(channel, e);
-                            writeDoc(folder, e.name() + ".wav", "audio/wav", clip.wav);
-                            stats[0]++;
+                            if (e.audioBytes > 0) { writeDoc(folder, e.name() + ".wav", "audio/wav", clip.wav); stats[0]++; }
                             if (!clip.subtitles.isEmpty()) {
                                 writeDoc(folder, e.name() + ".srt", "application/x-subrip",
                                         MgsVox.srt(clip.subtitles).getBytes(java.nio.charset.StandardCharsets.UTF_8));
@@ -1709,9 +1708,9 @@ public class MainActivity extends Activity {
                             "were saved as raw 2352-byte sectors; open them with a tool such as jPSXdec." : "");
                     boolean hasVox = false;
                     for (Ps1Disc.FileEntry f : info.files)
-                        if (f.path.toUpperCase(Locale.ROOT).matches("(.*/)?VOX(_\\d+)?\\.DAT")) hasVox = true;
-                    final String voxHint = hasVox ? "\n\nThis disc has Metal Gear Solid voice files (VOX.DAT). Open the extracted " +
-                            "VOX.DAT here to convert its clips to WAV with subtitles." : "";
+                        if (f.path.toUpperCase(Locale.ROOT).matches("(.*/)?(VOX|DEMO)(_\\d+)?\\.DAT")) hasVox = true;
+                    final String voxHint = hasVox ? "\n\nThis disc has Metal Gear Solid voice files (VOX.DAT and DEMO.DAT). Open " +
+                            "the extracted files here to convert their clips to WAV with subtitles." : "";
                     summary.setText("Disc extraction " + (cancelled.get() ? "cancelled" : "complete"));
                     detail.setText(result);
                     new AlertDialog.Builder(this).setTitle(cancelled.get() ? "Disc extraction cancelled" : "Disc extraction complete")
