@@ -66,6 +66,7 @@ public class MainActivity extends Activity {
     private static final int PICK_PALETTE = 317;
     private static final int PICK_PAK_FOLDER = 318;
     private static final int PICK_PS1_FOLDER = 319;
+    private static final int PICK_VOX_FOLDER = 320;
     private static final String DIR_MIME = DocumentsContract.Document.MIME_TYPE_DIR;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -77,6 +78,10 @@ public class MainActivity extends Activity {
     private RetroTiles.Info retroInfo;
     private TorusPak.Info pakInfo;
     private Ps1Disc.Info ps1Info;
+    private MgsVox.Info voxInfo;
+    private final List<String> voxLabels = new ArrayList<>();
+    /** Index of the single clip to extract, or -1 for all. */
+    private int voxOnly = -1;
     /** Index of the single disc file to extract, or -1 for the whole disc. */
     private int ps1Only = -1;
     /** Index of the single bundle to extract, or -1 for the whole PAK. */
@@ -223,7 +228,8 @@ public class MainActivity extends Activity {
         paletteButton.setOnClickListener(v -> choosePalette());
         upscaleHd.setOnClickListener(v -> chooseHdUpscale());
         extractAll.setOnClickListener(v -> {
-            if (ps1Info != null) beginPs1Extract(-1);
+            if (voxInfo != null) beginVoxExtract(-1);
+            else if (ps1Info != null) beginPs1Extract(-1);
             else if (pakInfo != null) beginPakExtract(-1);
             else if (retroInfo != null) beginRetroExport(-1);
             else if (nesInfo != null) beginNesExport(-1);
@@ -246,6 +252,17 @@ public class MainActivity extends Activity {
             if (busy || position < 0 || position >= displayed.size()) return;
             if (retroInfo != null || nesInfo != null) {
                 showTilePreview(position);
+                return;
+            }
+            if (voxInfo != null) {
+                if (position >= voxInfo.entries.size()) return;
+                MgsVox.Entry clip = voxInfo.entries.get(position);
+                new AlertDialog.Builder(this).setTitle(clip.name())
+                        .setMessage("Length: " + duration(clip.seconds()) + (clip.channels == 2 ? " (stereo)" : "") +
+                                (clip.subtitleChunks > 0 ? "\nHas subtitles." : "\nNo subtitles.") + "\n\nExtract this clip?")
+                        .setNegativeButton("Cancel", null)
+                        .setPositiveButton("Extract", (d, w) -> beginVoxExtract(position))
+                        .show();
                 return;
             }
             if (ps1Info != null) {
@@ -346,6 +363,7 @@ public class MainActivity extends Activity {
             retroInfo = null;
             pakInfo = null;
             ps1Info = null;
+            voxInfo = null;
             retroMode = null;
             ndsNodes.clear();
             expandedNds.clear();
@@ -368,6 +386,23 @@ public class MainActivity extends Activity {
                                 summary.setText(parsedDisc.description());
                                 detail.setText("Extract all, or tap a file to extract just that one. TIM images are saved as PNG " +
                                         "and VAG sounds as WAV; TIMs packed inside other files are found too.");
+                                render();
+                            });
+                        } else if (MgsVox.isVox(channel)) {
+                            MgsVox.Info parsedVox = MgsVox.parse(channel);
+                            List<String> labels = new ArrayList<>();
+                            for (MgsVox.Entry e : parsedVox.entries) {
+                                String first = MgsVox.firstLine(channel, e);
+                                labels.add("🎙 " + e.name() + " · " + duration(e.seconds()) + (e.channels == 2 ? " · stereo" : "") +
+                                        (first.isEmpty() ? "" : " · " + (first.length() > 40 ? first.substring(0, 40) + "…" : first)));
+                            }
+                            runOnUiThread(() -> {
+                                voxInfo = parsedVox; voxLabels.clear(); voxLabels.addAll(labels);
+                                archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null;
+                                busy = false;
+                                summary.setText(parsedVox.description());
+                                detail.setText("Extract all, or tap a clip to extract just that one. Each clip is saved as a WAV " +
+                                        "with its subtitles as an .srt file; script.txt lists every line.");
                                 render();
                             });
                         } else if (NesCodec.isNes(channel)) {
@@ -440,7 +475,7 @@ public class MainActivity extends Activity {
                     }
                 } catch (Exception e) {
                     runOnUiThread(() -> {
-                        busy = false; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null;
+                        busy = false; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null; voxInfo = null;
                         summary.setText("Could not open game file");
                         detail.setText(message(e));
                         render();
@@ -485,6 +520,8 @@ public class MainActivity extends Activity {
             startActivityForResult(save, SAVE_NDS);
         } else if (request == SAVE_NDS && ndsImportNode != null && ndsPngUri != null) {
             rebuildNds(uri);
+        } else if (request == PICK_VOX_FOLDER && voxInfo != null) {
+            extractVox(uri);
         } else if (request == PICK_PS1_FOLDER && ps1Info != null) {
             extractPs1(uri);
         } else if (request == PICK_PAK_FOLDER && pakInfo != null) {
@@ -557,6 +594,7 @@ public class MainActivity extends Activity {
                                 retroInfo.lzBlocks.get(i).offset,retroInfo.lzBlocks.get(i).size/retroMode.tileBytes) :
                         String.format(Locale.ROOT,"📄 %s page %04d",retroMode.slug,i));
         }
+        if (voxInfo != null) displayed.addAll(voxLabels);
         if (ps1Info != null) {
             for (Ps1Disc.FileEntry f : ps1Info.files)
                 displayed.add("💿 " + f.path + " · " + human(f.exportSize()) + (f.form2 ? " · raw XA/STR sectors" : ""));
@@ -590,6 +628,7 @@ public class MainActivity extends Activity {
                         " (" + displayed.size() + " sheets)" :
                 "/" + activePath + "   (" + displayed.size() + " items)");
         if (pakInfo != null) location.setText("/PAK   (" + displayed.size() + " bundles)");
+        if (voxInfo != null) location.setText("/VOX   (" + displayed.size() + " clips)");
         if (ps1Info != null) location.setText("/" + ps1Info.title() + "   (" + displayed.size() + " files, " + human(ps1Info.totalBytes) + ")");
         open.setEnabled(!busy);
         pngToBtex.setEnabled(!busy);
@@ -605,7 +644,7 @@ public class MainActivity extends Activity {
         pngToRetro.setVisibility(retroInfo!=null?View.VISIBLE:View.GONE);
         if(retroMode!=null)retroFormat.setText("Format: "+retroMode.slug);
         extractAll.setText((nesInfo != null || retroInfo != null) ? "Export all tile PNGs" : "Extract all");
-        extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null || pakInfo != null || ps1Info != null));
+        extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null || pakInfo != null || ps1Info != null || voxInfo != null));
         extractHere.setEnabled(!busy && (archive != null && !entriesIn(activePath).isEmpty() ||
                 ndsInfo != null && !ndsEntriesIn(activePath).isEmpty()));
         up.setEnabled(!busy && (archive != null || ndsInfo!=null) && !activePath.isEmpty());
@@ -1522,6 +1561,84 @@ public class MainActivity extends Activity {
         });
     }
 
+    private static String duration(double seconds) {
+        long s = Math.round(seconds);
+        return s / 60 + ":" + String.format(Locale.ROOT, "%02d", s % 60);
+    }
+
+    private void beginVoxExtract(int onlyClip) {
+        if (busy || voxInfo == null) return;
+        voxOnly = onlyClip;
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        startActivityForResult(intent, PICK_VOX_FOLDER);
+    }
+
+    /** Metal Gear Solid VOX: one WAV per clip, an .srt per clip with subtitles, and script.txt with every line. */
+    private void extractVox(Uri tree) {
+        if (busy || voxInfo == null || imageUri == null) return;
+        final MgsVox.Info info = voxInfo;
+        final int only = voxOnly;
+        busy = true; cancelled.set(false); render();
+        summary.setText("Converting voice clips...");
+        worker.execute(() -> {
+            final int[] stats = new int[3]; // clips, subtitle files, failed
+            try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                if (descriptor == null) throw new IOException("Could not reopen the VOX file");
+                try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
+                     FileChannel channel = stream.getChannel()) {
+                    String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+                    Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+                    String base = getFilename(imageUri);
+                    base = base.contains(".") ? base.substring(0, base.lastIndexOf('.')) : base;
+                    Uri folder = DocumentsContract.createDocument(getContentResolver(), parent, DIR_MIME,
+                            "MGS_" + TorusPak.safeName(base).replace(' ', '_') + "_" + stamp);
+                    if (folder == null) throw new IOException("Cannot create output folder");
+                    StringBuilder script = new StringBuilder();
+                    int total = only >= 0 ? 1 : info.entries.size(), done = 0;
+                    for (MgsVox.Entry e : info.entries) {
+                        if (only >= 0 && e.index != only) continue;
+                        if (cancelled.get()) break;
+                        final int position = ++done;
+                        runOnUiThread(() -> summary.setText("Converting clip " + position + "/" + total + "..."));
+                        try {
+                            MgsVox.Clip clip = MgsVox.convert(channel, e);
+                            writeDoc(folder, e.name() + ".wav", "audio/wav", clip.wav);
+                            stats[0]++;
+                            if (!clip.subtitles.isEmpty()) {
+                                writeDoc(folder, e.name() + ".srt", "application/x-subrip",
+                                        MgsVox.srt(clip.subtitles).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                                stats[1]++;
+                                script.append("== ").append(e.name()).append(" (").append(duration(e.seconds())).append(")\n");
+                                for (MgsVox.Subtitle sub : clip.subtitles) script.append(sub.text.replace('\n', ' ')).append('\n');
+                                script.append('\n');
+                            }
+                        } catch (IOException | OutOfMemoryError broken) {
+                            stats[2]++;
+                        }
+                    }
+                    if (script.length() > 0)
+                        writeDoc(folder, "script.txt", "text/plain", script.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                }
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    String result = stats[0] + " clip(s) saved as WAV (22050 Hz), " + stats[1] + " with subtitles (.srt)." +
+                            (stats[2] > 0 ? " " + stats[2] + " clip(s) could not be converted." : "");
+                    summary.setText("Voice extraction " + (cancelled.get() ? "cancelled" : "complete"));
+                    detail.setText(result);
+                    new AlertDialog.Builder(this).setTitle(cancelled.get() ? "Voice extraction cancelled" : "Voice extraction complete")
+                            .setMessage(result + "\n\nThe VOX file is unchanged.").setPositiveButton("OK", null).show();
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Voice extraction failed"); detail.setText(message(e));
+                    new AlertDialog.Builder(this).setTitle("Voice extraction failed")
+                            .setMessage(message(e)).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
     private void beginPs1Extract(int onlyFile) {
         if (busy || ps1Info == null) return;
         ps1Only = onlyFile;
@@ -1590,10 +1707,15 @@ public class MainActivity extends Activity {
                     String result = stats[0] + " file(s), " + human(stats[1]) + ". " + stats[2] + " image(s) saved as PNG, " +
                             stats[3] + " sound(s) as WAV." + (stats[4] > 0 ? "\n\n" + stats[4] + " XA audio / STR video file(s) " +
                             "were saved as raw 2352-byte sectors; open them with a tool such as jPSXdec." : "");
+                    boolean hasVox = false;
+                    for (Ps1Disc.FileEntry f : info.files)
+                        if (f.path.toUpperCase(Locale.ROOT).matches("(.*/)?VOX(_\\d+)?\\.DAT")) hasVox = true;
+                    final String voxHint = hasVox ? "\n\nThis disc has Metal Gear Solid voice files (VOX.DAT). Open the extracted " +
+                            "VOX.DAT here to convert its clips to WAV with subtitles." : "";
                     summary.setText("Disc extraction " + (cancelled.get() ? "cancelled" : "complete"));
                     detail.setText(result);
                     new AlertDialog.Builder(this).setTitle(cancelled.get() ? "Disc extraction cancelled" : "Disc extraction complete")
-                            .setMessage(result + "\n\nThe disc image is unchanged.").setPositiveButton("OK", null).show();
+                            .setMessage(result + voxHint + "\n\nThe disc image is unchanged.").setPositiveButton("OK", null).show();
                 });
             } catch (Exception | OutOfMemoryError e) {
                 final String why = e instanceof Exception ? message((Exception) e) : "Not enough memory";
