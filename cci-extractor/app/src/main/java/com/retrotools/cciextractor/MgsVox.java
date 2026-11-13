@@ -9,12 +9,13 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Metal Gear Solid (PS1) voice archives: VOX.DAT. Worked out from a retail VOX file.
+ * Metal Gear Solid (PS1) voice and cutscene archives: VOX.DAT and DEMO.DAT. Worked out from retail files.
  *
  * <pre>
  * The file is a run of entries, each starting on a 2048-byte boundary. An entry is a stream of chunks:
  *   u8 type, u24 length (including this 4-byte header), payload.
- *   0x10  8 bytes, u32 parameter
+ *   0x10  8 bytes, u32 parameter (an entry starts with one: 1 in VOX.DAT, 5 in DEMO.DAT)
+ *   0x05  DEMO.DAT only: cutscene animation, one numbered chunk per frame (skipped)
  *   0x02  20 bytes: u32 id, u32, u8 channels (1 or 2) …
  *   0x04  8 bytes
  *   0x03  subtitles: u32 0, u32 scene length, u16 lip-sync offset, u16 subtitle offset (both from the payload
@@ -29,7 +30,7 @@ import java.util.Locale;
 public final class MgsVox {
     public static final int SAMPLE_RATE = 22050;
     static final int SAMPLES_PER_TICK = 896;
-    private static final int MAX_ENTRY_AUDIO = 32 << 20;
+    private static final int MAX_ENTRY_BYTES = 96 << 20;
 
     private MgsVox() {}
 
@@ -47,16 +48,23 @@ public final class MgsVox {
         public int subtitleChunks;
         Entry(int index, long offset, long end) { this.index = index; this.offset = offset; this.end = end; }
         public double seconds() { return audioBytes / 16.0 * 28 / channels / SAMPLE_RATE; }
-        public String name() { return String.format(Locale.ROOT, "vox_%04d", index); }
+        /** DEMO.DAT entries carry cutscene animation (0x05 chunks). */
+        public boolean cutscene;
+        public String name() { return String.format(Locale.ROOT, cutscene ? "demo_%04d" : "vox_%04d", index); }
     }
 
     public static final class Info {
         public final List<Entry> entries = new ArrayList<>();
         public long audioBytes;
-        public int stereo, withSubtitles;
+        public int stereo, withSubtitles, cutscenes;
         public String description() {
-            return "Metal Gear Solid voice archive · " + entries.size() + " clips · " +
-                    String.format(Locale.ROOT, "%.1f", audioBytes / 16.0 * 28 / SAMPLE_RATE / 3600) + " h of audio";
+            return "Metal Gear Solid " + (cutscenes > 0 ? "cutscene audio (DEMO)" : "voice archive (VOX)") + " · " +
+                    entries.size() + " clips · " + String.format(Locale.ROOT, "%.1f", hours()) + " h of audio";
+        }
+        public double hours() {
+            double s = 0;
+            for (Entry e : entries) s += e.seconds();
+            return s / 3600;
         }
     }
 
@@ -69,12 +77,32 @@ public final class MgsVox {
 
     // ------------------------------------------------------------------ detection and index
 
-    /** The first entry starts with a 0x10 chunk of 8 bytes holding 1, followed by a 20-byte 0x02 header. */
+    /**
+     * The first entry starts with an 8-byte 0x10 chunk, uses only known chunk types, has a 20-byte 0x02 header and
+     * ends with 0xF0. Only chunk headers are read.
+     */
     public static boolean isVox(FileChannel ch) throws IOException {
-        if (ch.size() < 0x800) return false;
-        byte[] h = read(ch, 0, 12);
-        return h[0] == 0x10 && h[1] == 8 && h[2] == 0 && h[3] == 0 && h[4] == 1 && h[5] == 0 && h[6] == 0 && h[7] == 0
-                && h[8] == 2 && h[9] == 0x14 && h[10] == 0 && h[11] == 0;
+        long size = ch.size();
+        if (size < 0x800) return false;
+        byte[] h = read(ch, 0, 4);
+        if (h[0] != 0x10 || h[1] != 8 || h[2] != 0 || h[3] != 0) return false;
+        long p = 0;
+        boolean header = false;
+        for (int n = 0; n < 200000 && p + 4 <= size; n++) {
+            h = read(ch, p, 4);
+            int type = h[0] & 255;
+            long len = (h[1] & 255) | (h[2] & 255) << 8 | (long) (h[3] & 255) << 16;
+            if (len < 4 || p + len > size) return false;
+            switch (type) {
+                case 0x02: if (len != 20) return false; header = true; break;
+                case 0x10: if (len != 8) return false; break;
+                case 0x01: case 0x03: case 0x04: case 0x05: break;
+                case 0xF0: return header && len == 4;
+                default: return false;
+            }
+            p += len;
+        }
+        return false;
     }
 
     /** Walks every entry, reading only chunk headers. */
@@ -86,7 +114,7 @@ public final class MgsVox {
         ByteBuffer hb = ByteBuffer.wrap(head);
         while (p + 4 <= size) {
             byte[] start = read(ch, p, 4);
-            if (start[0] != 0x10 || start[1] != 8) {
+            if (start[0] != 0x10 || start[1] != 8 || start[2] != 0 || start[3] != 0) {
                 if (isZeroSector(ch, p)) { p += 0x800; continue; }
                 throw new IOException(String.format(Locale.ROOT, "Unexpected data at 0x%X (entry %d)", p, info.entries.size()));
             }
@@ -95,6 +123,7 @@ public final class MgsVox {
             boolean ended = false;
             int channels = 1, subChunks = 0;
             long audio = 0;
+            boolean scene = false;
             while (p + 4 <= size) {
                 hb.clear();
                 while (hb.hasRemaining()) if (ch.read(hb, p + hb.position()) < 0) throw new IOException("Unexpected end of file");
@@ -104,16 +133,18 @@ public final class MgsVox {
                 if (type == 0x02 && len >= 13) channels = Math.max(1, Math.min(2, read(ch, p + 12, 1)[0] & 255));
                 else if (type == 0x01) audio += len - 4;
                 else if (type == 0x03) subChunks++;
+                else if (type == 0x05) scene = true;
                 p += len;
                 if (type == 0xF0) { ended = true; break; }
             }
             if (!ended) throw new IOException(String.format(Locale.ROOT, "Entry at 0x%X has no end marker", entryStart));
             e = new Entry(info.entries.size(), entryStart, p);
-            e.channels = channels; e.audioBytes = audio; e.subtitleChunks = subChunks;
+            e.channels = channels; e.audioBytes = audio; e.subtitleChunks = subChunks; e.cutscene = scene;
             info.entries.add(e);
             info.audioBytes += audio;
             if (channels == 2) info.stereo++;
             if (subChunks > 0) info.withSubtitles++;
+            if (scene) info.cutscenes++;
             p = (p + 0x7FF) & ~0x7FFL;
         }
         return info;
@@ -128,7 +159,7 @@ public final class MgsVox {
     // ------------------------------------------------------------------ conversion
 
     public static Clip convert(FileChannel ch, Entry e) throws IOException {
-        if (e.audioBytes > MAX_ENTRY_AUDIO) throw new IOException("Clip is too large to convert");
+        if (e.end - e.offset > MAX_ENTRY_BYTES) throw new IOException("Clip is too large to convert");
         byte[] d = read(ch, e.offset, (int) (e.end - e.offset));
         return convert(d, e.channels);
     }

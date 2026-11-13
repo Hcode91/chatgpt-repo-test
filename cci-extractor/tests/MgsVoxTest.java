@@ -70,7 +70,30 @@ public class MgsVoxTest {
         for (int c = 0; c < 2; c++) f.chunk(0x01, new B().raw(constantFrames(2, 3)).raw(constantFrames(2, 14)).done());
         f.chunk(0xF0, new byte[0]).pad(0x800);
 
+        // DEMO.DAT-style file: entry opens with 0x10 = 5 and carries numbered 0x05 animation chunks
+        B demo = new B();
+        demo.chunk(0x10, new B().u32(5).done());
+        for (int i = 0; i < 3; i++) demo.chunk(0x05, new B().u32(i).u32(2).u32(1).raw(new byte[20]).done());
+        demo.chunk(0x10, new B().u32(1).done()).chunk(0x02, header(2));
+        demo.chunk(0x01, new B().raw(constantFrames(1, 3)).raw(constantFrames(1, 14)).done()).chunk(0x05, new byte[24]);
+        demo.chunk(0xF0, new byte[0]).pad(0x800);
+
         Path file = Files.createTempFile("vox", ".dat");
+        Files.write(file, demo.done());
+        try (FileChannel ch = FileChannel.open(file)) {
+            check(MgsVox.isVox(ch), "DEMO.DAT layout detected");
+            MgsVox.Info info = MgsVox.parse(ch);
+            check(info.entries.size() == 1 && info.cutscenes == 1 && info.entries.get(0).name().equals("demo_0000"), "cutscene entry");
+            MgsVox.Clip c = MgsVox.convert(ch, info.entries.get(0));
+            check(c.wav[22] == 2 && (c.wav.length - 44) / 4 == 28 && pcmAt(c.wav, 0, 0) == 48 && pcmAt(c.wav, 27, 1) == -32,
+                    "animation chunks skipped, stereo audio intact");
+        }
+        // An unknown chunk type in the first entry means it isn't this format
+        byte[] odd = demo.done();
+        odd[8] = 0x55;
+        Files.write(file, odd);
+        try (FileChannel ch = FileChannel.open(file)) { check(!MgsVox.isVox(ch), "unknown chunk type rejected"); }
+
         try {
             Files.write(file, f.done());
             try (FileChannel ch = FileChannel.open(file)) {
