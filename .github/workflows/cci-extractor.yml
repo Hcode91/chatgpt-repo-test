@@ -43,6 +43,8 @@ jobs:
         run: bash cci-extractor/tests/run-mgs-vox-test.sh
       - name: Test Ren'Py archives (RPA-1.0/2.0/3.0/3.2/4.0, ALT-1.0, pickle protocols 0-5) and Folder -> RPA
         run: bash cci-extractor/tests/run-renpy-archive-test.sh
+      - name: Test PS3 trophy packs (TROPHY.TRP read/write, SHA-1)
+        run: bash cci-extractor/tests/run-ps3-trophy-test.sh
       - name: Test native CIA engine on synthetic titles (CIA -> CCI, DLC refusal)
         run: bash cci-extractor/tests/run-native-engine-test.sh
       - name: Install Android SDK 35 components
@@ -67,6 +69,6 @@ jobs:
         run: gradle --no-daemon -p cci-extractor :app:assembleDebug
       - uses: actions/upload-artifact@v4
         with:
-          name: game-asset-extractor-v0.13-debug-apk
+          name: game-asset-extractor-v0.14-debug-apk
           path: cci-extractor/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
