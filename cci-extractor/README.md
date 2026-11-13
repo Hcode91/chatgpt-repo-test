@@ -1,4 +1,19 @@
-# Game Asset Extractor (Android v0.12.1)
+# Game Asset Extractor (Android v0.13.0)
+
+## New in v0.13: Ren'Py archives (.rpa), extract and repack
+
+**Extract:** open a `.rpa` with **Open ROM**. Every file in the archive is listed. **Extract all** saves them with their original paths into `RPA_<name>_<time>/`, or tap a file to save just that one. Large files (videos, music) are streamed, not loaded into memory.
+
+- **Versions:** RPA-3.0 (current Ren'Py), RPA-3.2 and RPA-4.0 (custom variants), ALT-1.0, RPA-2.0, and RPA-1.0. For RPA-1.0, open the `.rpi` index and the app asks for the matching `.rpa`.
+- Follows **Ren'Py's own loader**, not unrpa, where they differ. Ren'Py joins files stored in several pieces, and puts a piece's prefix before its data. unrpa reads only the first piece, and counts the prefix inside the length. Ren'Py's own archiver never writes either, so this only matters for archives made by other tools.
+- **ZiX-12A/B** archives aren't supported. Their key is hidden in the game's `loader.pyo`, which needs a Python decompiler (unrpa on a computer can do it, given `loader.pyo`).
+- The index is read with a built-in **data-only pickle reader**. It never runs code from the archive.
+
+**Repack:** **Convert → Folder → RPA** packs a folder back into an archive. Pick the extracted folder after editing; the suggested name is the original archive's name. The output matches Ren'Py's own archiver: an RPA-3.0 header, the same fixed key and padding, files in path order, and a protocol-2 pickle index. That index works with both Python 2 Ren'Py (6/7) and Python 3 Ren'Py (8).
+
+Tip: you often don't need to repack. Ren'Py loads loose files from the game's `game/` folder ahead of archives, so an edited file copied into `game/` at the same path overrides the archived one.
+
+**How it was checked:** `tests/fixtures/rpa` holds archives whose indexes were written by Python's own `pickle` module, in every supported version and pickle protocols 0, 2, 4 and 5, plus a hand-built Python 2-style index. The Java reader matches all 44 files. unrpa extracts the same fixtures identically, except RPA-1.0, where unrpa reads data from the `.rpi` instead of the `.rpa`, unlike Ren'Py. Archives built by **Folder → RPA** were read back byte-for-byte by unrpa and by Ren'Py's loader logic, including empty files, deep paths and non-ASCII names, and their index uses no pickle opcode newer than protocol 2. Not yet tried in a running Ren'Py game.
 
 ## v0.12.1: Metal Gear Solid cutscene audio (DEMO.DAT) too
 

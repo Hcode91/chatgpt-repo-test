@@ -67,6 +67,8 @@ public class MainActivity extends Activity {
     private static final int PICK_PAK_FOLDER = 318;
     private static final int PICK_PS1_FOLDER = 319;
     private static final int PICK_VOX_FOLDER = 320;
+    private static final int PICK_RPA_FOLDER = 321;
+    private static final int PICK_RPA_DATA = 322;
     private static final String DIR_MIME = DocumentsContract.Document.MIME_TYPE_DIR;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -79,6 +81,11 @@ public class MainActivity extends Activity {
     private TorusPak.Info pakInfo;
     private Ps1Disc.Info ps1Info;
     private MgsVox.Info voxInfo;
+    private RenpyArchive.Info rpaInfo;
+    /** For RPA-1.0: the archive data file (the opened file is its .rpi index); otherwise the opened file. */
+    private Uri rpaDataUri;
+    private Uri pendingRpiUri;
+    private int rpaOnly = -1;
     private final List<String> voxLabels = new ArrayList<>();
     /** Index of the single clip to extract, or -1 for all. */
     private int voxOnly = -1;
@@ -177,7 +184,7 @@ public class MainActivity extends Activity {
         controls.setOrientation(LinearLayout.HORIZONTAL);
         controls.setPadding(dp(6), 0, dp(6), 0);
         root.addView(controls);
-        open = button("Open ROM (3DS / DS / PS1 / NES / SNES / MD / GB / GBA) or PAK");
+        open = button("Open ROM (3DS / DS / PS1 / NES / SNES / MD / GB / GBA), PAK or RPA");
         extractAll = button("Extract all");
         controls.addView(open, new LinearLayout.LayoutParams(0, dp(54), 1));
         controls.addView(extractAll, new LinearLayout.LayoutParams(0, dp(54), 1));
@@ -228,7 +235,8 @@ public class MainActivity extends Activity {
         paletteButton.setOnClickListener(v -> choosePalette());
         upscaleHd.setOnClickListener(v -> chooseHdUpscale());
         extractAll.setOnClickListener(v -> {
-            if (voxInfo != null) beginVoxExtract(-1);
+            if (rpaInfo != null) beginRpaExtract(-1);
+            else if (voxInfo != null) beginVoxExtract(-1);
             else if (ps1Info != null) beginPs1Extract(-1);
             else if (pakInfo != null) beginPakExtract(-1);
             else if (retroInfo != null) beginRetroExport(-1);
@@ -252,6 +260,16 @@ public class MainActivity extends Activity {
             if (busy || position < 0 || position >= displayed.size()) return;
             if (retroInfo != null || nesInfo != null) {
                 showTilePreview(position);
+                return;
+            }
+            if (rpaInfo != null) {
+                if (position >= rpaInfo.files.size()) return;
+                RenpyArchive.FileEntry file = rpaInfo.files.get(position);
+                new AlertDialog.Builder(this).setTitle(file.path)
+                        .setMessage("Size: " + human(file.size()) + "\n\nExtract this file?")
+                        .setNegativeButton("Cancel", null)
+                        .setPositiveButton("Extract", (d, w) -> beginRpaExtract(position))
+                        .show();
                 return;
             }
             if (voxInfo != null) {
@@ -364,6 +382,7 @@ public class MainActivity extends Activity {
             pakInfo = null;
             ps1Info = null;
             voxInfo = null;
+            rpaInfo = null;
             retroMode = null;
             ndsNodes.clear();
             expandedNds.clear();
@@ -388,6 +407,9 @@ public class MainActivity extends Activity {
                                         "and VAG sounds as WAV; TIMs packed inside other files are found too.");
                                 render();
                             });
+                        } else if (RenpyArchive.isArchive(channel)) {
+                            RenpyArchive.Info parsedRpa = RenpyArchive.parse(channel);
+                            runOnUiThread(() -> showRpa(parsedRpa, uri));
                         } else if (MgsVox.isVox(channel)) {
                             MgsVox.Info parsedVox = MgsVox.parse(channel);
                             List<String> labels = new ArrayList<>();
@@ -452,6 +474,20 @@ public class MainActivity extends Activity {
                                         "as PNG; models, animations, sounds and other assets are saved as raw data.");
                                 render();
                             });
+                        } else if (RenpyArchive.isRpi(channel)) {
+                            runOnUiThread(() -> {
+                                busy = false; pendingRpiUri = uri; render();
+                                new AlertDialog.Builder(this).setTitle("Ren'Py archive index (RPA-1.0)")
+                                        .setMessage("This .rpi file is the index of an old-style Ren'Py archive. The files themselves " +
+                                                "are in the .rpa with the same name. Pick that .rpa next.")
+                                        .setNegativeButton("Cancel", null)
+                                        .setPositiveButton("Pick the .rpa", (d, w) -> {
+                                            Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                                            pick.addCategory(Intent.CATEGORY_OPENABLE);
+                                            pick.setType("*/*");
+                                            startActivityForResult(pick, PICK_RPA_DATA);
+                                        }).show();
+                            });
                         } else if (CiaConverter.isCia(channel)) {
                             throw new IOException("This is a CIA, which can't be browsed directly. Go to the Convert tab, " +
                                     "use CIA → CCI (.3ds), then open the .3ds it saves here.");
@@ -475,7 +511,7 @@ public class MainActivity extends Activity {
                     }
                 } catch (Exception e) {
                     runOnUiThread(() -> {
-                        busy = false; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null; voxInfo = null;
+                        busy = false; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null; voxInfo = null; rpaInfo = null;
                         summary.setText("Could not open game file");
                         detail.setText(message(e));
                         render();
@@ -520,6 +556,10 @@ public class MainActivity extends Activity {
             startActivityForResult(save, SAVE_NDS);
         } else if (request == SAVE_NDS && ndsImportNode != null && ndsPngUri != null) {
             rebuildNds(uri);
+        } else if (request == PICK_RPA_DATA && pendingRpiUri != null) {
+            openRpi(pendingRpiUri, uri);
+        } else if (request == PICK_RPA_FOLDER && rpaInfo != null) {
+            extractRpa(uri);
         } else if (request == PICK_VOX_FOLDER && voxInfo != null) {
             extractVox(uri);
         } else if (request == PICK_PS1_FOLDER && ps1Info != null) {
@@ -595,6 +635,7 @@ public class MainActivity extends Activity {
                         String.format(Locale.ROOT,"📄 %s page %04d",retroMode.slug,i));
         }
         if (voxInfo != null) displayed.addAll(voxLabels);
+        if (rpaInfo != null) for (RenpyArchive.FileEntry f : rpaInfo.files) displayed.add("📄 " + f.path + " · " + human(f.size()));
         if (ps1Info != null) {
             for (Ps1Disc.FileEntry f : ps1Info.files)
                 displayed.add("💿 " + f.path + " · " + human(f.exportSize()) + (f.form2 ? " · raw XA/STR sectors" : ""));
@@ -629,6 +670,7 @@ public class MainActivity extends Activity {
                 "/" + activePath + "   (" + displayed.size() + " items)");
         if (pakInfo != null) location.setText("/PAK   (" + displayed.size() + " bundles)");
         if (voxInfo != null) location.setText("/VOX   (" + displayed.size() + " clips)");
+        if (rpaInfo != null) location.setText("/RPA   (" + displayed.size() + " files, " + human(rpaInfo.totalBytes) + ")");
         if (ps1Info != null) location.setText("/" + ps1Info.title() + "   (" + displayed.size() + " files, " + human(ps1Info.totalBytes) + ")");
         open.setEnabled(!busy);
         pngToBtex.setEnabled(!busy);
@@ -644,7 +686,7 @@ public class MainActivity extends Activity {
         pngToRetro.setVisibility(retroInfo!=null?View.VISIBLE:View.GONE);
         if(retroMode!=null)retroFormat.setText("Format: "+retroMode.slug);
         extractAll.setText((nesInfo != null || retroInfo != null) ? "Export all tile PNGs" : "Extract all");
-        extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null || pakInfo != null || ps1Info != null || voxInfo != null));
+        extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null || pakInfo != null || ps1Info != null || voxInfo != null || rpaInfo != null));
         extractHere.setEnabled(!busy && (archive != null && !entriesIn(activePath).isEmpty() ||
                 ndsInfo != null && !ndsEntriesIn(activePath).isEmpty()));
         up.setEnabled(!busy && (archive != null || ndsInfo!=null) && !activePath.isEmpty());
@@ -1556,6 +1598,111 @@ public class MainActivity extends Activity {
                     detail.setText(message(e));
                     new AlertDialog.Builder(this).setTitle("Rebuild failed").setMessage(message(e))
                         .setPositiveButton("OK",null).show();
+                });
+            }
+        });
+    }
+
+    private void showRpa(RenpyArchive.Info info, Uri dataUri) {
+        rpaInfo = info; rpaDataUri = dataUri;
+        archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null; voxInfo = null;
+        busy = false;
+        summary.setText(info.description() + " · " + human(info.totalBytes));
+        detail.setText("Extract all, or tap a file to extract just that one. To put edited files back, use Convert → " +
+                "Folder → RPA on the extracted folder.");
+        render();
+    }
+
+    /** RPA-1.0: index from the .rpi the user opened, data from the .rpa they picked. */
+    private void openRpi(Uri rpiUri, Uri dataUri) {
+        busy = true; render();
+        worker.execute(() -> {
+            try (ParcelFileDescriptor rpiFd = getContentResolver().openFileDescriptor(rpiUri, "r");
+                 ParcelFileDescriptor dataFd = getContentResolver().openFileDescriptor(dataUri, "r")) {
+                if (rpiFd == null || dataFd == null) throw new IOException("Could not open the archive files");
+                RenpyArchive.Info info;
+                try (FileInputStream rs = new FileInputStream(rpiFd.getFileDescriptor()); FileChannel rpi = rs.getChannel()) {
+                    info = RenpyArchive.parseRpi(rpi, dataFd.getStatSize());
+                }
+                runOnUiThread(() -> { imageUri = dataUri; pendingRpiUri = null; showRpa(info, dataUri); });
+            } catch (Exception e) {
+                runOnUiThread(() -> { busy = false; render(); summary.setText("Could not open the archive"); detail.setText(message(e)); });
+            }
+        });
+    }
+
+    private void beginRpaExtract(int onlyFile) {
+        if (busy || rpaInfo == null) return;
+        rpaOnly = onlyFile;
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        startActivityForResult(intent, PICK_RPA_FOLDER);
+    }
+
+    /** Ren'Py archive: the files with their original paths, streamed. */
+    private void extractRpa(Uri tree) {
+        if (busy || rpaInfo == null || rpaDataUri == null) return;
+        final RenpyArchive.Info info = rpaInfo;
+        final Uri dataUri = rpaDataUri;
+        final int only = rpaOnly;
+        busy = true; cancelled.set(false); render();
+        summary.setText("Extracting archive files...");
+        worker.execute(() -> {
+            final long[] stats = new long[2]; // files, bytes
+            try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(dataUri, "r")) {
+                if (descriptor == null) throw new IOException("Could not reopen the archive");
+                try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
+                     FileChannel channel = stream.getChannel()) {
+                    String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+                    Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+                    String base = getFilename(dataUri);
+                    base = base.contains(".") ? base.substring(0, base.lastIndexOf('.')) : base;
+                    Uri folder = DocumentsContract.createDocument(getContentResolver(), parent, DIR_MIME,
+                            "RPA_" + TorusPak.safeName(base).replace(' ', '_') + "_" + stamp);
+                    if (folder == null) throw new IOException("Cannot create output folder");
+                    Map<String, Uri> folders = new HashMap<>();
+                    folders.put("", folder);
+                    int total = only >= 0 ? 1 : info.files.size(), done = 0;
+                    for (int index = 0; index < info.files.size(); index++) {
+                        if (only >= 0 && index != only) continue;
+                        if (cancelled.get()) break;
+                        RenpyArchive.FileEntry file = info.files.get(index);
+                        final int position = ++done;
+                        final long bytesSoFar = stats[1];
+                        runOnUiThread(() -> {
+                            summary.setText("Extracting " + position + "/" + total + "...");
+                            detail.setText(file.path + "\n" + human(bytesSoFar) + " written");
+                        });
+                        int slash = file.path.lastIndexOf('/');
+                        Uri dir = ensureFolder(slash < 0 ? "" : file.path.substring(0, slash), folders);
+                        String name = slash < 0 ? file.path : file.path.substring(slash + 1);
+                        Uri out = DocumentsContract.createDocument(getContentResolver(), dir, "application/octet-stream", name);
+                        if (out == null) throw new IOException("Cannot create " + name);
+                        try (OutputStream os = getContentResolver().openOutputStream(out, "w")) {
+                            if (os == null) throw new IOException("Cannot write " + name);
+                            java.io.BufferedOutputStream buffered = new java.io.BufferedOutputStream(os, 1 << 20);
+                            RenpyArchive.copy(channel, file, buffered);
+                            buffered.flush();
+                        }
+                        stats[0]++; stats[1] += file.size();
+                    }
+                }
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    String result = stats[0] + " file(s), " + human(stats[1]) + ".";
+                    summary.setText("Archive extraction " + (cancelled.get() ? "cancelled" : "complete"));
+                    detail.setText(result);
+                    new AlertDialog.Builder(this).setTitle(cancelled.get() ? "Archive extraction cancelled" : "Archive extraction complete")
+                            .setMessage(result + "\n\nTo rebuild the archive after editing, use Convert → Folder → RPA and pick the " +
+                                    "extracted folder. Tip: Ren'Py also loads loose files from the game folder, and they take " +
+                                    "priority over archives, so an edited file can simply be copied into game/ at the same path.")
+                            .setPositiveButton("OK", null).show();
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Archive extraction failed"); detail.setText(message(e));
+                    new AlertDialog.Builder(this).setTitle("Archive extraction failed")
+                            .setMessage(message(e)).setPositiveButton("OK", null).show();
                 });
             }
         });
