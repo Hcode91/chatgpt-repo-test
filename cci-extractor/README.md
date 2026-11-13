@@ -1,4 +1,20 @@
-# Game Asset Extractor (Android v0.13.0)
+# Game Asset Extractor (Android v0.14.0)
+
+## New in v0.14: PS3 trophy packs (TROPHY.TRP), extract and rebuild
+
+**Extract:** open a `TROPHY.TRP` (found in `PS3_GAME/TROPDIR/<NPWR id>/`) with **Open ROM**. The summary shows the game, its trophy-set ID and the trophy count. Files are saved to `TRP_<id>_v<version>_<time>/`:
+- `TROPCONF.SFM`: the trophy list (ID, grade, hidden, platinum link).
+- `TROP.SFM` / `TROP_xx.SFM`: names and descriptions, per language.
+- `ICON0.PNG`: the game's trophy icon.
+- `TROPnnn.PNG`: one icon per trophy.
+
+The `.SFM` files are plain XML.
+
+**Rebuild:** **Convert → Folder → TROPHY.TRP** packs the folder back into a pack laid out exactly like Sony's: same file order, flags, 16-byte alignment and padding. Version 2+ packs get the SHA-1 checksum RPCS3 verifies. The version comes from the extracted folder's name.
+
+**Where edited packs work:** RPCS3 does not check the trophy files' signature comment, and reinstalls `TROPHY.TRP` from the game folder every time the game starts, so edits show up there. A real PS3 checks the signatures and rejects edited files.
+
+**How it was checked:** a retail `TROPHY.TRP` (version 1, 17 files) was extracted and rebuilt byte-for-byte identical, even with the files supplied in shuffled order. A version 3 rebuild passes RPCS3's checksum rule, verified independently with Python's `hashlib`. The format and the emulator behaviour were taken from RPCS3's own source (`Loader/TRP.cpp`, `Loader/TROPUSR.cpp`, `Modules/sceNpTrophy.cpp`). CI runs `tests/Ps3TrophyTest.java` on a synthetic pack.
 
 ## New in v0.13: Ren'Py archives (.rpa), extract and repack
 

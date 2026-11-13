@@ -38,7 +38,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /** The "Convert" tab: 3DS container conversion and batch texture conversion. */
 final class ConvertTab {
     static final int PICK_CIA = 401, SAVE_CCI = 402, PICK_CCI = 403, SAVE_CIA = 404, PICK_CERT_CIA = 405,
-            PICK_TEXTURES = 406, PICK_TEXTURE_DIR = 407, PICK_CERT_FILE = 408, PICK_RPA_SOURCE = 409, SAVE_RPA = 410;
+            PICK_TEXTURES = 406, PICK_TEXTURE_DIR = 407, PICK_CERT_FILE = 408, PICK_RPA_SOURCE = 409, SAVE_RPA = 410,
+            PICK_TRP_SOURCE = 411, SAVE_TRP = 412;
 
     private static final String[] OUTPUTS = {"PNG", "DDS · RGBA8 (uncompressed)", "DDS · BC1 / DXT1", "DDS · BC3 / DXT5",
             "KTX · RGBA8", "KTX · ETC1", "DS NCGR + NCLR · 4bpp (16 colours)", "DS NCGR + NCLR · 8bpp (256 colours)"};
@@ -53,7 +54,7 @@ final class ConvertTab {
     private int textureOutput, textureResize;
     private boolean busy;
     private TextView status, certStatus, log;
-    private Button ciaToCci, cciToCia, saveCert, textures, folderToRpa, cancel;
+    private Button ciaToCci, cciToCia, saveCert, textures, folderToRpa, folderToTrp, cancel;
     final View view;
 
     ConvertTab(Activity activity) {
@@ -102,6 +103,12 @@ final class ConvertTab {
         folderToRpa = button("Folder → RPA");
         box.addView(folderToRpa, new LinearLayout.LayoutParams(-1, dp(52)));
 
+        box.addView(text("PS3 trophies", 17, Color.rgb(35, 45, 91)));
+        box.addView(text("Rebuild a TROPHY.TRP from a folder of its files (TROPCONF.SFM, TROP.SFM, ICON0.PNG, TROPnnn.PNG …) " +
+                "after editing. Works in RPCS3; a real PS3 rejects edited trophy files.", 12, Color.DKGRAY));
+        folderToTrp = button("Folder → TROPHY.TRP");
+        box.addView(folderToTrp, new LinearLayout.LayoutParams(-1, dp(52)));
+
         cancel = button("Cancel");
         box.addView(cancel, new LinearLayout.LayoutParams(-1, dp(46)));
         status = text("Ready.", 14, Color.rgb(36, 49, 105));
@@ -126,6 +133,12 @@ final class ConvertTab {
         });
         saveCert.setOnClickListener(v -> pick(PICK_CERT_CIA, "*/*", false));
         textures.setOnClickListener(v -> pick(PICK_TEXTURES, "*/*", true));
+        folderToTrp.setOnClickListener(v -> {
+            if (busy) return;
+            Intent tree = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+            tree.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            activity.startActivityForResult(tree, PICK_TRP_SOURCE);
+        });
         folderToRpa.setOnClickListener(v -> {
             if (busy) return;
             Intent tree = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
@@ -141,7 +154,7 @@ final class ConvertTab {
 
     private void refresh() {
         ciaToCci.setEnabled(!busy); cciToCia.setEnabled(!busy); saveCert.setEnabled(!busy); textures.setEnabled(!busy);
-        folderToRpa.setEnabled(!busy);
+        folderToRpa.setEnabled(!busy); folderToTrp.setEnabled(!busy);
         cancel.setEnabled(busy);
         certStatus.setText(loadCertChain() != null ? "Certificate chain: saved ✓ (CCI → CIA is ready)"
                 : "Certificate chain: not saved yet (needed for CCI → CIA)");
@@ -177,7 +190,7 @@ final class ConvertTab {
     private static String message(Exception e) { return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(); }
 
     // ---------------------------------------------------------------- results
-    boolean handles(int request) { return request >= 401 && request <= 410; }
+    boolean handles(int request) { return request >= 401 && request <= 412; }
 
     void onResult(int request, Intent data) {
         if (request == PICK_TEXTURES) {
@@ -211,6 +224,8 @@ final class ConvertTab {
             case PICK_TEXTURE_DIR: runTextures(uri); break;
             case PICK_RPA_SOURCE: sourceUri = uri; save(SAVE_RPA, rpaName(uri)); break;
             case SAVE_RPA: runFolderToRpa(sourceUri, uri); break;
+            case PICK_TRP_SOURCE: sourceUri = uri; save(SAVE_TRP, "TROPHY.TRP"); break;
+            case SAVE_TRP: runFolderToTrp(sourceUri, uri); break;
         }
     }
 
@@ -300,6 +315,49 @@ final class ConvertTab {
             } catch (Exception e) {
                 try { DocumentsContract.deleteDocument(activity.getContentResolver(), dest); } catch (Exception ignored) { }
                 activity.runOnUiThread(() -> { busy = false; refresh(); error("Folder → RPA failed", e); });
+            }
+        });
+    }
+
+    // ---------------------------------------------------------------- PS3 trophy packing
+
+    /** Folder → TROPHY.TRP: the files at the top of the folder. Version from a "TRP_..._v3_..." folder name, else 1. */
+    private void runFolderToTrp(Uri tree, Uri dest) {
+        busy = true; cancelled.set(false); refresh();
+        status.setText("Building trophy pack…"); log.setText("");
+        worker.execute(() -> {
+            try {
+                List<Ps3Trophy.Source> files = new ArrayList<>();
+                boolean hasConf = false;
+                for (RenpyArchive.Source f : listTree(tree)) {
+                    if (f.path().contains("/") || f.path().startsWith(".")) continue;
+                    if (f.path().equalsIgnoreCase("TROPCONF.SFM")) hasConf = true;
+                    files.add(new Ps3Trophy.Source() {
+                        public String name() { return f.path(); }
+                        public long size() { return f.size(); }
+                        public InputStream open() throws IOException { return f.open(); }
+                    });
+                }
+                if (!hasConf) throw new IOException("The folder has no TROPCONF.SFM, so it isn't an extracted trophy pack");
+                String id = DocumentsContract.getTreeDocumentId(tree);
+                java.util.regex.Matcher m = java.util.regex.Pattern.compile("_v(\\d)_\\d{8}_\\d{6}$").matcher(id);
+                int version = m.find() ? Integer.parseInt(m.group(1)) : 1;
+                byte[] pack = Ps3Trophy.build(files, version);
+                try (OutputStream out = activity.getContentResolver().openOutputStream(dest, "w")) {
+                    if (out == null) throw new IOException("Cannot write the trophy pack");
+                    out.write(pack);
+                }
+                final int count = files.size(), v = version;
+                activity.runOnUiThread(() -> {
+                    busy = false; refresh();
+                    status.setText("Folder → TROPHY.TRP done");
+                    log.setText(count + " files · version " + v + (v >= 2 ? " (checksum written)" : "") + " · " + (pack.length >> 10) + " KB\n" +
+                            "Replace PS3_GAME/TROPDIR/<id>/TROPHY.TRP in the game folder (keep a backup). RPCS3 reinstalls it the " +
+                            "next time the game starts.");
+                });
+            } catch (Exception e) {
+                try { DocumentsContract.deleteDocument(activity.getContentResolver(), dest); } catch (Exception ignored) { }
+                activity.runOnUiThread(() -> { busy = false; refresh(); error("Folder → TROPHY.TRP failed", e); });
             }
         });
     }

@@ -69,6 +69,7 @@ public class MainActivity extends Activity {
     private static final int PICK_VOX_FOLDER = 320;
     private static final int PICK_RPA_FOLDER = 321;
     private static final int PICK_RPA_DATA = 322;
+    private static final int PICK_TRP_FOLDER = 323;
     private static final String DIR_MIME = DocumentsContract.Document.MIME_TYPE_DIR;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -82,6 +83,8 @@ public class MainActivity extends Activity {
     private Ps1Disc.Info ps1Info;
     private MgsVox.Info voxInfo;
     private RenpyArchive.Info rpaInfo;
+    private Ps3Trophy.Info trpInfo;
+    private int trpOnly = -1;
     /** For RPA-1.0: the archive data file (the opened file is its .rpi index); otherwise the opened file. */
     private Uri rpaDataUri;
     private Uri pendingRpiUri;
@@ -184,7 +187,7 @@ public class MainActivity extends Activity {
         controls.setOrientation(LinearLayout.HORIZONTAL);
         controls.setPadding(dp(6), 0, dp(6), 0);
         root.addView(controls);
-        open = button("Open ROM (3DS / DS / PS1 / NES / SNES / MD / GB / GBA), PAK or RPA");
+        open = button("Open ROM (3DS / DS / PS1 / NES / SNES / MD / GB / GBA), PAK, RPA or TRP");
         extractAll = button("Extract all");
         controls.addView(open, new LinearLayout.LayoutParams(0, dp(54), 1));
         controls.addView(extractAll, new LinearLayout.LayoutParams(0, dp(54), 1));
@@ -235,7 +238,8 @@ public class MainActivity extends Activity {
         paletteButton.setOnClickListener(v -> choosePalette());
         upscaleHd.setOnClickListener(v -> chooseHdUpscale());
         extractAll.setOnClickListener(v -> {
-            if (rpaInfo != null) beginRpaExtract(-1);
+            if (trpInfo != null) beginTrpExtract(-1);
+            else if (rpaInfo != null) beginRpaExtract(-1);
             else if (voxInfo != null) beginVoxExtract(-1);
             else if (ps1Info != null) beginPs1Extract(-1);
             else if (pakInfo != null) beginPakExtract(-1);
@@ -260,6 +264,16 @@ public class MainActivity extends Activity {
             if (busy || position < 0 || position >= displayed.size()) return;
             if (retroInfo != null || nesInfo != null) {
                 showTilePreview(position);
+                return;
+            }
+            if (trpInfo != null) {
+                if (position >= trpInfo.files.size()) return;
+                Ps3Trophy.FileEntry file = trpInfo.files.get(position);
+                new AlertDialog.Builder(this).setTitle(file.name)
+                        .setMessage("Size: " + human(file.size) + "\n\nExtract this file?")
+                        .setNegativeButton("Cancel", null)
+                        .setPositiveButton("Extract", (d, w) -> beginTrpExtract(position))
+                        .show();
                 return;
             }
             if (rpaInfo != null) {
@@ -383,6 +397,7 @@ public class MainActivity extends Activity {
             ps1Info = null;
             voxInfo = null;
             rpaInfo = null;
+            trpInfo = null;
             retroMode = null;
             ndsNodes.clear();
             expandedNds.clear();
@@ -405,6 +420,18 @@ public class MainActivity extends Activity {
                                 summary.setText(parsedDisc.description());
                                 detail.setText("Extract all, or tap a file to extract just that one. TIM images are saved as PNG " +
                                         "and VAG sounds as WAV; TIMs packed inside other files are found too.");
+                                render();
+                            });
+                        } else if (Ps3Trophy.isTrophyPack(channel)) {
+                            Ps3Trophy.Info parsedTrp = Ps3Trophy.parse(channel);
+                            runOnUiThread(() -> {
+                                trpInfo = parsedTrp;
+                                archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null;
+                                voxInfo = null; rpaInfo = null;
+                                busy = false;
+                                summary.setText(parsedTrp.description());
+                                detail.setText("Extract all, or tap a file. The .SFM files are XML (trophy list, names and " +
+                                        "descriptions). After editing, use Convert → Folder → TROPHY.TRP to rebuild the pack.");
                                 render();
                             });
                         } else if (RenpyArchive.isArchive(channel)) {
@@ -511,7 +538,7 @@ public class MainActivity extends Activity {
                     }
                 } catch (Exception e) {
                     runOnUiThread(() -> {
-                        busy = false; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null; voxInfo = null; rpaInfo = null;
+                        busy = false; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null; voxInfo = null; rpaInfo = null; trpInfo = null;
                         summary.setText("Could not open game file");
                         detail.setText(message(e));
                         render();
@@ -556,6 +583,8 @@ public class MainActivity extends Activity {
             startActivityForResult(save, SAVE_NDS);
         } else if (request == SAVE_NDS && ndsImportNode != null && ndsPngUri != null) {
             rebuildNds(uri);
+        } else if (request == PICK_TRP_FOLDER && trpInfo != null) {
+            extractTrp(uri);
         } else if (request == PICK_RPA_DATA && pendingRpiUri != null) {
             openRpi(pendingRpiUri, uri);
         } else if (request == PICK_RPA_FOLDER && rpaInfo != null) {
@@ -636,6 +665,7 @@ public class MainActivity extends Activity {
         }
         if (voxInfo != null) displayed.addAll(voxLabels);
         if (rpaInfo != null) for (RenpyArchive.FileEntry f : rpaInfo.files) displayed.add("📄 " + f.path + " · " + human(f.size()));
+        if (trpInfo != null) for (Ps3Trophy.FileEntry f : trpInfo.files) displayed.add("🏆 " + f.name + " · " + human(f.size));
         if (ps1Info != null) {
             for (Ps1Disc.FileEntry f : ps1Info.files)
                 displayed.add("💿 " + f.path + " · " + human(f.exportSize()) + (f.form2 ? " · raw XA/STR sectors" : ""));
@@ -670,6 +700,7 @@ public class MainActivity extends Activity {
                 "/" + activePath + "   (" + displayed.size() + " items)");
         if (pakInfo != null) location.setText("/PAK   (" + displayed.size() + " bundles)");
         if (voxInfo != null) location.setText("/VOX   (" + displayed.size() + " clips)");
+        if (trpInfo != null) location.setText("/TROPHY.TRP   (" + displayed.size() + " files)");
         if (rpaInfo != null) location.setText("/RPA   (" + displayed.size() + " files, " + human(rpaInfo.totalBytes) + ")");
         if (ps1Info != null) location.setText("/" + ps1Info.title() + "   (" + displayed.size() + " files, " + human(ps1Info.totalBytes) + ")");
         open.setEnabled(!busy);
@@ -686,7 +717,7 @@ public class MainActivity extends Activity {
         pngToRetro.setVisibility(retroInfo!=null?View.VISIBLE:View.GONE);
         if(retroMode!=null)retroFormat.setText("Format: "+retroMode.slug);
         extractAll.setText((nesInfo != null || retroInfo != null) ? "Export all tile PNGs" : "Extract all");
-        extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null || pakInfo != null || ps1Info != null || voxInfo != null || rpaInfo != null));
+        extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null || pakInfo != null || ps1Info != null || voxInfo != null || rpaInfo != null || trpInfo != null));
         extractHere.setEnabled(!busy && (archive != null && !entriesIn(activePath).isEmpty() ||
                 ndsInfo != null && !ndsEntriesIn(activePath).isEmpty()));
         up.setEnabled(!busy && (archive != null || ndsInfo!=null) && !activePath.isEmpty());
@@ -1598,6 +1629,62 @@ public class MainActivity extends Activity {
                     detail.setText(message(e));
                     new AlertDialog.Builder(this).setTitle("Rebuild failed").setMessage(message(e))
                         .setPositiveButton("OK",null).show();
+                });
+            }
+        });
+    }
+
+    private void beginTrpExtract(int onlyFile) {
+        if (busy || trpInfo == null) return;
+        trpOnly = onlyFile;
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        startActivityForResult(intent, PICK_TRP_FOLDER);
+    }
+
+    /** Trophy pack: its files into TRP_<comm id>_v<version>_<time>/ (the version is reused when repacking). */
+    private void extractTrp(Uri tree) {
+        if (busy || trpInfo == null || imageUri == null) return;
+        final Ps3Trophy.Info info = trpInfo;
+        final int only = trpOnly;
+        busy = true; render();
+        summary.setText("Extracting trophy pack...");
+        worker.execute(() -> {
+            int count = 0;
+            try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                if (descriptor == null) throw new IOException("Could not reopen the trophy pack");
+                try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
+                     FileChannel channel = stream.getChannel()) {
+                    String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+                    Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+                    String id = info.commId.isEmpty() ? "TROPHY" : TorusPak.safeName(info.commId);
+                    Uri folder = DocumentsContract.createDocument(getContentResolver(), parent, DIR_MIME,
+                            "TRP_" + id + "_v" + info.version + "_" + stamp);
+                    if (folder == null) throw new IOException("Cannot create output folder");
+                    for (int i = 0; i < info.files.size(); i++) {
+                        if (only >= 0 && i != only) continue;
+                        Ps3Trophy.FileEntry f = info.files.get(i);
+                        writeDoc(folder, f.name, f.name.toUpperCase(Locale.ROOT).endsWith(".PNG") ? "image/png" : "application/octet-stream",
+                                Ps3Trophy.read(channel, f));
+                        count++;
+                    }
+                }
+                final int done = count;
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    summary.setText("Trophy pack extracted");
+                    detail.setText(done + " file(s).");
+                    new AlertDialog.Builder(this).setTitle("Trophy pack extracted")
+                            .setMessage(done + " file(s) saved. TROPCONF.SFM and TROP.SFM are XML text: the trophy list, and " +
+                                    "names and descriptions. TROPnnn.PNG are the trophy icons. To rebuild after editing, use " +
+                                    "Convert → Folder → TROPHY.TRP on this folder.")
+                            .setPositiveButton("OK", null).show();
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Trophy pack extraction failed"); detail.setText(message(e));
+                    new AlertDialog.Builder(this).setTitle("Trophy pack extraction failed")
+                            .setMessage(message(e)).setPositiveButton("OK", null).show();
                 });
             }
         });
