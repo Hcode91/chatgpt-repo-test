@@ -1323,15 +1323,26 @@ volatile int g_eu_lean_flip;
 #define EU_LIVE_L_LANESPIN (1 << 18)
 #define EU_LIVE_L_KSPIN    (1 << 19)
 #define EU_LIVE_L_TASKWAIT (1 << 20)
-#define EU_LIVE_CHANGES    (EU_LIVE_F_AUDSPIN | EU_LIVE_F_NAP | EU_LIVE_L_LANESPIN | EU_LIVE_L_KSPIN | EU_LIVE_L_TASKWAIT)
+/* Optional game patches (the title build decides what each bit does and sets g_eu_gp_base from EU_GP at
+ * start-up; none = 0). The translated game code reads g_eu_gp, so a bit can be flipped while running: the
+ * comparison items GP_A..GP_D invert bits 1, 2, 4 and 8 for their stretch. */
+volatile unsigned g_eu_gp, g_eu_gp_base;
+#define EU_LIVE_GP_A (1 << 21)
+#define EU_LIVE_GP_B (1 << 22)
+#define EU_LIVE_GP_C (1 << 23)
+#define EU_LIVE_GP_D (1 << 24)
+#define EU_LIVE_GP_ALL (EU_LIVE_GP_A | EU_LIVE_GP_B | EU_LIVE_GP_C | EU_LIVE_GP_D)
+#define EU_LIVE_CHANGES    (EU_LIVE_F_AUDSPIN | EU_LIVE_F_NAP | EU_LIVE_L_LANESPIN | EU_LIVE_L_KSPIN | EU_LIVE_L_TASKWAIT | EU_LIVE_GP_ALL)
 static void eu_sched_flip_set(int now)
 {
+    g_eu_gp = g_eu_gp_base ^ (unsigned)((now & EU_LIVE_GP_ALL) >> 21);
     g_eu_feat_flip = (now & EU_LIVE_F_AUDSPIN) ? "V242A_AUDSPIN" : (now & EU_LIVE_F_NAP) ? "V242A_NAP" : NULL;
     g_eu_lean_flip = ((now & EU_LIVE_L_LANESPIN) ? 0x08 : 0) | ((now & EU_LIVE_L_KSPIN) ? 0x01 : 0) | ((now & EU_LIVE_L_TASKWAIT) ? 0x20 : 0);
 }
 static struct { const char* name; int bit; } s_ab_known[] = {
     {"V242A_AUDSPIN", EU_LIVE_F_AUDSPIN}, {"V242A_NAP", EU_LIVE_F_NAP}, {"LEAN_LANESPIN", EU_LIVE_L_LANESPIN},
     {"LEAN_KSPIN", EU_LIVE_L_KSPIN}, {"LEAN_TASKWAIT", EU_LIVE_L_TASKWAIT},
+    {"GP_NOVFX", EU_LIVE_GP_A}, {"GP_VFX", EU_LIVE_GP_B}, {"GP_LIGHT", EU_LIVE_GP_C}, {"GP_SHADOWS", EU_LIVE_GP_D},
     {"EU_CORE_SPLIT", EU_LIVE_CORE_SPLIT}, {"EU_MAIN_BOOST", EU_LIVE_MAIN_BOOST}, {"EU_SPURS_PARK", EU_LIVE_SPURS_PARK},
     {"EU_INDEX_FAST", EU_LIVE_INDEX_FAST}, {"EU_VK_CB_USED", EU_LIVE_CB_USED}, {"EU_LL_YIELD", EU_LIVE_LL_YIELD},
     {"EU_SPU_NICE", EU_LIVE_SPU_NICE}, {"EU_PERF_HINT", EU_LIVE_PERF_HINT},

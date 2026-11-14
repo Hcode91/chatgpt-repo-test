@@ -204,7 +204,7 @@ public final class EuBootActivity extends Activity {
         openScreen.setChecked(true);
         root.addView(openScreen);
         extraEnv = new EditText(this);
-        extraEnv.setHint("Extra settings (optional), e.g. EU_VK_PULL=0 EU_AUDIO_BOOST=0");
+        extraEnv.setHint("Extra settings (optional), e.g. EU_GP=speed,light EU_FOV=1.2");
         extraEnv.setTextColor(Color.WHITE);
         extraEnv.setHintTextColor(Color.rgb(120, 130, 150));
         extraEnv.setText(prefs.getString("extra_env", ""));
