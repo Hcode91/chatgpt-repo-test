@@ -1,0 +1,77 @@
+name: PS3 ELF Extractor Android APK
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/ps3-elf-extractor-android
+    paths:
+      - 'ps3-elf-extractor/**'
+      - '.github/workflows/ps3-elf-extractor.yml'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Install Android toolchain
+        run: |
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | head -n1)"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+      - name: Fetch pinned GPLv2 scetool sources
+        run: |
+          git clone https://github.com/naehrwert/scetool.git /tmp/scetool-src
+          git -C /tmp/scetool-src checkout --detach d78d8986c9ab831f084516f21ecdf87080ac7b78
+          test "$(git -C /tmp/scetool-src rev-parse HEAD)" = d78d8986c9ab831f084516f21ecdf87080ac7b78
+      - name: Fetch pinned GPLv2 RPCS3 key vault source
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/RPCS3/rpcs3.git /tmp/rpcs3-keyvault
+          git -C /tmp/rpcs3-keyvault checkout 47599599a4cea37f350eb0936d7c5e4de6f7bf57 -- rpcs3/Crypto/key_vault.cpp rpcs3/Crypto/key_vault.h
+          python3 ps3-elf-extractor/tools/generate_rpcs3_keyset.py \
+            --cpp /tmp/rpcs3-keyvault/rpcs3/Crypto/key_vault.cpp \
+            --header /tmp/rpcs3-keyvault/rpcs3/Crypto/key_vault.h \
+            --out ps3-elf-extractor/app/src/main/assets/scetool-keys.ini
+          test -s ps3-elf-extractor/app/src/main/assets/scetool-keys.ini
+      - name: Cross-compile ARM64 ELF decryption executable
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
+          bash ps3-elf-extractor/tools/build_scetool_android.sh /tmp/scetool-src ps3-elf-extractor/app/src/main/jniLibs/arm64-v8a/libps3elf.so
+          # Ship the NDK C++ shared runtime needed by scetool on Android.
+          CXX_SO="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+          test -s "$CXX_SO"
+          cp "$CXX_SO" ps3-elf-extractor/app/src/main/jniLibs/arm64-v8a/libc++_shared.so
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -d ps3-elf-extractor/app/src/main/jniLibs/arm64-v8a/libps3elf.so | grep "libc++_shared.so"
+      - name: Build Android APK
+        working-directory: ps3-elf-extractor
+        run: gradle --no-daemon --stacktrace assembleDebug
+      - name: Check packaged native dependencies
+        run: |
+          python3 - <<'PY'
+          from zipfile import ZipFile
+          from glob import glob
+          apk = glob("ps3-elf-extractor/app/build/outputs/apk/debug/*.apk")[0]
+          with ZipFile(apk) as z:
+              for name in ("lib/arm64-v8a/libps3elf.so", "lib/arm64-v8a/libc++_shared.so", "assets/scetool-keys.ini"):
+                  assert name in z.namelist(), "Missing native library: " + name
+                  print("PACKAGED:", name)
+          PY
+      - name: Upload GPL source notice and source archive
+        run: |
+          cp /tmp/scetool-src/README ps3-elf-extractor/SCETOOL_UPSTREAM_README.txt
+          git -C /tmp/scetool-src archive --format=tar.gz -o "$GITHUB_WORKSPACE/ps3-elf-extractor/scetool-source-gplv2.tar.gz" HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ps3-elf-extractor-arm64-apk
+          path: |
+            ps3-elf-extractor/app/build/outputs/apk/debug/*.apk
+            ps3-elf-extractor/scetool-source-gplv2.tar.gz
+            ps3-elf-extractor/SCETOOL_UPSTREAM_README.txt
+          if-no-files-found: error
