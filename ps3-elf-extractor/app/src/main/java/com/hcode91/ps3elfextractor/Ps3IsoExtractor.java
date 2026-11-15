@@ -290,13 +290,23 @@ final class Ps3IsoExtractor {
         byte[] nameBytes = new byte[nameLen];
         System.arraycopy(data, at + 33, nameBytes, 0, nameLen);
         String name;
-        if (joliet) {
-            if ((nameLen & 1) != 0) throw new IOException("Bad Joliet filename");
+        // Both ISO9660 and Joliet use a SINGLE byte 0 for the root
+        // record's identifier. It is not a UTF-16 name. Decode it before
+        // enforcing even byte lengths for ordinary Joliet filenames.
+        // Previously this check happened after UTF-16 validation, so any
+        // valid ISO with a Joliet supplementary descriptor failed here.
+        if (at == 156 && nameLen == 1 && nameBytes[0] == 0) {
+            name = "ISO_ROOT";
+        } else if (joliet) {
+            if ((nameLen & 1) != 0)
+                throw new IOException("Invalid Joliet entry (odd-length UTF-16BE filename)"
+                        + " at ISO offset " + (at));
             name = new String(nameBytes, StandardCharsets.UTF_16BE);
-        } else name = new String(nameBytes, StandardCharsets.ISO_8859_1);
+        } else {
+            name = new String(nameBytes, StandardCharsets.ISO_8859_1);
+        }
         name = name.replaceFirst(";[0-9]+$", "");
         if (name.endsWith(".")) name = name.substring(0, name.length() - 1);
-        if (at == 156 && nameLen == 1 && nameBytes[0] == 0) name = "ISO_ROOT";
         if (name.isEmpty() || name.equals(".") || name.equals("..")
                 || name.equals(INCOMPLETE) || name.contains("/")
                 || name.contains("\\") || name.indexOf(':') >= 0
