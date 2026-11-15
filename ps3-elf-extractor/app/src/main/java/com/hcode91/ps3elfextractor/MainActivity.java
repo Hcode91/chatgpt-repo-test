@@ -28,12 +28,15 @@ import java.util.regex.Pattern;
 import java.util.concurrent.TimeUnit;
 
 public final class MainActivity extends Activity {
-    private static final int PICK_EBOOT = 11, PICK_RAP = 12, SAVE_ELF = 14;
+    private static final int PICK_EBOOT = 11, PICK_RAP = 12, SAVE_ELF = 14, PICK_ISO = 15, PICK_ISO_DEST = 16;
     private static final long MAX_EBOOT = 384L * 1024 * 1024;
     private final Uri[] selected = new Uri[2];
     private final String[] selectedNames = new String[]{"Not selected", "Not selected"};
     private TextView report, ebootStatus, rapStatus;
-    private Button extract, save;
+    private Button extract, save, isoExtract;
+    private Uri selectedIso;
+    private String selectedIsoName = "Not selected";
+    private TextView isoStatus;
     private File verifiedElf;
     private volatile boolean busy;
     private static final Pattern CONTENT_ID = Pattern.compile("[A-Z]{2}[0-9]{4}-[A-Z0-9]{9}_[0-9]{2}-[A-Z0-9]{16}");
@@ -67,6 +70,14 @@ public final class MainActivity extends Activity {
 
         report = addText(root, "Ready. Select EBOOT.BIN. Disc-based APP executables need no RAP; PSN NPDRM executables need a matching 16-byte RAP.", 14, 0xffa9f1c9);
         report.setTypeface(Typeface.MONOSPACE);
+        addText(root, "PS3 ISO to JB Folder", 21, Color.WHITE)
+                .setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        addText(root, "Extract an already-decrypted PS3 ISO into PS3_GAME and other disc files. "
+                + "Encrypted ISOs need a matching disc key and decryption first. "
+                + "No uploads, and no need to copy the whole ISO into app storage.", 14, 0xffaebdd6);
+        isoStatus = addText(root, "ISO: Not selected", 14, 0xffd6e4f9);
+        button(root, "Select PS3 ISO", () -> choose(PICK_ISO));
+        isoExtract = button(root, "Extract ISO to JB Folder", this::pickIsoDestination);
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
         scroll.addView(root);
@@ -102,6 +113,26 @@ public final class MainActivity extends Activity {
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
         if (result != RESULT_OK || data == null || data.getData() == null) return;
+        if (request == PICK_ISO_DEST) {
+            Uri tree = data.getData();
+            try { getContentResolver().takePersistableUriPermission(
+                    tree, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                            | Intent.FLAG_GRANT_WRITE_URI_PERMISSION); }
+            catch (SecurityException ignored) { }
+            extractIso(tree);
+            return;
+        }
+        if (request == PICK_ISO) {
+            selectedIso = data.getData();
+            selectedIsoName = displayName(selectedIso);
+            try { getContentResolver().takePersistableUriPermission(
+                    selectedIso, Intent.FLAG_GRANT_READ_URI_PERMISSION); }
+            catch (SecurityException ignored) { }
+            isoStatus.setText("ISO: " + selectedIsoName);
+            message("ISO selected: " + selectedIsoName
+                    + "\\nSelect an output folder to begin extracting.");
+            return;
+        }
         if (request == SAVE_ELF) {
             if (verifiedElf == null || !verifiedElf.isFile()) { message("No verified ELF to save."); return; }
             try (InputStream in = new FileInputStream(verifiedElf);
@@ -279,6 +310,59 @@ public final class MainActivity extends Activity {
                 message(finalOutcome);
             });
         }, "elf-extractor-worker").start();
+    }
+
+    private void pickIsoDestination() {
+        if (busy) return;
+        if (selectedIso == null) {
+            message("Select a decrypted PS3 ISO first.");
+            return;
+        }
+        if (!selectedIsoName.toLowerCase(Locale.ROOT).endsWith(".iso")) {
+            message("The selected image must have a .iso filename.");
+            return;
+        }
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        startActivityForResult(intent, PICK_ISO_DEST);
+    }
+
+    private void extractIso(Uri destination) {
+        if (busy || selectedIso == null) return;
+        busy = true;
+        extract.setEnabled(false);
+        save.setEnabled(false);
+        isoExtract.setEnabled(false);
+        message("Reading PS3 ISO filesystem...");
+        Uri input = selectedIso;
+        String name = selectedIsoName;
+        new Thread(() -> {
+            String outcome;
+            try {
+                Ps3IsoExtractor.Result result = Ps3IsoExtractor.extract(
+                        getContentResolver(), input, destination, name,
+                        progress -> runOnUiThread(() -> message(progress)));
+                outcome = "JB extraction finished!\\nFolder: " + result.name
+                        + "\\nFiles: " + result.files
+                        + "\\nExtracted: " + (result.bytes / 1024 / 1024) + " MiB"
+                        + "\\nOriginal ISO has not been modified.";
+            } catch (Exception e) {
+                outcome = "ISO extraction failed: " + e.getMessage()
+                        + "\\nIf an output folder was created, it may contain partial "
+                        + "files and an _INCOMPLETE_EXTRACT.txt marker. "
+                        + "Do not use that folder until extraction succeeds.";
+            }
+            String finished = outcome;
+            runOnUiThread(() -> {
+                busy = false;
+                extract.setEnabled(true);
+                save.setEnabled(verifiedElf != null && verifiedElf.isFile());
+                isoExtract.setEnabled(true);
+                message(finished);
+            });
+        }, "ps3-iso-extraction").start();
     }
 
     private static boolean elfHeader(byte[] data, int at) {
