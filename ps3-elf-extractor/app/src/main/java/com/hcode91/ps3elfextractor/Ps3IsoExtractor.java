@@ -296,6 +296,7 @@ final class Ps3IsoExtractor {
         } else name = new String(nameBytes, StandardCharsets.ISO_8859_1);
         name = name.replaceFirst(";[0-9]+$", "");
         if (name.endsWith(".")) name = name.substring(0, name.length() - 1);
+        if (at == 156 && nameLen == 1 && nameBytes[0] == 0) name = "ISO_ROOT";
         if (name.isEmpty() || name.equals(".") || name.equals("..")
                 || name.equals(INCOMPLETE) || name.contains("/")
                 || name.contains("\\") || name.indexOf(':') >= 0
