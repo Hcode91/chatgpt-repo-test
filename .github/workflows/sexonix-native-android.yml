@@ -1,0 +1,52 @@
+name: SeXoniX Native Android APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [feature/sexonix-native-android]
+    paths:
+      - 'sexonix-android/**'
+      - '.github/workflows/sexonix-native-android.yml'
+permissions:
+  contents: read
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Install Android SDK
+        run: |
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f | head -n1)"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0"
+      - name: Build standalone native Android APK
+        working-directory: sexonix-android
+        run: gradle --no-daemon --stacktrace assembleDebug
+      - name: Verify no bundled copyrighted game files and no network permission
+        run: |
+          python3 - <<'PY'
+          import glob,zipfile
+          apk=glob.glob("sexonix-android/app/build/outputs/apk/debug/*.apk")[0]
+          with zipfile.ZipFile(apk) as z:
+              names=z.namelist()
+              assert not any(n.endswith('.dat') or n.endswith('.mid')
+                  or n.startswith("assets/game") for n in names)
+              manifest=z.read('AndroidManifest.xml')
+              assert b'INTERNET' not in manifest
+              print("Verified APK:",apk)
+          PY
+      - name: Upload installable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: sexonix-native-android-preview-apk
+          path: sexonix-android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
