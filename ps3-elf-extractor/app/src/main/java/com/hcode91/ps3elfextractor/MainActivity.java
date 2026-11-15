@@ -130,7 +130,7 @@ public final class MainActivity extends Activity {
             catch (SecurityException ignored) { }
             isoStatus.setText("ISO: " + selectedIsoName);
             message("ISO selected: " + selectedIsoName
-                    + "\\nSelect an output folder to begin extracting.");
+                    + "\nSelect an output folder to begin extracting.");
             return;
         }
         if (request == SAVE_ELF) {
@@ -344,13 +344,13 @@ public final class MainActivity extends Activity {
                 Ps3IsoExtractor.Result result = Ps3IsoExtractor.extract(
                         getContentResolver(), input, destination, name,
                         progress -> runOnUiThread(() -> message(progress)));
-                outcome = "JB extraction finished!\\nFolder: " + result.name
-                        + "\\nFiles: " + result.files
-                        + "\\nExtracted: " + (result.bytes / 1024 / 1024) + " MiB"
-                        + "\\nOriginal ISO has not been modified.";
+                outcome = "JB extraction finished!\nFolder: " + result.name
+                        + "\nFiles: " + result.files
+                        + "\nExtracted: " + (result.bytes / 1024 / 1024) + " MiB"
+                        + "\nOriginal ISO has not been modified.";
             } catch (Exception e) {
                 outcome = "ISO extraction failed: " + e.getMessage()
-                        + "\\nIf an output folder was created, it may contain partial "
+                        + "\nIf an output folder was created, it may contain partial "
                         + "files and an _INCOMPLETE_EXTRACT.txt marker. "
                         + "Do not use that folder until extraction succeeds.";
             }
