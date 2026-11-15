@@ -2,6 +2,33 @@
 
 v0.3-alpha Android ARM64 proof-of-concept for decrypting **personally supplied PS3 SELF/EBOOT.BIN** files to an ELF using [naehrwert/scetool](https://github.com/naehrwert/scetool), with RPCS3's [unself.cpp](https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Crypto/unself.cpp) serving as a reference for SELF/NPDRM processing.
 
+## v0.4: PS3 ISO → JB folder
+
+The Android app now also offers **Select PS3 ISO** and **Extract ISO to JB Folder**.
+Select an **already decrypted** ISO9660 (including Joliet) PS3 game image and then
+choose an Android document-provider destination directory. It creates an
+`<ISO name> [JB]` folder and streams the original disc paths and files into it,
+including `PS3_GAME/PARAM.SFO` and `PS3_GAME/USRDIR/EBOOT.BIN`.
+The extractor does **not** decrypt EBOOT.BIN as part of folder extraction;
+the existing dedicated EBOOT → ELF tool remains separate.
+
+- Streaming extraction via seekable Android document descriptors. The entire ISO
+  is **not copied** into temporary storage.
+- Handles ISO9660, Joliet names, and regular-file multi-extent chains.
+- Checks volume, extent bounds, names, duplicate paths, format, and PS3 file headers
+  before creating the target directory.
+- Rejects encrypted/raw disc images and UDF-only images. They require a separate
+  ISO decryption workflow with a legitimately obtained matching disc key.
+- Uses a visible `_INCOMPLETE_EXTRACT.txt` marker for partial output. It is
+  removed only after all files are written. Retry into a **new** empty folder.
+- Extraction may need many gigabytes of available free space. The selected
+  document provider must support seeking the input ISO and writing nested files.
+- No network permission, and nothing is sent to a server.
+
+**Testing:** A green GitHub Actions build confirms APK packaging, not that all
+real-world PS3 game ISOs are supported or correctly unpacked. Verify on a
+decrypted game you own and compare file counts / hashes before relying on it.
+
 ## Status
 
 - Functional app UI with Android document pickers, content-ID detection, RAP size checks, local file staging, native-process invocation, timeout protection, logs and ELF64 big-endian PowerPC verification.
