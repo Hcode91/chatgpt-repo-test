@@ -19,7 +19,10 @@ jobs:
           distribution: temurin
           java-version: '17'
       - name: Install Android SDK components
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+        run: |
+          SDKMANAGER="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}" -name sdkmanager -type f | head -n 1)"
+          test -n "$SDKMANAGER"
+          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0"
       - name: Restore source archive
         shell: bash
         run: |
