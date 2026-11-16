@@ -26,6 +26,11 @@ public final class GameView extends View {
     private static final int SIZE = 128, SCREEN_H = 160, TARGET = 75;
     private static final int EMPTY = 0, OWNED = 1, TRAIL = 2;
     private static final int MENU = 0, PLAY = 1, LEVEL_DONE = 2, GAME_OVER = 3;
+    // The original prototype's 64ms movement interval made the player
+    // significantly slower than enemies, whose physics updates every 34ms.
+    // Movement cadence is now independent from render cadence.
+    private static final int[] PLAYER_STEP_MS = {34, 26, 20};
+    private static final String[] SPEED_NAMES = {"Gentle", "Balanced", "Fast"};
     private final Paint paint = new Paint();
     private final Random random = new Random();
     private final int[] cells = new int[SIZE * SIZE];
@@ -39,7 +44,7 @@ public final class GameView extends View {
             if (getWindowToken() == null) return;
             tick();
             invalidate();
-            postDelayed(this, 35);
+            postDelayed(this, 16);
         }
     };
     private int state = MENU, level, lives = 4, score, target = TARGET, percent;
@@ -50,6 +55,19 @@ public final class GameView extends View {
     private String status = "Import your J2ME JAR to load the original stage images.";
     private int touchDir;
     private boolean drawHeld;
+    private int speedIndex = 1; // Balanced is the default for existing installs.
+
+    public int getSpeedIndex() { return speedIndex; }
+
+    public String speedLabel() { return SPEED_NAMES[speedIndex]; }
+
+    public void setSpeedIndex(int value) {
+        if (value < 0 || value >= PLAYER_STEP_MS.length) value = 1;
+        speedIndex = value;
+        // Apply immediately, without replaying accumulated old timing.
+        lastMove = android.os.SystemClock.uptimeMillis();
+        invalidate();
+    }
 
     private static final class Ball {
         float x,y,vx,vy;
@@ -105,43 +123,71 @@ public final class GameView extends View {
     }
 
     private void tick() {
-        if (state!=PLAY || paused) return;
-        long now=android.os.SystemClock.uptimeMillis();
-        if(now-lastBall>=34) {
-            int steps=(int)Math.min(4,(now-lastBall)/34);
-            lastBall=now;
-            for(int i=0;i<steps;i++)updateBalls();
+        if (state != PLAY || paused) return;
+        long now = android.os.SystemClock.uptimeMillis();
+
+        // Keep enemy movement unchanged at 34ms per physics step.
+        // Catch up a few steps if the UI frame is late; avoid huge bursts
+        // after the app has been backgrounded.
+        long ballElapsed = now - lastBall;
+        if (ballElapsed >= 34) {
+            int steps = (int)Math.min(5, ballElapsed / 34);
+            lastBall += steps * 34L;
+            if (now - lastBall > 170) lastBall = now - 34;
+            for (int i = 0; i < steps && state == PLAY; i++) updateBalls();
         }
-        int mx=dx,my=dy;
-        if(touchDir==1){mx=0;my=-1;}
-        if(touchDir==2){mx=0;my=1;}
-        if(touchDir==3){mx=-1;my=0;}
-        if(touchDir==4){mx=1;my=0;}
-        if(now-lastMove>=64 && (mx!=0||my!=0)) {
-            lastMove=now;
-            boolean fromOwn=cells[py*SIZE+px]==OWNED;
-            boolean wantsDraw=drawHeld || drawing;
-            int nx=Math.max(0,Math.min(SIZE-1,px+mx));
-            int ny=Math.max(0,Math.min(SIZE-1,py+my));
-            int value=cells[ny*SIZE+nx];
-            if (value==TRAIL) return;
-            if(value==EMPTY && !wantsDraw) return;
-            if(value==EMPTY && wantsDraw && fromOwn) {
-                drawing=true;trailLength=0;
-            }
-            if(value==EMPTY && drawing) {
-                cells[ny*SIZE+nx]=TRAIL;trailLength++;
-            }
-            px=nx;py=ny;
-            if(drawing && value==OWNED && trailLength>0) {
-                drawing=false;
-                captureTerritory();
-                if(percent>=target) {
-                    state=LEVEL_DONE;
-                    score += 1000*(level+1);
-                }
+        if (state != PLAY) return;
+
+        int mx = dx, my = dy;
+        if (touchDir == 1) { mx = 0; my = -1; }
+        else if (touchDir == 2) { mx = 0; my = 1; }
+        else if (touchDir == 3) { mx = -1; my = 0; }
+        else if (touchDir == 4) { mx = 1; my = 0; }
+        if (mx == 0 && my == 0) {
+            lastMove = now; // No accumulated moves after standing still.
+            return;
+        }
+
+        int period = PLAYER_STEP_MS[speedIndex];
+        long elapsed = now - lastMove;
+        if (elapsed >= period) {
+            int steps = (int)Math.min(8, elapsed / period);
+            lastMove += steps * (long)period;
+            if (now - lastMove > 8L * period) lastMove = now - period;
+            for (int i = 0; i < steps && state == PLAY; i++) {
+                if (!movePlayer(mx, my)) break;
             }
         }
+    }
+
+    /** Single-pixel step keeps trail and collision checks intact at all speeds. */
+    private boolean movePlayer(int mx, int my) {
+        boolean fromOwn = cells[py * SIZE + px] == OWNED;
+        boolean wantsDraw = drawHeld || drawing;
+        int nx = Math.max(0, Math.min(SIZE - 1, px + mx));
+        int ny = Math.max(0, Math.min(SIZE - 1, py + my));
+        if (nx == px && ny == py) return false;
+        int value = cells[ny * SIZE + nx];
+        if (value == TRAIL || (value == EMPTY && !wantsDraw)) return false;
+        if (value == EMPTY && wantsDraw && fromOwn) {
+            drawing = true;
+            trailLength = 0;
+        }
+        if (value == EMPTY && drawing) {
+            cells[ny * SIZE + nx] = TRAIL;
+            trailLength++;
+        }
+        px = nx;
+        py = ny;
+        if (drawing && value == OWNED && trailLength > 0) {
+            drawing = false;
+            captureTerritory();
+            if (percent >= target) {
+                state = LEVEL_DONE;
+                score += 1000 * (level + 1);
+            }
+        }
+        return true;
     }
 
     private void updateBalls() {
@@ -212,6 +258,12 @@ public final class GameView extends View {
     }
 
     private void direction(int value) {
+        // First key/arrow press responds on the next UI frame, rather than
+        // forcing the player to wait for the full movement interval.
+        boolean wasMoving = touchDir != 0 || dx != 0 || dy != 0;
+        if (!wasMoving && value != 0)
+            lastMove = android.os.SystemClock.uptimeMillis()
+                    - PLAYER_STEP_MS[speedIndex];
         touchDir=value;
         switch(value) {
             case 1:dx=0;dy=-1;break;
