@@ -5,6 +5,16 @@ built with Gradle and GitHub Actions (no J2ME Loader at runtime). This is an
 **early gameplay prototype**, not an exact port or a claim that all mechanics
 match the original.
 
+## v0.2 movement update
+
+- Player moves much faster than in v0.1, while enemy velocity remains unchanged.
+- Player step intervals: Gentle 34ms, Balanced 26ms (default), Fast 20ms.
+- A new **Player speed** selector is shown above the game and is saved between launches.
+- Rendering is requested approximately every 16ms and movement catches up in
+  single-cell steps after small frame delays, avoiding skipped collision cells.
+- This is a gameplay-prototype tuning change, not yet calibrated against
+  the original Java ME code. Speed may vary on slower Android devices.
+
 ## First milestone
 - Native Android APK, Java 17, Android API 26+.
 - Offline JAR picker, reading seven original `1.dat` through `7.dat` stages.
