@@ -1,6 +1,7 @@
 package com.hcode91.sexonix;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -34,6 +35,7 @@ public final class MainActivity extends Activity {
     private final byte[][] savedStages = new byte[7][];
     private GameView game;
     private TextView info;
+    private Button speedButton;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -67,10 +69,36 @@ public final class MainActivity extends Activity {
         root.addView(info);
 
         game=new GameView(this);
+        int savedSpeed = getPreferences(MODE_PRIVATE).getInt("playerSpeed", 1);
+        game.setSpeedIndex(savedSpeed);
+        speedButton = new Button(this);
+        speedButton.setTextSize(11);
+        speedButton.setText("Player speed: " + game.speedLabel());
+        top.addView(speedButton);
+        speedButton.setOnClickListener(v -> showSpeedDialog());
         root.addView(game,new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,0,1));
         setContentView(root);
         restoreStages();
+    }
+
+    private void showSpeedDialog() {
+        final String[] options = {
+                "Gentle (34 ms / step)",
+                "Balanced (26 ms / step)",
+                "Fast (20 ms / step)"
+        };
+        new AlertDialog.Builder(this)
+                .setTitle("Player movement speed")
+                .setSingleChoiceItems(options, game.getSpeedIndex(), (dialog, selected) -> {
+                    game.setSpeedIndex(selected);
+                    getPreferences(MODE_PRIVATE).edit()
+                            .putInt("playerSpeed", selected).apply();
+                    speedButton.setText("Player speed: " + game.speedLabel());
+                    dialog.dismiss();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     private void selectJar() {
