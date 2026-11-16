@@ -29,6 +29,8 @@ jobs:
           mkdir -p TextureForge/build-source
           base64 --decode TextureForge/project.tar.xz.b64 > /tmp/textureforge.tar.xz
           tar -xJf /tmp/textureforge.tar.xz -C TextureForge/build-source
+          base64 --decode TextureForge/upgrade-v02.tar.xz.b64 > /tmp/textureforge-v02.tar.xz
+          tar -xJf /tmp/textureforge-v02.tar.xz -C TextureForge/build-source
           test -f TextureForge/build-source/app/build.gradle
       - uses: gradle/actions/setup-gradle@v4
         with:
