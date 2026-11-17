@@ -17,9 +17,12 @@ import java.util.zip.Inflater;
  * Unreal Engine 4 .pak files, versions 3–5 (UE 4.13 – 4.19 era): unencrypted index, files stored or zlib-compressed in
  * blocks. Files are read with random access (only the blocks a read touches are inflated).
  *
- * Rebuilding appends: every original byte up to the old index stays as it is, changed files are written after it
- * as new entries (zlib blocks, each preceded by its entry header as UnrealPak does), then a fresh index and footer
- * with the SHA-1s Unreal checks (index hash in the footer, data hash per entry). The old copies become unused bytes.
+ * Rebuilding is done in place so the pak (and the OBB around it) keeps exactly its original size: Android games
+ * check the OBB's size before starting and refuse a file that differs. A changed file is recompressed at the highest
+ * zlib level into its own slot. If it doesn't fit, the files right after it are recompressed and moved up until the
+ * run ends where an original file starts; everything else stays byte-for-byte. The index (same length, since every
+ * entry keeps its block count) and the footer's SHA-1 are rewritten in place.
+ * The older append mode ({@link #buildTail}) is kept for tests and loose paks that don't need a fixed size.
  */
 final class UnrealPak {
     static final int MAGIC = 0x5A6F12E1;
@@ -324,6 +327,191 @@ final class UnrealPak {
                         } else System.arraycopy(tail, (int) (at - indexOffset), b, off, n);
                         at += n;
                         return n;
+                    }
+                };
+            }
+        };
+    }
+
+    // ------------------------------------------------------------------ writing in place (same size)
+    static final class Patch {
+        final long at; final byte[] data;
+        Patch(long at, byte[] data) { this.at = at; this.data = data; }
+    }
+
+    /** Most bytes one rewrite run may cover before giving up (keeps memory bounded on phones). */
+    static final int MAX_RUN = 96 << 20;
+
+    private static List<byte[]> deflateBlocks(byte[] data, int bs) {
+        List<byte[]> blocks = new ArrayList<>();
+        for (int at = 0; at < data.length || (data.length == 0 && blocks.isEmpty()); at += bs) {
+            int n = Math.max(0, Math.min(bs, data.length - at));
+            Deflater d = new Deflater(Deflater.BEST_COMPRESSION);
+            try {
+                d.setInput(data, at, n); d.finish();
+                ByteArrayOutputStream cb = new ByteArrayOutputStream(Math.max(64, n / 2));
+                byte[] buf = new byte[16384];
+                while (!d.finished()) { int k = d.deflate(buf); cb.write(buf, 0, k); }
+                blocks.add(cb.toByteArray());
+            } finally { d.end(); }
+            if (data.length == 0) break;
+        }
+        return blocks;
+    }
+
+    /** The stored blocks of an entry exactly as they are in the file. */
+    private List<byte[]> rawBlocks(Entry e) throws IOException {
+        List<byte[]> out = new ArrayList<>();
+        if (e.method == 0) {
+            if (e.size > Integer.MAX_VALUE - 16) throw new IOException(e.name + " is too big to move");
+            byte[] b = new byte[(int) e.size]; src.read(e.dataStart, b, 0, b.length); out.add(b);
+            return out;
+        }
+        for (int k = 0; k < e.blockStart.length; k++) {
+            long s = abs(e, e.blockStart[k]), en = abs(e, e.blockEnd[k]);
+            if (s < e.dataStart || en < s || en > e.dataStart + e.size) throw new IOException(e.name + ": compression block out of range");
+            byte[] b = new byte[(int) (en - s)]; src.read(s, b, 0, b.length); out.add(b);
+        }
+        return out;
+    }
+
+    /** An entry (header + blocks) laid out at {@code pos}; {@code into} gets its bytes. */
+    private Entry layout(Entry old, int method, int bs, List<byte[]> blocks, long usize, long pos, ByteArrayOutputStream into) {
+        Entry e = new Entry();
+        e.name = old.name; e.offset = pos; e.usize = usize; e.method = method; e.encrypted = false;
+        e.blockSize = method == 0 ? old.blockSize : bs;
+        long size = 0;
+        for (byte[] b : blocks) size += b.length;
+        e.size = size;
+        e.blockStart = new long[method == 0 ? 0 : blocks.size()]; e.blockEnd = new long[e.blockStart.length];
+        long dataPos = pos + headerSize(e, version), at = dataPos;
+        for (int k = 0; k < e.blockStart.length; k++) {
+            long st = at, en = at + blocks.get(k).length;
+            e.blockStart[k] = version >= 5 ? st - pos : st;
+            e.blockEnd[k] = version >= 5 ? en - pos : en;
+            at = en;
+        }
+        MessageDigest md;
+        try { md = MessageDigest.getInstance("SHA-1"); } catch (Exception ex) { throw new IllegalStateException(ex); }
+        for (byte[] b : blocks) md.update(b);
+        e.hash = md.digest();
+        e.dataStart = dataPos;
+        writeEntry(into, e, true);
+        for (byte[] b : blocks) into.write(b, 0, b.length);
+        return e;
+    }
+
+    private int blockSizeOf(Entry old) {
+        if (old.blockSize > 0) return old.blockSize;
+        return 65536;
+    }
+
+    /**
+     * Same-size rebuild: byte patches (pak offsets) that turn the original pak into one with {@code changed}
+     * (path → new real content). Fails with a clear message if a change can't be made to fit.
+     */
+    List<Patch> buildInPlace(Map<String, byte[]> changed) throws IOException {
+        for (String k : changed.keySet()) if (!byName.containsKey(k)) throw new IOException(k + " isn't in the pak");
+        List<Entry> sorted = new ArrayList<>(entries);
+        sorted.sort((a, b) -> Long.compare(a.offset, b.offset));
+        Map<String, Entry> replaced = new LinkedHashMap<>();
+        List<Patch> patches = new ArrayList<>();
+        for (int i = 0; i < sorted.size(); i++) {
+            if (!changed.containsKey(sorted.get(i).name)) continue;
+            long runStart = sorted.get(i).offset, cursor = runStart;
+            ByteArrayOutputStream run = new ByteArrayOutputStream();
+            int j = i;
+            while (true) {
+                Entry o = sorted.get(j);
+                if (o.encrypted) throw new IOException(o.name + " is encrypted and can't be moved");
+                long limit = j + 1 < sorted.size() ? sorted.get(j + 1).offset : indexOffset;
+                byte[] data = changed.get(o.name);
+                Entry w;
+                if (data != null) {
+                    if (o.method == 1) w = layout(o, 1, blockSizeOf(o), deflateBlocks(data, blockSizeOf(o)), data.length, cursor, run);
+                    else { List<byte[]> one = new ArrayList<>(); one.add(data); w = layout(o, 0, 0, one, data.length, cursor, run); }
+                } else {
+                    // an unchanged file that has to move up: recompress it tighter if that helps, else move it as is
+                    List<byte[]> blocks = rawBlocks(o);
+                    if (o.method == 1) {
+                        List<byte[]> tighter = deflateBlocks(read(o), blockSizeOf(o));
+                        long a = 0, b = 0;
+                        for (byte[] x : tighter) a += x.length;
+                        for (byte[] x : blocks) b += x.length;
+                        if (a < b && tighter.size() == blocks.size()) blocks = tighter;
+                    }
+                    w = layout(o, o.method, blockSizeOf(o), blocks, o.usize, cursor, run);
+                }
+                replaced.put(o.name, w);
+                cursor = runStart + run.size();
+                if (run.size() > MAX_RUN)
+                    throw new IOException("The edited " + shortName(sorted.get(i).name) + " doesn't compress as small as the original, and there's no room to make up the difference. Try a simpler edit (flat colours compress best).");
+                boolean last = j + 1 >= sorted.size();
+                if (cursor <= limit) {
+                    // fits: pad up to where the next original file starts
+                    for (long k = cursor; k < limit; k++) run.write(0);
+                    cursor = limit;
+                    if (last || !changed.containsKey(sorted.get(j + 1).name)) break;
+                } else if (last) {
+                    throw new IOException("The edited " + shortName(sorted.get(i).name) + " doesn't compress as small as the original, and there's no room left at the end of the pak. Try a simpler edit (flat colours compress best).");
+                }
+                j++;
+            }
+            patches.add(new Patch(runStart, run.toByteArray()));
+            i = j;
+        }
+        // index (same length) and footer
+        ByteArrayOutputStream idx = new ByteArrayOutputStream();
+        fstr(idx, mount);
+        le32(idx, entries.size());
+        for (Entry e : entries) { fstr(idx, e.name); writeEntry(idx, replaced.getOrDefault(e.name, e), false); }
+        byte[] index = idx.toByteArray();
+        if (index.length != indexSize) throw new IOException("The new pak index came out " + index.length + " bytes instead of " + indexSize);
+        patches.add(new Patch(indexOffset, index));
+        ByteArrayOutputStream f = new ByteArrayOutputStream();
+        if (version >= 7) { byte[] guid = new byte[16]; src.read(src.size() - footerSize, guid, 0, 16); f.write(guid, 0, 16); }
+        if (version >= 4) f.write(0);
+        le32(f, MAGIC); le32(f, version); le64(f, indexOffset); le64(f, index.length);
+        byte[] h = sha1(index, 0, index.length);
+        f.write(h, 0, 20);
+        byte[] fb = f.toByteArray();
+        patches.add(new Patch(src.size() - fb.length, fb));
+        patches.sort((a, b) -> Long.compare(a.at, b.at));
+        for (int k = 1; k < patches.size(); k++)
+            if (patches.get(k - 1).at + patches.get(k - 1).data.length > patches.get(k).at) throw new IOException("Overlapping pak changes");
+        return patches;
+    }
+
+    private static String shortName(String path) { return path.substring(path.lastIndexOf('/') + 1); }
+
+    /** The original pak with patches applied: same length. */
+    UnityObb.Content patched(List<Patch> patches) {
+        return overlay(src, 0, src.size(), patches);
+    }
+
+    /** Bytes [start, start+len) of a source with patches (given in source offsets) laid over them. */
+    static UnityObb.Content overlay(UnityBundle.Source s, long start, long len, List<Patch> patches) {
+        return new UnityObb.Content() {
+            public long length() { return len; }
+            public InputStream open() {
+                return new InputStream() {
+                    long at = 0;
+                    @Override public int read() throws IOException { byte[] one = new byte[1]; int n = read(one, 0, 1); return n < 0 ? -1 : one[0] & 255; }
+                    @Override public int read(byte[] b, int off, int n) throws IOException {
+                        if (at >= len) return -1;
+                        n = (int) Math.min(n, len - at);
+                        long pos = start + at;
+                        for (Patch p : patches) {
+                            long pe = p.at + p.data.length;
+                            if (pos >= p.at && pos < pe) {           // inside a patch
+                                n = (int) Math.min(n, pe - pos);
+                                System.arraycopy(p.data, (int) (pos - p.at), b, off, n);
+                                at += n; return n;
+                            }
+                            if (p.at > pos) { n = (int) Math.min(n, p.at - pos); break; } // stop before the next patch
+                        }
+                        s.read(pos, b, off, n);
+                        at += n; return n;
                     }
                 };
             }

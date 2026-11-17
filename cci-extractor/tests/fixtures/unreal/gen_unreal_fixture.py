@@ -255,7 +255,7 @@ def pak(files, block=512):
     for path, data, comp in files:
         off = len(out)
         if comp:
-            chunks = [zlib.compress(data[i:i + block]) for i in range(0, len(data), block)] or [zlib.compress(b'')]
+            chunks = [zlib.compress(data[i:i + block], 1) for i in range(0, len(data), block)] or [zlib.compress(b'', 1)]  # fast level, like many shipped paks
             hlen = 8 * 3 + 4 + 20 + 4 + 16 * len(chunks) + 1 + 4
             pos = off + hlen; blocks = []
             for c in chunks: blocks.append((pos, pos + len(c))); pos += len(c)

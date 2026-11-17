@@ -12,8 +12,8 @@ import java.util.Map;
 /**
  * Unreal Engine 4 games on Android: an OBB (stored zip) holding one or more .pak files, or a loose .pak.
  * Lists every cooked Texture2D, decodes them, and rebuilds with edited textures: each changed package is patched in
- * place (re-encoded mips are exactly the original size), appended to its pak (see {@link UnrealPak#buildTail}),
- * and the OBB is rewritten with only that pak entry changed.
+ * place (re-encoded mips are exactly the original size), written back into its pak in place
+ * (see {@link UnrealPak#buildInPlace}), and the OBB keeps its exact size and zip headers.
  */
 final class UnrealObb {
 
@@ -144,27 +144,69 @@ final class UnrealObb {
         }
     }
 
-    /** {@code changed}: pak index → (package path → new package bytes). */
+    /**
+     * {@code changed}: pak index → (package path → new package bytes). Writes a file of exactly the original size:
+     * Android games check the OBB's size (the Play Store expansion-file check) and won't start with one that differs.
+     * Every zip header stays byte-for-byte; only the pak's bytes and its CRC-32 change.
+     */
     static void rebuild(FileChannel ch, Info info, Map<Integer, Map<String, byte[]>> changed, OutputStream out, UnityObb.Progress progress) throws IOException {
-        if (info.single) {
-            PakInfo p = info.paks.get(0);
-            Map<String, byte[]> c = changed.get(0);
-            byte[] tail = p.pak.buildTail(c == null ? new LinkedHashMap<>() : c);
-            byte[] buf = new byte[1 << 20];
-            try (java.io.InputStream in = p.pak.rebuilt(tail).open()) {
-                int n;
-                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
-            }
-            out.flush();
-            return;
-        }
-        Map<String, UnityObb.Content> replace = new LinkedHashMap<>();
+        List<UnrealPak.Patch> all = new ArrayList<>();
         for (Map.Entry<Integer, Map<String, byte[]>> e : changed.entrySet()) {
             PakInfo p = info.paks.get(e.getKey());
             if (progress != null) progress.step(0, 1, "Packing " + p.entry);
-            replace.put(p.entry, p.pak.rebuilt(p.pak.buildTail(e.getValue())));
+            List<UnrealPak.Patch> patches = p.pak.buildInPlace(e.getValue());
+            if (info.single) { all.addAll(patches); continue; }
+            for (UnrealPak.Patch q : patches) all.add(new UnrealPak.Patch(p.offset + q.at, q.data));
+            // the pak's CRC-32 in its local header, central directory record and (if used) data descriptor
+            UnityObb.Entry z = null;
+            for (UnityObb.Entry ze : info.zipEntries) if (ze.name.equals(p.entry)) z = ze;
+            if (z == null) throw new IOException(p.entry + " not found in the OBB");
+            long crc = crc32(UnrealPak.overlay(UnityBundle.of(ch, p.offset, p.size), 0, p.size, patches), progress, p.entry);
+            byte[] c = {(byte) crc, (byte) (crc >>> 8), (byte) (crc >>> 16), (byte) (crc >>> 24)};
+            all.add(new UnrealPak.Patch(z.localOffset + 14, c));
+            all.add(new UnrealPak.Patch(z.directoryRecord + 16, c));
+            if ((z.flags & 8) != 0) {
+                long d = z.dataOffset + z.csize;
+                byte[] sig = new byte[4];
+                UnityBundle.of(ch, 0, ch.size()).read(d, sig, 0, 4);
+                boolean hasSig = (sig[0] & 255) == 0x50 && (sig[1] & 255) == 0x4b && sig[2] == 7 && sig[3] == 8;
+                all.add(new UnrealPak.Patch(d + (hasSig ? 4 : 0), c));
+            }
         }
-        UnityObb.writeZipContent(ch, info.zipEntries, replace, out, progress);
+        all.sort((a, b) -> Long.compare(a.at, b.at));
+        UnityObb.Content content = UnrealPak.overlay(UnityBundle.of(ch, 0, ch.size()), 0, ch.size(), all);
+        byte[] buf = new byte[1 << 20];
+        long done = 0, total = ch.size();
+        try (java.io.InputStream in = content.open()) {
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+                done += n;
+                if (progress != null && (done & ((32 << 20) - 1)) < n) {
+                    if (progress.cancelled()) throw new IOException("Cancelled");
+                    progress.step((int) (done >> 20), (int) (total >> 20), "Writing " + (done >> 20) + " / " + (total >> 20) + " MB");
+                }
+            }
+        }
+        out.flush();
+    }
+
+    private static long crc32(UnityObb.Content c, UnityObb.Progress progress, String name) throws IOException {
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        byte[] buf = new byte[1 << 20];
+        long done = 0;
+        try (java.io.InputStream in = c.open()) {
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                crc.update(buf, 0, n);
+                done += n;
+                if (progress != null && (done & ((32 << 20) - 1)) < n) {
+                    if (progress.cancelled()) throw new IOException("Cancelled");
+                    progress.step((int) (done >> 20), (int) (c.length() >> 20), "Checking " + name + " " + (done >> 20) + " MB");
+                }
+            }
+        }
+        return crc.getValue();
     }
 
     // ------------------------------------------------------------------ export index
