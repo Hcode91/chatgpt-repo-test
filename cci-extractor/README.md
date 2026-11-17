@@ -1,4 +1,18 @@
-# Game Asset Extractor (Android v0.22.0)
+# Game Asset Extractor (Android v0.23.0)
+
+## New in v0.23: Metal Gear Solid textures and codec portraits (STAGE.DIR, FACE.DAT)
+
+Metal Gear Solid (PS1) keeps almost all of its graphics in two files on the disc, in Konami's own formats rather than standard PS1 TIM images. Extract them from the disc image first (open the `.bin`, Extract all), then open them here with **Open ROM**:
+
+- **STAGE.DIR**: every area of the game (94 on the US disc). Extract all, or tap one area. Each texture is saved as a PNG under `area/group/hash.png`; models, scripts, sounds and the rest are kept as they are, with their usual extensions (`.kmd`, `.gcx`, `.wvx`...).
+- **FACE.DAT**: the codec portraits. Each one is saved as `hash_base.png` plus one PNG per expression (`eyes-blink`, `eyes-droop`, `mouth-a`, `mouth-e`), with the expression already drawn over the face. The few animated portraits are saved frame by frame.
+
+Both are recognised by their content, not their names.
+
+**How it was checked:** the format was worked out from retail files (US disc 1) and matches the open-source Codec asset browser (otac0n/Codec, MIT). On the real files every one of the 18,486 textures and 445 portraits/animations converts with no errors, and the directory walk ends inside the file with nothing out of range. Every texture was compared pixel for pixel against a separate decoder that itself matches Pillow (an independent image library), and samples were checked by eye. One MGS quirk matters: the 256-colour textures pad the file after the palette, so standard PCX readers miss the palette and show them in grey. This version reads them correctly. CI runs `tests/MgsStageTest.java` on synthetic files.
+
+**What's uncertain or left out:** textures are saved fully opaque, because the game decides transparency when it loads them, and which colour that is hasn't been confirmed. Files are named by their 16-bit name hash, because the original file names aren't stored. The handful of `.res`/`.img` files and the 3D models aren't converted.
+
 
 ## New in v0.22: paint only one piece of a model (Area)
 

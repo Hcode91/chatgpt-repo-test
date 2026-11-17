@@ -75,6 +75,7 @@ public class MainActivity extends Activity {
     private static final int SAVE_UNITY = 326;
     private static final int SAVE_VIEWER_FILE = 327;
     private static final int PICK_DECAL = 328;
+    private static final int PICK_MGS_FOLDER = 329;
     private static final String DIR_MIME = DocumentsContract.Document.MIME_TYPE_DIR;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -87,6 +88,8 @@ public class MainActivity extends Activity {
     private TorusPak.Info pakInfo;
     private Ps1Disc.Info ps1Info;
     private MgsVox.Info voxInfo;
+    private MgsStage.Info mgsInfo;   // Metal Gear Solid STAGE.DIR / FACE.DAT
+    private int mgsOnly = -1;
     private RenpyArchive.Info rpaInfo;
     private Ps3Trophy.Info trpInfo;
     private UnityObb.Info unityInfo;
@@ -280,6 +283,7 @@ public class MainActivity extends Activity {
             else if (trpInfo != null) beginTrpExtract(-1);
             else if (rpaInfo != null) beginRpaExtract(-1);
             else if (voxInfo != null) beginVoxExtract(-1);
+            else if (mgsInfo != null) beginMgsExtract(-1);
             else if (ps1Info != null) beginPs1Extract(-1);
             else if (pakInfo != null) beginPakExtract(-1);
             else if (retroInfo != null) beginRetroExport(-1);
@@ -361,6 +365,17 @@ public class MainActivity extends Activity {
                         .setMessage("Size: " + human(file.size()) + "\n\nExtract this file?")
                         .setNegativeButton("Cancel", null)
                         .setPositiveButton("Extract", (d, w) -> beginRpaExtract(position))
+                        .show();
+                return;
+            }
+            if (mgsInfo != null) {
+                if (position >= mgsInfo.parts.size()) return;
+                MgsStage.Part part = mgsInfo.parts.get(position);
+                new AlertDialog.Builder(this).setTitle(mgsInfo.face ? "Portrait group " + part.name : "Area " + part.name)
+                        .setMessage(mgsInfo.label(position).replaceFirst("^\\S+ ", "") + "\n\nExtract this " +
+                                (mgsInfo.face ? "group" : "area") + "?")
+                        .setNegativeButton("Cancel", null)
+                        .setPositiveButton("Extract", (d, w) -> beginMgsExtract(position))
                         .show();
                 return;
             }
@@ -473,7 +488,7 @@ public class MainActivity extends Activity {
             retroInfo = null;
             pakInfo = null;
             ps1Info = null;
-            voxInfo = null;
+            voxInfo = null; mgsInfo = null;
             rpaInfo = null;
             trpInfo = null;
             unityInfo = null;
@@ -528,7 +543,7 @@ public class MainActivity extends Activity {
                             runOnUiThread(() -> {
                                 trpInfo = parsedTrp;
                                 archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null;
-                                voxInfo = null; rpaInfo = null;
+                                voxInfo = null; mgsInfo = null; rpaInfo = null;
                                 busy = false;
                                 summary.setText(parsedTrp.description());
                                 detail.setText("Extract all, or tap a file. The .SFM files are XML (trophy list, names and " +
@@ -538,6 +553,22 @@ public class MainActivity extends Activity {
                         } else if (RenpyArchive.isArchive(channel)) {
                             RenpyArchive.Info parsedRpa = RenpyArchive.parse(channel);
                             runOnUiThread(() -> showRpa(parsedRpa, uri));
+                        } else if (MgsStage.isStageDir(channel) || MgsStage.isFaceDat(channel)) {
+                            MgsStage.Info parsedMgs = MgsStage.isFaceDat(channel) ? MgsStage.parseFaceDat(channel)
+                                    : MgsStage.parseStageDir(channel);
+                            runOnUiThread(() -> {
+                                archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null;
+                                voxInfo = null; rpaInfo = null; trpInfo = null; unityInfo = null; unrealInfo = null;
+                                mgsInfo = parsedMgs;
+                                busy = false;
+                                summary.setText(parsedMgs.description());
+                                detail.setText(parsedMgs.face
+                                        ? "Extract all, or tap a group. Each portrait is saved as PNGs: the base face plus one " +
+                                          "per expression (blinking, talking...). Animations are saved frame by frame."
+                                        : "Extract all, or tap an area to extract just that one. Textures are saved as PNG; " +
+                                          "models, scripts, sounds and other files are kept as they are.");
+                                render();
+                            });
                         } else if (MgsVox.isVox(channel)) {
                             MgsVox.Info parsedVox = MgsVox.parse(channel);
                             List<String> labels = new ArrayList<>();
@@ -639,7 +670,7 @@ public class MainActivity extends Activity {
                     }
                 } catch (Exception e) {
                     runOnUiThread(() -> {
-                        busy = false; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null; voxInfo = null; rpaInfo = null; trpInfo = null; unityInfo = null; unrealInfo = null;
+                        busy = false; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null; voxInfo = null; mgsInfo = null; rpaInfo = null; trpInfo = null; unityInfo = null; unrealInfo = null;
                         summary.setText("Could not open game file");
                         detail.setText(message(e));
                         render();
@@ -743,6 +774,8 @@ public class MainActivity extends Activity {
             extractRpa(uri);
         } else if (request == PICK_VOX_FOLDER && voxInfo != null) {
             extractVox(uri);
+        } else if (request == PICK_MGS_FOLDER && mgsInfo != null) {
+            extractMgs(uri);
         } else if (request == PICK_PS1_FOLDER && ps1Info != null) {
             extractPs1(uri);
         } else if (request == PICK_PAK_FOLDER && pakInfo != null) {
@@ -839,6 +872,7 @@ public class MainActivity extends Activity {
                         String.format(Locale.ROOT,"📄 %s page %04d",retroMode.slug,i));
         }
         if (voxInfo != null) displayed.addAll(voxLabels);
+        if (mgsInfo != null) for (int i = 0; i < mgsInfo.parts.size(); i++) displayed.add(mgsInfo.label(i));
         if (rpaInfo != null) for (RenpyArchive.FileEntry f : rpaInfo.files) displayed.add("📄 " + f.path + " · " + human(f.size()));
         if (trpInfo != null) for (Ps3Trophy.FileEntry f : trpInfo.files) displayed.add("🏆 " + f.name + " · " + human(f.size));
         rowIndex.clear();
@@ -899,6 +933,8 @@ public class MainActivity extends Activity {
                 "/" + activePath + "   (" + displayed.size() + " items)");
         if (pakInfo != null) location.setText("/PAK   (" + displayed.size() + " bundles)");
         if (voxInfo != null) location.setText("/VOX   (" + displayed.size() + " clips)");
+        if (mgsInfo != null) location.setText(mgsInfo.face ? "/FACE.DAT   (" + displayed.size() + " groups, " + mgsInfo.files + " portraits)"
+                : "/STAGE.DIR   (" + displayed.size() + " areas, " + mgsInfo.textures + " textures)");
         if (trpInfo != null) location.setText("/TROPHY.TRP   (" + displayed.size() + " files)");
         if (unrealInfo != null) location.setText("/Unreal   (" + displayed.size() + " packages, " + unrealInfo.textures + " textures" +
                 (unrealPainted.isEmpty() ? ")" : ", " + unrealPainted.size() + " painted — tap rebuild to save)"));
@@ -923,7 +959,7 @@ public class MainActivity extends Activity {
         pngToUnity.setText(unrealInfo != null ? "Edited PNGs → rebuild Unreal OBB / pak" : "Edited PNGs → rebuild Unity OBB / bundle");
         if(retroMode!=null)retroFormat.setText("Format: "+retroMode.slug);
         extractAll.setText((nesInfo != null || retroInfo != null) ? "Export all tile PNGs" : (unityInfo != null || unrealInfo != null) ? "Extract all textures" : "Extract all");
-        extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null || pakInfo != null || ps1Info != null || voxInfo != null || rpaInfo != null || trpInfo != null || unityInfo != null || unrealInfo != null));
+        extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null || pakInfo != null || ps1Info != null || voxInfo != null || mgsInfo != null || rpaInfo != null || trpInfo != null || unityInfo != null || unrealInfo != null));
         extractHere.setEnabled(!busy && (archive != null && !entriesIn(activePath).isEmpty() ||
                 ndsInfo != null && !ndsEntriesIn(activePath).isEmpty()));
         up.setEnabled(!busy && (archive != null || ndsInfo!=null) && !activePath.isEmpty());
@@ -1898,7 +1934,7 @@ public class MainActivity extends Activity {
 
     private void showRpa(RenpyArchive.Info info, Uri dataUri) {
         rpaInfo = info; rpaDataUri = dataUri;
-        archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null; voxInfo = null;
+        archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null; voxInfo = null; mgsInfo = null;
         busy = false;
         summary.setText(info.description() + " · " + human(info.totalBytes));
         detail.setText("Extract all, or tap a file to extract just that one. To put edited files back, use Convert → " +
@@ -2004,6 +2040,115 @@ public class MainActivity extends Activity {
     private static String duration(double seconds) {
         long s = Math.round(seconds);
         return s / 60 + ":" + String.format(Locale.ROOT, "%02d", s % 60);
+    }
+
+    private void beginMgsExtract(int onlyPart) {
+        if (busy || mgsInfo == null) return;
+        mgsOnly = onlyPart;
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        startActivityForResult(intent, PICK_MGS_FOLDER);
+    }
+
+    /**
+     * Metal Gear Solid STAGE.DIR: area/group/hash.png for every texture, other files as they are.
+     * FACE.DAT: group/hash_base.png plus one PNG per expression, animations frame by frame.
+     */
+    private void extractMgs(Uri tree) {
+        if (busy || mgsInfo == null || imageUri == null) return;
+        final MgsStage.Info info = mgsInfo;
+        final int only = mgsOnly;
+        busy = true; cancelled.set(false); render();
+        summary.setText(info.face ? "Converting portraits..." : "Converting textures...");
+        worker.execute(() -> {
+            final int[] stats = new int[3]; // PNGs, other files, failed
+            try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                if (descriptor == null) throw new IOException("Could not reopen the file");
+                try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
+                     FileChannel channel = stream.getChannel()) {
+                    String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+                    Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+                    String base = getFilename(imageUri);
+                    base = base.contains(".") ? base.substring(0, base.lastIndexOf('.')) : base;
+                    Uri folder = DocumentsContract.createDocument(getContentResolver(), parent, DIR_MIME,
+                            "MGS_" + TorusPak.safeName(base).replace(' ', '_') + "_" + stamp);
+                    if (folder == null) throw new IOException("Cannot create output folder");
+                    Map<String, Uri> folders = new HashMap<>();
+                    folders.put("", folder);
+                    java.util.Set<String> used = new java.util.HashSet<>();
+                    int total = 0;
+                    for (int i = 0; i < info.parts.size(); i++) if (only < 0 || i == only) total += info.parts.get(i).entries.size();
+                    int done = 0;
+                    for (int i = 0; i < info.parts.size() && !cancelled.get(); i++) {
+                        if (only >= 0 && i != only) continue;
+                        MgsStage.Part part = info.parts.get(i);
+                        for (MgsStage.Entry e : part.entries) {
+                            if (cancelled.get()) break;
+                            if (++done % 25 == 1 || done == total) {
+                                final String progress = (info.face ? "Converting portrait " : "Converting file ") + done + "/" + total + "...";
+                                final String where = info.face ? "Group " + part.name : part.name;
+                                runOnUiThread(() -> { summary.setText(progress); detail.setText(where); });
+                            }
+                            try {
+                                byte[] data = MgsStage.read(channel, e);
+                                if (info.face) {
+                                    String dirPath = "group_" + part.name;
+                                    Uri dir = ensureFolder(dirPath, folders);
+                                    String stem = String.format(Locale.ROOT, "%04x", e.id) + (e.group == 'a' ? "_anim" : "");
+                                    for (Map.Entry<String, MgsStage.Image> img : MgsStage.decodeFace(e, data).entrySet()) {
+                                        String name = unique(used, dirPath, stem + "_" + img.getKey(), ".png");
+                                        writePng(dir, name, img.getValue().width, img.getValue().height, img.getValue().argb);
+                                        stats[0]++;
+                                    }
+                                } else {
+                                    String path = e.path();
+                                    String dirPath = path.substring(0, path.lastIndexOf('/'));
+                                    String stem = path.substring(path.lastIndexOf('/') + 1, path.lastIndexOf('.'));
+                                    Uri dir = ensureFolder(dirPath, folders);
+                                    MgsStage.Image img = null;
+                                    if (e.isTexture()) {
+                                        try { img = MgsStage.decodePcx(data); } catch (IOException notDecoded) { img = null; }
+                                    }
+                                    if (img != null) {
+                                        writePng(dir, unique(used, dirPath, stem, ".png"), img.width, img.height, img.argb);
+                                        stats[0]++;
+                                    } else {
+                                        writeDoc(dir, unique(used, dirPath, stem, "." + e.extension()), "application/octet-stream", data);
+                                        stats[1]++;
+                                    }
+                                }
+                            } catch (Exception | OutOfMemoryError broken) {
+                                stats[2]++;
+                            }
+                        }
+                    }
+                }
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    String result = info.face
+                            ? stats[0] + " portrait image(s) saved as PNG." + (stats[2] > 0 ? " " + stats[2] + " portrait(s) could not be converted." : "")
+                            : stats[0] + " texture(s) saved as PNG, " + stats[1] + " other file(s) kept as they are (models, scripts, " +
+                              "sounds...)." + (stats[2] > 0 ? " " + stats[2] + " file(s) could not be read." : "");
+                    summary.setText("Extraction " + (cancelled.get() ? "cancelled" : "complete"));
+                    detail.setText(result);
+                    new AlertDialog.Builder(this).setTitle(cancelled.get() ? "Extraction cancelled" : "Extraction complete")
+                            .setMessage(result + "\n\nThe original file is unchanged.").setPositiveButton("OK", null).show();
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Extraction failed"); detail.setText(message(e));
+                    new AlertDialog.Builder(this).setTitle("Extraction failed")
+                            .setMessage(message(e)).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+    /** stem + ext, or stem_2 + ext etc. if that name is already taken in the folder. */
+    private static String unique(java.util.Set<String> used, String dirPath, String stem, String ext) {
+        String name = stem + ext;
+        for (int n = 2; !used.add(dirPath + "/" + name); n++) name = stem + "_" + n + ext;
+        return name;
     }
 
     private void beginVoxExtract(int onlyClip) {
@@ -2149,8 +2294,13 @@ public class MainActivity extends Activity {
                     boolean hasVox = false;
                     for (Ps1Disc.FileEntry f : info.files)
                         if (f.path.toUpperCase(Locale.ROOT).matches("(.*/)?(VOX|DEMO)(_\\d+)?\\.DAT")) hasVox = true;
-                    final String voxHint = hasVox ? "\n\nThis disc has Metal Gear Solid voice files (VOX.DAT and DEMO.DAT). Open " +
-                            "the extracted files here to convert their clips to WAV with subtitles." : "";
+                    boolean hasMgsGraphics = false;
+                    for (Ps1Disc.FileEntry f : info.files)
+                        if (f.path.toUpperCase(Locale.ROOT).matches("(.*/)?(STAGE\\.DIR|FACE\\.DAT)")) hasMgsGraphics = true;
+                    final String voxHint = (hasVox ? "\n\nThis disc has Metal Gear Solid voice files (VOX.DAT and DEMO.DAT). Open " +
+                            "the extracted files here to convert their clips to WAV with subtitles." : "") +
+                            (hasMgsGraphics ? "\n\nThis disc has Metal Gear Solid graphics archives (STAGE.DIR and FACE.DAT). " +
+                            "Open the extracted files here to get every texture and codec portrait as PNG." : "");
                     summary.setText("Disc extraction " + (cancelled.get() ? "cancelled" : "complete"));
                     detail.setText(result);
                     new AlertDialog.Builder(this).setTitle(cancelled.get() ? "Disc extraction cancelled" : "Disc extraction complete")
@@ -2772,7 +2922,7 @@ public class MainActivity extends Activity {
     private void showUnreal(UnrealObb.Info info) {
         unrealInfo = info;
         unityInfo = null; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null;
-        voxInfo = null; rpaInfo = null; trpInfo = null;
+        voxInfo = null; mgsInfo = null; rpaInfo = null; trpInfo = null;
         busy = false;
         summary.setText(info.description());
         detail.setText("Extract all textures as PNG, or tap a package" + (info.meshes.isEmpty() ? "" : " (also to open the 3D models and paint on them)") +
@@ -3192,7 +3342,7 @@ public class MainActivity extends Activity {
         unityInfo = info;
         unrealInfo = null;
         archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null;
-        voxInfo = null; rpaInfo = null; trpInfo = null;
+        voxInfo = null; mgsInfo = null; rpaInfo = null; trpInfo = null;
         busy = false;
         summary.setText(info.description());
         detail.setText("Extract all textures as PNG, or tap a bundle (also to view its 3D models). Edit the PNGs (keep their names), then use " +
