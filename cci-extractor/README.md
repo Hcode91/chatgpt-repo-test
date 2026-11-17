@@ -1,4 +1,21 @@
-# Game Asset Extractor (Android v0.18.1)
+# Game Asset Extractor (Android v0.19.0)
+
+## New in v0.19: put a modified file back into an APK and sign it
+
+For games whose data file (e.g. a Unity OBB) sits inside the APK itself. **Convert → Put a file into an APK & sign…**, or tap **Put into APK…** straight after rebuilding an OBB:
+1. Pick the game's original APK.
+2. Pick the file inside it to replace (listed largest first, with size and whether it's stored or compressed).
+3. Pick your modified file, unless you came from the OBB rebuild, where it's already chosen.
+4. Choose where to save the new APK.
+
+The new APK has every other file byte-for-byte as before (same compression), the chosen file replaced (stored), and the old signature files removed. It's signed by Google's **apksig** (the library behind the SDK's `apksigner`) with v1 where the app's minimum Android version needs it, plus v2 and v3, and uncompressed files aligned the way Android requires. After saving, the app re-verifies the file with apksig's verifier, which runs the same checks as Android's installer.
+
+The signing key is an RSA-2048 key created on first use inside the Android Keystore. It never leaves the phone. Because it isn't the game's original key, **uninstall the original game first** (back up saves without cloud sync). Later rebuilds are signed with the same key, so they install straight over the modded one, unless this app is uninstalled or its data cleared, which deletes the key. While it works it needs free space for about two extra copies of the APK.
+
+**How it was checked:** `tests/run-apk-repack-test.sh` builds an APK with an old signature, replaces its data file, signs it and verifies it with apksig's `ApkVerifier` (v1 + v2 + v3, our certificate). It also checks that the replaced file is inside, every other file and its compression are unchanged, the old signature files are gone, and every stored file is 4-byte aligned. The test fetches apksig 8.7.3 and checks its SHA-256.
+
+**Not yet checked:** this hasn't been run on a phone yet, including the Android Keystore key.
+
 
 ## v0.18.1: view buttons for painting all the way round
 

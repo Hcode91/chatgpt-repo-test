@@ -7,8 +7,8 @@ android {
         applicationId 'com.retrotools.cciextractor'
         minSdk 26
         targetSdk 34
-        versionCode 21
-        versionName '0.18.1'
+        versionCode 22
+        versionName '0.19.0'
         // Native CIA decryption engine (ctrtool + makerom). ARM devices only.
         ndk { abiFilters 'arm64-v8a', 'armeabi-v7a' }
         externalNativeBuild {
@@ -29,4 +29,9 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+}
+
+dependencies {
+    // Google's APK signing library (the one behind the SDK's apksigner), used to sign repacked APKs
+    implementation 'com.android.tools.build:apksig:8.7.3'
 }
