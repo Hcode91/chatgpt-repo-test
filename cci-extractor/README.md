@@ -1,4 +1,8 @@
-# Game Asset Extractor (Android v0.21.1)
+# Game Asset Extractor (Android v0.21.2)
+
+## v0.21.2: search box for Unity and Unreal files
+
+After opening a Unity or Unreal file, type in the search box above the list to filter it as you type. It matches file paths and texture names, so `Max01_Body` finds the package holding `TX_Max01_BodyNobag_D`. Several words must all match (e.g. `chloe hair`). When only a texture name matched, the row shows which textures did. Tapping a result works as before.
 
 ## v0.21.1: Unreal OBBs now keep their exact size
 
