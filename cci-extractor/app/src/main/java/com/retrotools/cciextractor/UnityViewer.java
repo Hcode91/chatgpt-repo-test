@@ -63,6 +63,9 @@ final class UnityViewer {
         final Map<String, int[]> texSize = new HashMap<>();     // {width, height}
         final Map<String, String> texFile = new HashMap<>();    // suggested PNG name
         boolean[] partCutout;        // per part: alpha means see-through (null: every part)
+        UnityModels.Mesh base;       // the unedited mesh (edits are matched against it); null = mesh is unedited
+        int[] weld;                  // UnityModels.weld(base or mesh), for OBJ export / import
+        boolean edited;
         String note;
         Bitmap bitmap(int part) { return part < 0 || partKey[part] == null ? null : bitmaps.get(partKey[part]); }
     }
@@ -78,6 +81,12 @@ final class UnityViewer {
         int paintedCount();
         /** Encode every painted texture and save a new OBB. */
         void buildPainted();
+        /** Whether "Import edited OBJ" works for this engine. */
+        boolean canImportObj();
+        /** Pick an OBJ, read it against {@code d}, store the edit and reopen the viewer ({@code close} closes this one). */
+        void importObj(Data d, Runnable close);
+        /** Drop this model's imported edit and reopen the viewer. */
+        void revertMesh(Data d, Runnable close);
     }
 
     static String key(UnityModels.Ref r) { return r.bundle + "|" + r.file + "|" + r.pathId; }
@@ -185,7 +194,7 @@ final class UnityViewer {
     }
 
     /** Unreal Engine 4: loads a mesh, its materials and textures for the viewer. {@code painted}: textures already painted, by key. */
-    static Data loadUnreal(UnrealObb.Info info, UnrealModels.MeshRef ref, Map<String, int[]> painted) throws Exception {
+    static Data loadUnreal(UnrealObb.Info info, UnrealModels.MeshRef ref, Map<String, int[]> painted, ObjEdit.Edit edit) throws Exception {
         UnrealPak pak = info.paks.get(ref.pak).pak;
         UnrealPak.Entry entry = pak.byName.get(ref.path);
         if (entry == null) throw new IOException("Package not found: " + ref.path);
@@ -208,7 +217,10 @@ final class UnityViewer {
         };
 
         Data d = new Data();
-        d.mesh = l.mesh;
+        d.base = l.mesh;
+        d.weld = UnityModels.weld(l.mesh);
+        d.mesh = edit == null ? l.mesh : ObjEdit.apply(l.mesh, edit);
+        d.edited = edit != null;
         d.geometry = new UnityPaint.Geometry(d.mesh);
         int parts = d.mesh.parts.length;
         d.partNames = new String[parts];
@@ -518,9 +530,11 @@ final class UnityViewer {
         save.setOnClickListener(v -> {
             List<String> options = new ArrayList<>();
             int texPart = selected[0] >= 0 ? selected[0] : firstTextured(d);
-            if (host.paintedCount() > 0) options.add("New OBB with painted textures (" + host.paintedCount() + ")");
+            if (host.paintedCount() > 0) options.add("New OBB with your changes (" + host.paintedCount() + ")");
             if (texPart >= 0 && d.bitmap(texPart) != null) options.add("Texture as PNG (as shown, incl. paint)");
-            options.add("Model as OBJ (with UVs)");
+            options.add("Model as OBJ (with UVs; edit in Blender and import back)");
+            if (host.canImportObj()) options.add("Import edited OBJ…");
+            if (host.canImportObj() && d.edited) options.add("Undo model edit (back to original shape)");
             if (texPart >= 0 && d.bitmap(texPart) != null && d.mesh.uv != null) options.add("UV layout PNG (texture + outlines)");
             if (texPart >= 0 && d.mesh.uv != null) options.add("UV outlines only (transparent PNG)");
             new AlertDialog.Builder(activity).setTitle("Save").setItems(options.toArray(new String[0]), (dd, w) -> {
@@ -538,8 +552,13 @@ final class UnityViewer {
                         b.recycle();
                         host.save(d.texFile.get(k), "image/png", out.toByteArray());
                     } else if (o.startsWith("Model as OBJ")) {
+                        if (d.weld == null) d.weld = UnityModels.weld(d.mesh);
                         host.save(UnityObb.safe(d.mesh.name) + ".obj", "application/octet-stream",
-                                UnityModels.toObj(d.mesh).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                                UnityModels.toObj(d.mesh, d.weld).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    } else if (o.startsWith("Import edited OBJ")) {
+                        host.importObj(d, () -> { work.shutdown(); dialog.dismiss(); });
+                    } else if (o.startsWith("Undo model edit")) {
+                        host.revertMesh(d, () -> { work.shutdown(); dialog.dismiss(); });
                     } else {
                         boolean withTexture = o.startsWith("UV layout");
                         Bitmap b = uv.render(texPart, selected[0], withTexture);

@@ -113,6 +113,12 @@ public class MainActivity extends Activity {
     private final Map<String, Object[]> unityPainted = new java.util.LinkedHashMap<>();
     /** Unreal textures painted in the 3D viewer: key → {PackageInfo, Texture, int[] straight ARGB, top-down}. */
     private final Map<String, Object[]> unrealPainted = new java.util.LinkedHashMap<>();
+    /** Unreal models changed by "Import edited OBJ": mesh key → {MeshRef, ObjEdit.Edit}. */
+    private final Map<String, Object[]> unrealMeshEdits = new java.util.LinkedHashMap<>();
+    private static final int PICK_OBJ = 329;
+    private UnityViewer.Data pendingObjData;
+    private Runnable pendingObjClose;
+    private UnrealModels.MeshRef viewingUnrealMesh;
     /** Search box for Unity / Unreal lists; rowIndex maps a shown row to its bundle / package index. */
     private android.widget.EditText search;
     private final List<Integer> rowIndex = new ArrayList<>();
@@ -514,6 +520,7 @@ public class MainActivity extends Activity {
             unityPainted.clear();
             mgsPainted.clear();
             unrealPainted.clear();
+            unrealMeshEdits.clear();
             if (search.length() > 0) search.setText("");
             retroMode = null;
             ndsNodes.clear();
@@ -744,6 +751,33 @@ public class MainActivity extends Activity {
             scanUnityEdits(uri);
         } else if (request == SAVE_UNITY && unityInfo != null && unityPatches != null) {
             rebuildUnity(uri);
+        } else if (request == PICK_OBJ && pendingObjData != null) {
+            final UnityViewer.Data d = pendingObjData; final Runnable close = pendingObjClose;
+            final UnrealModels.MeshRef ref = viewingUnrealMesh;
+            pendingObjData = null; pendingObjClose = null;
+            if (ref == null) return;
+            busy = true;
+            summary.setText("Reading the OBJ...");
+            worker.execute(() -> {
+                try {
+                    byte[] bytes = readUri(uri);
+                    ObjEdit.Edit edit = ObjEdit.read(d.base, d.weld, new String(bytes, java.nio.charset.StandardCharsets.UTF_8));
+                    runOnUiThread(() -> {
+                        busy = false;
+                        unrealMeshEdits.put(UnrealModels.key(ref.pak, ref.path, ref.export), new Object[]{ref, edit});
+                        close.run(); render();
+                        android.widget.Toast.makeText(this, "Model updated: " + edit.moved + " point(s) moved, " + edit.hiddenCount + " face(s) removed. " +
+                                "Save… → New OBB to put it in the game.", android.widget.Toast.LENGTH_LONG).show();
+                        viewUnrealModel(ref);
+                    });
+                } catch (Exception | OutOfMemoryError e) {
+                    String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                    runOnUiThread(() -> {
+                        busy = false; summary.setText("Couldn't use that OBJ");
+                        new AlertDialog.Builder(this).setTitle("Couldn't use that OBJ").setMessage(why).setPositiveButton("OK", null).show();
+                    });
+                }
+            });
         } else if (request == PICK_DECAL && pendingDecal != null) {
             UnityViewer.ImageCallback cb = pendingDecal;
             pendingDecal = null;
@@ -971,7 +1005,7 @@ public class MainActivity extends Activity {
                   (mgsPainted.isEmpty() ? ")" : ", " + mgsPainted.size() + " painted — tap rebuild to save)"));
         if (trpInfo != null) location.setText("/TROPHY.TRP   (" + displayed.size() + " files)");
         if (unrealInfo != null) location.setText("/Unreal   (" + displayed.size() + " packages, " + unrealInfo.textures + " textures" +
-                (unrealPainted.isEmpty() ? ")" : ", " + unrealPainted.size() + " painted — tap rebuild to save)"));
+                (unrealPainted.isEmpty() && unrealMeshEdits.isEmpty() ? ")" : ", " + (unrealPainted.size() + unrealMeshEdits.size()) + " changed in the 3D viewer — tap rebuild to save)"));
         if (unityInfo != null) location.setText("/Unity   (" + displayed.size() + " bundles, " + unityInfo.textures + " textures" +
                 (unityPainted.isEmpty() ? ")" : ", " + unityPainted.size() + " painted — tap rebuild to save)"));
         if (rpaInfo != null) location.setText("/RPA   (" + displayed.size() + " files, " + human(rpaInfo.totalBytes) + ")");
@@ -2260,6 +2294,9 @@ public class MainActivity extends Activity {
             }
             @Override public int paintedCount() { return mgsPainted.size(); }
             @Override public void buildPainted() { prepareMgsEdits(null); }
+            @Override public boolean canImportObj() { return false; }
+            @Override public void importObj(UnityViewer.Data d, Runnable close) { }
+            @Override public void revertMesh(UnityViewer.Data d, Runnable close) { }
         };
     }
 
@@ -3341,10 +3378,12 @@ public class MainActivity extends Activity {
                 for (Map.Entry<String, Object[]> e : unrealPainted.entrySet()) painted.put(e.getKey(), (int[]) e.getValue()[2]);
                 try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
                      FileChannel channel = stream.getChannel()) {
-                    data = UnityViewer.loadUnreal(reopenUnreal(channel, info), ref, painted);
+                    Object[] me = unrealMeshEdits.get(UnrealModels.key(ref.pak, ref.path, ref.export));
+                    data = UnityViewer.loadUnreal(reopenUnreal(channel, info), ref, painted, me == null ? null : (ObjEdit.Edit) me[1]);
                 }
                 runOnUiThread(() -> {
                     busy = false; render(); summary.setText(info.description());
+                    viewingUnrealMesh = ref;
                     UnityViewer.show(this, data, viewerHost(true));
                 });
             } catch (Exception | OutOfMemoryError e) {
@@ -3359,7 +3398,7 @@ public class MainActivity extends Activity {
 
     /** Encodes painted Unreal textures into their packages and asks where to save the new OBB / pak. */
     private void buildPaintedUnreal() {
-        if (busy || unrealInfo == null || unrealPainted.isEmpty() || imageUri == null) return;
+        if (busy || unrealInfo == null || unrealPainted.isEmpty() && unrealMeshEdits.isEmpty() || imageUri == null) return;
         final UnrealObb.Info info = unrealInfo;
         final List<Object[]> painted = new ArrayList<>(unrealPainted.values());
         busy = true; render();
@@ -3371,10 +3410,10 @@ public class MainActivity extends Activity {
                 try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor()); FileChannel channel = stream.getChannel()) {
                     addUnrealPainted(reopenUnreal(channel, info), changed, painted);
                 }
-                final int count = painted.size();
+                final int count = painted.size() + unrealMeshEdits.size();
                 runOnUiThread(() -> {
                     busy = false; render();
-                    summary.setText(count + " texture(s) ready");
+                    summary.setText(count + " change(s) ready");
                     unrealChanged = changed; unityEditCount = count;
                     Intent save = new Intent(Intent.ACTION_CREATE_DOCUMENT);
                     save.addCategory(Intent.CATEGORY_OPENABLE);
@@ -3405,6 +3444,19 @@ public class MainActivity extends Activity {
             byte[] bytes = pkgs.get(pi.path);
             if (bytes == null) { bytes = live.paks.get(pi.pak).pak.read(UnrealObb.entry(live, pi)); pkgs.put(pi.path, bytes); }
             UnrealObb.patch(bytes, t, (int[]) p[2], t.width, t.height);
+        }
+        // models edited with "Import edited OBJ"
+        for (Object[] me : new ArrayList<>(unrealMeshEdits.values())) {
+            UnrealModels.MeshRef ref = (UnrealModels.MeshRef) me[0];
+            runOnUiThread(() -> summary.setText("Writing edited model " + ref.name + "..."));
+            Map<String, byte[]> pkgs = changed.computeIfAbsent(ref.pak, k -> new java.util.LinkedHashMap<>());
+            byte[] bytes = pkgs.get(ref.path);
+            if (bytes == null) {
+                UnrealPak pak = live.paks.get(ref.pak).pak;
+                bytes = pak.read(pak.byName.get(ref.path)); pkgs.put(ref.path, bytes);
+            }
+            UnrealAssets.Package pk = UnrealAssets.parse(bytes);
+            UnrealModels.writeEdit(bytes, pk, pk.exports.get(ref.export), (ObjEdit.Edit) me[1]);
         }
     }
 
@@ -3581,9 +3633,10 @@ public class MainActivity extends Activity {
                         }
                         // textures painted in the 3D viewer win over a PNG of the same texture
                         List<Object[]> painted = new ArrayList<>(unrealPainted.values());
-                        if (!painted.isEmpty()) {
+                        if (!painted.isEmpty() || !unrealMeshEdits.isEmpty()) {
                             addUnrealPainted(live, changed, painted);
                             for (Object[] p : painted) edited.add(((UnrealAssets.Texture) p[1]).name + " (painted in 3D viewer)");
+                            for (Object[] me : unrealMeshEdits.values()) edited.add(((UnrealModels.MeshRef) me[0]).name + " (model edited from OBJ)");
                         }
                     }
                 }
@@ -3914,8 +3967,24 @@ public class MainActivity extends Activity {
                 (unreal ? unrealPainted : unityPainted).put(key, new Object[]{texInfo[0], texInfo[1], pixels});
                 render();
             }
-            @Override public int paintedCount() { return (unreal ? unrealPainted : unityPainted).size(); }
+            @Override public int paintedCount() { return unreal ? unrealPainted.size() + unrealMeshEdits.size() : unityPainted.size(); }
             @Override public void buildPainted() { if (unreal) buildPaintedUnreal(); else buildPaintedObb(null); }
+            @Override public boolean canImportObj() { return unreal; }
+            @Override public void importObj(UnityViewer.Data d, Runnable close) {
+                if (!unreal || viewingUnrealMesh == null) return;
+                pendingObjData = d; pendingObjClose = close;
+                Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                pick.addCategory(Intent.CATEGORY_OPENABLE);
+                pick.setType("*/*");
+                startActivityForResult(pick, PICK_OBJ);
+            }
+            @Override public void revertMesh(UnityViewer.Data d, Runnable close) {
+                UnrealModels.MeshRef ref = viewingUnrealMesh;
+                if (!unreal || ref == null) return;
+                unrealMeshEdits.remove(UnrealModels.key(ref.pak, ref.path, ref.export));
+                close.run(); render();
+                viewUnrealModel(ref);
+            }
         };
     }
 
@@ -3965,11 +4034,11 @@ public class MainActivity extends Activity {
     private void startUnityRebuild() {
         if (busy) return;
         if (mgsInfo != null && !mgsInfo.face) { startMgsRebuild(); return; }
-        if (unrealInfo != null && !unrealPainted.isEmpty()) {
+        if (unrealInfo != null && (!unrealPainted.isEmpty() || !unrealMeshEdits.isEmpty())) {
             new AlertDialog.Builder(this).setTitle("Rebuild")
-                    .setMessage(unrealPainted.size() + " texture(s) painted in the 3D viewer will be included. Add edited PNGs from an " +
+                    .setMessage((unrealPainted.size() + unrealMeshEdits.size()) + " change(s) from the 3D viewer (painted textures, edited models) will be included. Add edited PNGs from an " +
                             "extracted folder too? (If the same texture is in both, the painted version wins.)")
-                    .setNegativeButton("Painted only", (d, w) -> buildPaintedUnreal())
+                    .setNegativeButton("Viewer changes only", (d, w) -> buildPaintedUnreal())
                     .setPositiveButton("Also pick a folder", (d, w) -> {
                         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
                         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);

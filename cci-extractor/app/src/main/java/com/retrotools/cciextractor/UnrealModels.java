@@ -28,6 +28,7 @@ final class UnrealModels {
     static final class Loaded {
         UnityModels.Mesh mesh;
         String[] partMaterial;
+        Raw raw;
     }
 
     static boolean isMeshClass(String cls) { return "SkeletalMesh".equals(cls) || "StaticMesh".equals(cls); }
@@ -49,6 +50,9 @@ final class UnrealModels {
         int[] indices;
         float[] pos, normal, uv; // Unreal space, uv as stored
         int vertexCount, end;
+        // where things are in the package, for writing edits back
+        int vertAt, stride, normalAt, posInVert = -1, posAt = -1, uvAt, idxAt, idxEs, boundsAt = -1;
+        boolean shortNormals, fullUv;
     }
 
     private static int count(UnrealAssets.Le r, int max) throws IOException {
@@ -62,8 +66,9 @@ final class UnrealModels {
         UnrealAssets.properties(r, pk);
         if (r.i32() != 0) r.skip(16);                 // object guid
         r.skip(2);                                    // strip flags
-        r.skip(28);                                   // imported bounds
         Raw m = new Raw();
+        m.boundsAt = r.p;
+        r.skip(28);                                   // imported bounds
         int mats = count(r, 1000);
         m.matObject = new int[mats];
         for (int i = 0; i < mats; i++) { m.matObject[i] = r.i32(); r.skip(8 + 24); }  // material, slot name, uv density / flags
@@ -88,6 +93,7 @@ final class UnrealModels {
         r.u8();
         int es = r.i32(), n = count(r, 1 << 26);
         if (es != 2 && es != 4) throw new IOException("Bad index size " + es);
+        m.idxAt = r.p; m.idxEs = es;
         m.indices = indices(r, es, n);
         int a = count(r, 1 << 20); r.skip(a * 2);                 // active bones
         r.i32();
@@ -103,6 +109,7 @@ final class UnrealModels {
         if (uvs < 1 || uvs > 8 || es != 20 + uvSize * uvs || n != nv || n < 0 || n > 1 << 24)
             throw new IOException("Unexpected skinned vertex layout");
         r.need(es * n);
+        m.vertAt = r.p; m.stride = es; m.normalAt = 4; m.posInVert = 8; m.uvAt = 20; m.fullUv = full;
         vertices(m, d, r.p, n, es, 4, false, 8, 20, full);
         r.skip(es * n);
         m.end = r.p;
@@ -144,6 +151,7 @@ final class UnrealModels {
         if (n != nv || nv2 != nv || es != stride2 || uvs < 1 || uvs > 8 || es != tb + (full ? 8 : 4) * uvs)
             throw new IOException("Unexpected static vertex layout");
         r.need(es * n);
+        m.posAt = posAt; m.vertAt = r.p; m.stride = es; m.normalAt = hp ? 8 : 4; m.shortNormals = hp; m.uvAt = tb; m.fullUv = full;
         m.pos = new float[nv * 3];
         for (int i = 0; i < nv * 3; i++) m.pos[i] = Float.intBitsToFloat(le32(d, posAt + i * 4));
         vertices(m, d, r.p, n, es, hp ? 8 : 4, hp, -1, tb, full);
@@ -154,6 +162,7 @@ final class UnrealModels {
         boolean b32 = r.i32() != 0;
         if (r.i32() != 1) throw new IOException("Unexpected index buffer");
         int bytes = count(r, 1 << 28);
+        m.idxAt = r.p; m.idxEs = b32 ? 4 : 2;
         m.indices = indices(r, b32 ? 4 : 2, bytes / (b32 ? 4 : 2));
         m.matObject = new int[mats.size()];
         for (int i = 0; i < mats.size(); i++) m.matObject[i] = mats.get(i);
@@ -213,6 +222,7 @@ final class UnrealModels {
         int secs = raw.sectionMat.length;
         mesh.parts = new int[secs][];
         Loaded out = new Loaded();
+        out.raw = raw;
         out.partMaterial = new String[secs];
         for (int s = 0; s < secs; s++) {
             long base = raw.sectionBase[s] & 0xffffffffL, len = (raw.sectionTris[s] & 0xffffffffL) * 3;
@@ -229,6 +239,94 @@ final class UnrealModels {
         }
         out.mesh = mesh;
         return out;
+    }
+
+    // ------------------------------------------------------------------ writing a model edit back
+    /**
+     * Writes an {@link ObjEdit.Edit} (viewer convention, for this mesh's LOD 0) into the package in place:
+     * positions, normals (the packed tangent-Z; tangent-X and skin weights stay), the first UV set, and deleted
+     * faces as zero-area triangles. Skinned meshes also get their bounds widened if the edit grew the model.
+     * The package keeps its exact size.
+     */
+    static void writeEdit(byte[] d, UnrealAssets.Package pk, UnrealAssets.Export x, ObjEdit.Edit e) throws IOException {
+        Loaded l = mesh(d, pk, x);
+        Raw m = l.raw;
+        int n = m.vertexCount;
+        if (e.pos.length != n * 3 || e.hidden.length != m.sectionMat.length) throw new IOException("The edit doesn't match this model");
+        float[] lo = {Float.MAX_VALUE, Float.MAX_VALUE, Float.MAX_VALUE}, hi = {-Float.MAX_VALUE, -Float.MAX_VALUE, -Float.MAX_VALUE};
+        for (int i = 0; i < n; i++) {
+            // viewer (-x, z, y) back to Unreal (x, y, z)
+            float ux = -e.pos[i * 3], uy = e.pos[i * 3 + 2], uz = e.pos[i * 3 + 1];
+            float nx = -e.normal[i * 3], ny = e.normal[i * 3 + 2], nz = e.normal[i * 3 + 1];
+            float[] up = {ux, uy, uz};
+            for (int k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], up[k]); hi[k] = Math.max(hi[k], up[k]); }
+            int v = m.vertAt + i * m.stride;
+            int pAt = m.posInVert >= 0 ? v + m.posInVert : m.posAt + i * 12;
+            for (int k = 0; k < 3; k++) putF(d, pAt + 4 * k, up[k]);
+            float[] nn = {nx, ny, nz};
+            for (int k = 0; k < 3; k++) {
+                if (m.shortNormals) {
+                    int q = Math.round(Math.max(-1f, Math.min(1f, nn[k])) * 32767f);
+                    d[v + m.normalAt + 2 * k] = (byte) q; d[v + m.normalAt + 2 * k + 1] = (byte) (q >> 8);
+                } else d[v + m.normalAt + k] = (byte) Math.round((Math.max(-1f, Math.min(1f, nn[k])) + 1f) * 127.5f);
+            }
+            if (e.uv != null) {
+                float u = e.uv[i * 2], vv = 1f - e.uv[i * 2 + 1];
+                if (m.fullUv) { putF(d, v + m.uvAt, u); putF(d, v + m.uvAt + 4, vv); }
+                else { putH(d, v + m.uvAt, u); putH(d, v + m.uvAt + 2, vv); }
+            }
+        }
+        for (int s = 0; s < e.hidden.length; s++) {
+            if (e.hidden[s].length != m.sectionTris[s]) throw new IOException("The edit doesn't match this model's parts");
+            for (int t = 0; t < e.hidden[s].length; t++) {
+                if (!e.hidden[s][t]) continue;
+                int at = m.idxAt + (m.sectionBase[s] + t * 3) * m.idxEs;
+                int first = m.indices[m.sectionBase[s] + t * 3];
+                for (int k = 1; k < 3; k++) {
+                    if (m.idxEs == 2) { d[at + 2 * k] = (byte) first; d[at + 2 * k + 1] = (byte) (first >> 8); }
+                    else putI(d, at + 4 * k, first);
+                }
+            }
+        }
+        if (m.boundsAt >= 0 && n > 0) {
+            // FBoxSphereBounds: origin, box extent, sphere radius; widen to cover the edit
+            float[] o = new float[3], ex = new float[3];
+            for (int k = 0; k < 3; k++) { o[k] = getF(d, m.boundsAt + 4 * k); ex[k] = getF(d, m.boundsAt + 12 + 4 * k); }
+            float r = getF(d, m.boundsAt + 24);
+            boolean grow = false;
+            for (int k = 0; k < 3; k++) if (lo[k] < o[k] - ex[k] || hi[k] > o[k] + ex[k]) grow = true;
+            if (grow) {
+                float r2 = 0;
+                for (int k = 0; k < 3; k++) {
+                    float a = Math.min(lo[k], o[k] - ex[k]), b = Math.max(hi[k], o[k] + ex[k]);
+                    o[k] = (a + b) / 2; ex[k] = (b - a) / 2; r2 += ex[k] * ex[k];
+                }
+                for (int k = 0; k < 3; k++) { putF(d, m.boundsAt + 4 * k, o[k]); putF(d, m.boundsAt + 12 + 4 * k, ex[k]); }
+                putF(d, m.boundsAt + 24, Math.max(r, (float) Math.sqrt(r2)));
+            }
+        }
+    }
+
+    private static void putI(byte[] d, int p, int v) { d[p] = (byte) v; d[p + 1] = (byte) (v >> 8); d[p + 2] = (byte) (v >> 16); d[p + 3] = (byte) (v >> 24); }
+    private static void putF(byte[] d, int p, float f) { putI(d, p, Float.floatToIntBits(f)); }
+    private static float getF(byte[] d, int p) { return Float.intBitsToFloat(le32(d, p)); }
+    private static void putH(byte[] d, int p, float f) { int h = toHalf(f); d[p] = (byte) h; d[p + 1] = (byte) (h >> 8); }
+
+    /** float → IEEE half, round to nearest even. */
+    static int toHalf(float f) {
+        int b = Float.floatToIntBits(f), sign = (b >>> 16) & 0x8000, exp = ((b >>> 23) & 0xff) - 127 + 15, mant = b & 0x7fffff;
+        if (((b >>> 23) & 0xff) == 0xff) return sign | 0x7c00 | (mant != 0 ? 0x200 : 0);
+        if (exp >= 31) return sign | 0x7c00;
+        if (exp <= 0) {
+            if (exp < -10) return sign;
+            mant |= 0x800000;
+            int shift = 14 - exp, half = mant >> shift, rem = mant & ((1 << shift) - 1), mid = 1 << (shift - 1);
+            if (rem > mid || (rem == mid && (half & 1) != 0)) half++;
+            return sign | half;
+        }
+        int half = (exp << 10) | (mant >> 13), rem = mant & 0x1fff;
+        if (rem > 0x1000 || (rem == 0x1000 && (half & 1) != 0)) half++;
+        return sign | half;
     }
 
     // ------------------------------------------------------------------ materials

@@ -1,6 +1,37 @@
-# Game Asset Extractor (Android v0.24.0)
+# Game Asset Extractor (Android v0.25.0)
 
-## New in v0.24: Metal Gear Solid 3D models, painting and putting textures back
+## New in v0.25: edit Unreal models in Blender and put them back
+
+In the 3D viewer, use **Save… → Model as OBJ** and open the file in Blender (or another 3D program that keeps point order). You can then:
+- move or sculpt points,
+- change UVs,
+- delete faces (e.g. a bag or a bracelet).
+
+Export as OBJ again, then in the viewer use **Save… → Import edited OBJ…**. The viewer reopens with the new shape, and **Save… → New OBB with your changes** writes it into the game together with any painted textures. **Undo model edit** goes back to the original shape.
+
+What can't go back: adding or removing points (subdivide, remesh, dyntopo, merge by distance) or adding faces. Every point in a game model also carries skeleton weights that the OBJ doesn't have, and the file has to stay the same size. The app refuses such an OBJ with a message saying what's wrong. Moved points keep their original weights, so they still animate with the bone they belonged to.
+
+How it works:
+- **Export:** the OBJ has one point per position, so sculpting doesn't tear UV seams open, and one UV per original vertex.
+- **Import:** points are matched by order. Faces are matched by their three points, which ties each corner back to its original vertex and UV. A face missing from the OBJ is removed (written as a zero-area triangle). A double-sided face, i.e. the same three points used twice, counts as one face, because 3D programs merge such pairs.
+- **Normals:** recomputed around moved points; elsewhere they stay as they were.
+- **Exact values:** points that moved less than the OBJ's text rounding keep their exact original values.
+- **Writing back:** positions, normals and UVs go into the cooked LOD 0 vertex buffer in place. Deleted faces become zero-area triangles. A skinned model's bounds are widened if the model grew. The package and the OBB keep their exact sizes.
+
+**How it was checked:**
+- Max (Life is Strange) was exported by the app's code and opened in real **Blender 5.3** (its Python module) with default import settings.
+- Her shoes were made 40% bigger and every bag face was deleted, then the model was exported with Blender's default settings.
+- Blender kept all 13,854 points in their original order. The import found exactly the 2,295 deleted bag faces, and the edit read back from the package with no position or UV error.
+- The rebuilt pak is the original size. repak reads all 27,835 files, and only Max's model changed (same size).
+- An independent render from repak's copy shows Max with no bag or strap and bigger shoes.
+- The CI test covers the round trip, the edge cases (extra points, new faces, quads, normals in the OBJ, double-sided faces), bounds and half-float UVs.
+
+**Limits:**
+- Only the nearest level of detail (LOD 0) is changed, so from far away the game may still show the old shape.
+- Skinned bounds only grow, never shrink.
+- Unity models can be exported but not imported back yet.
+
+## v0.24: Metal Gear Solid 3D models, painting and putting textures back
 
 Open **STAGE.DIR**, tap an area, then **View 3D models**. Every model in the area is listed (biggest first) and opens in the same 3D viewer as Unity and Unreal games: rotate, zoom, see the texture layout, and paint designs onto the model. Edits show on the model straight away.
 
@@ -23,7 +54,7 @@ Textures keep their size. Black is see-through in this game (it's how the game i
 **Not yet tested:** the edited game running in an emulator or on a console. Try it on a copy of your disc image first.
 
 
-## New in v0.23: Metal Gear Solid textures and codec portraits (STAGE.DIR, FACE.DAT)
+## v0.23: Metal Gear Solid textures and codec portraits (STAGE.DIR, FACE.DAT)
 
 Metal Gear Solid (PS1) keeps almost all of its graphics in two files on the disc, in Konami's own formats rather than standard PS1 TIM images. Extract them from the disc image first (open the `.bin`, Extract all), then open them here with **Open ROM**:
 
