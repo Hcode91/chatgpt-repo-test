@@ -66,7 +66,10 @@ final class UnityTextures {
 
     // ---------------------------------------------------------------- decode
     /** Decodes mip 0 into top-down ARGB. Single-channel formats come out as opaque grey (value → brightness). */
-    static int[] decode(byte[] data, int f, int w, int h) throws IOException {
+    static int[] decode(byte[] data, int f, int w, int h) throws IOException { return decode(data, f, w, h, true); }
+
+    /** {@code bottomUp}: rows stored bottom row first (Unity); false for top-down storage (Unreal). */
+    static int[] decode(byte[] data, int f, int w, int h, boolean bottomUp) throws IOException {
         if (!supported(f)) throw new IOException("Unsupported texture format " + name(f));
         if (w <= 0 || h <= 0 || (long) w * h > 64L << 20) throw new IOException("Bad texture size " + w + "x" + h);
         long need = levelSize(f, w, h);
@@ -85,7 +88,7 @@ final class UnityTextures {
                     if (sx >= w || sy >= h) continue;
                     int c = px[y * 4 + x];
                     if (f == ETC2_RGBA8) c = (c & 0xFFFFFF) | (alpha[x * 4 + y] << 24);
-                    out[(h - 1 - sy) * w + sx] = c;
+                    out[(bottomUp ? h - 1 - sy : sy) * w + sx] = c;
                 }
             }
             return out;
@@ -105,7 +108,7 @@ final class UnityTextures {
                 case RGBA4444: { int v = b0 | (b1 << 8); c = ((v & 15) * 17 << 24) | ((v >> 12) * 17 << 16) | (((v >> 8) & 15) * 17 << 8) | (((v >> 4) & 15) * 17); break; }
                 default: throw new IOException("Unsupported texture format " + name(f));
             }
-            out[(h - 1 - sy) * w + x] = c;
+            out[(bottomUp ? h - 1 - sy : sy) * w + x] = c;
         }
         return out;
     }
@@ -211,7 +214,7 @@ final class UnityTextures {
         for (int l = 0; l < mips; l++) {
             int tw = Math.max(1, w >> l), th = Math.max(1, h >> l);
             if (l > 0) { level = downsample(level, lw, lh, tw, th); lw = tw; lh = th; }
-            at = encodeLevel(level, lw, lh, f, out, at);
+            at = encodeLevel(level, lw, lh, f, out, at, true);
         }
         if (at != out.length) throw new IOException("Internal error: encoded size mismatch");
         return out;
@@ -237,7 +240,16 @@ final class UnityTextures {
 
     private static int lum(int c) { return (((c >> 16) & 255) * 299 + ((c >> 8) & 255) * 587 + (c & 255) * 114 + 500) / 1000; }
 
-    private static int encodeLevel(int[] img, int w, int h, int f, byte[] out, int at) {
+    /** One level, rows top-down (Unreal). */
+    static byte[] encodeTopDown(int[] argb, int w, int h, int f) throws IOException {
+        if (!supported(f)) throw new IOException("Can't write texture format " + name(f));
+        if (argb.length != w * h) throw new IOException("Image size mismatch");
+        byte[] out = new byte[(int) levelSize(f, w, h)];
+        encodeLevel(argb, w, h, f, out, 0, false);
+        return out;
+    }
+
+    private static int encodeLevel(int[] img, int w, int h, int f, byte[] out, int at, boolean bottomUp) {
         int bb = blockBytes(f);
         if (bb > 0) {
             int bw = (w + 3) / 4, bh = (h + 3) / 4;
@@ -245,7 +257,7 @@ final class UnityTextures {
             for (int by = 0; by < bh; by++) for (int bx = 0; bx < bw; bx++) {
                 for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) {
                     int sx = Math.min(w - 1, bx * 4 + x), sy = Math.min(h - 1, by * 4 + y); // edge pixels repeat
-                    int c = img[(h - 1 - sy) * w + sx];
+                    int c = img[(bottomUp ? h - 1 - sy : sy) * w + sx];
                     px[y * 4 + x] = c | 0xFF000000;
                     alpha[x * 4 + y] = c >>> 24;
                 }
@@ -257,7 +269,7 @@ final class UnityTextures {
             return at;
         }
         for (int sy = 0; sy < h; sy++) for (int x = 0; x < w; x++) {
-            int c = img[(h - 1 - sy) * w + x];
+            int c = img[(bottomUp ? h - 1 - sy : sy) * w + x];
             int a = c >>> 24, r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
             switch (f) {
                 case ALPHA8: case R8: out[at++] = (byte) lum(c); break;
