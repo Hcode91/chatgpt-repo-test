@@ -24,7 +24,8 @@ import java.util.zip.ZipFile;
  *  - a synthetic OBB (fixtures/unity, built by gen_unity_fixture.py and cross-checked with UnityPy):
  *    scan, decode, patch three textures (one in a type-tree-stripped data.unity3d), rebuild, re-read,
  *  - a 2-part mesh (two vertex streams, half-float UVs, baseVertex) with its renderer's materials, one pointing
- *    at a texture in another bundle, against UnityPy's decoding.
+ *    at a texture in another bundle, against UnityPy's decoding,
+ *  - projection painting: placement, opacity, texture alpha kept, occlusion, back faces, seam padding, mirrored UVs.
  */
 public class UnityTest {
     static int checks = 0;
@@ -40,6 +41,7 @@ public class UnityTest {
         eacConstant();
         obb(dir);
         models(dir);
+        paint();
         System.out.println("UnityTest OK (" + checks + " checks)");
     }
 
@@ -317,5 +319,93 @@ public class UnityTest {
             check(obj.contains("v -1.000000 0.000000 0.000000") && obj.contains("g part2") && obj.contains("vt 0.500000 0.750000"), "OBJ export");
             check(UnityModels.half(0x3C00) == 1f && UnityModels.half(0xC000) == -2f && UnityModels.half(0x3800) == 0.5f, "half floats");
         }
+    }
+
+    // ------------------------------------------------------------------ projection painting
+    /** Quads in the XY plane at the given z, facing +z, all mapped to UV (u0,v0)-(u1,v1). */
+    static UnityModels.Mesh quads(float[] zs, float u0, float v0, float u1, float v1) {
+        UnityModels.Mesh m = new UnityModels.Mesh();
+        int n = zs.length;
+        m.vertexCount = n * 4; m.pos = new float[n * 12]; m.normal = new float[n * 12]; m.uv = new float[n * 8];
+        m.parts = new int[n][];
+        float[][] corner = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
+        float[][] uvc = {{u0, v0}, {u1, v0}, {u1, v1}, {u0, v1}};
+        for (int q = 0; q < n; q++) {
+            for (int c = 0; c < 4; c++) {
+                int v = q * 4 + c;
+                m.pos[v * 3] = corner[c][0]; m.pos[v * 3 + 1] = corner[c][1]; m.pos[v * 3 + 2] = zs[q];
+                m.normal[v * 3 + 2] = 1;
+                m.uv[v * 2] = uvc[c][0]; m.uv[v * 2 + 1] = uvc[c][1];
+            }
+            int b = q * 4;
+            m.parts[q] = new int[]{b, b + 1, b + 2, b, b + 2, b + 3};
+        }
+        m.min = new float[]{-1, -1, Float.MAX_VALUE}; m.max = new float[]{1, 1, -Float.MAX_VALUE};
+        for (float z : zs) { m.min[2] = Math.min(m.min[2], z); m.max[2] = Math.max(m.max[2], z); }
+        return m;
+    }
+
+    static UnityPaint.Decal red(UnityPaint.View3D v, float sizeFrac, float opacity) {
+        UnityPaint.Decal d = new UnityPaint.Decal();
+        d.w = 4; d.h = 4; d.argb = new int[16]; java.util.Arrays.fill(d.argb, 0xFFFF0000);
+        d.cx = v.width / 2f; d.cy = v.height / 2f; d.size = v.width * sizeFrac; d.opacity = opacity;
+        return d;
+    }
+
+    static void paint() {
+        int tw = 64, th = 64, grey = 0x80808080; // alpha 0x80 must survive
+        // 1) one quad facing the camera, full UV square; small red design in the middle
+        UnityPaint.Geometry g = new UnityPaint.Geometry(quads(new float[]{0}, 0, 0, 1, 1));
+        UnityPaint.View3D v = UnityPaint.camera(0, 0, 1, g.center, g.radius, 400, 400);
+        int[] px = new int[tw * th]; java.util.Arrays.fill(px, grey);
+        UnityPaint.Result r = UnityPaint.stamp(g, v, UnityPaint.depth(g, v, 400), red(v, 0.1f, 1), px, tw, th, java.util.Arrays.asList(0), java.util.Arrays.asList(0));
+        check(r.painted > 0 && !r.mirrored(), "stamp painted " + r.painted);
+        check(px[32 * tw + 32] == 0x80FF0000, "centre texel red with texture alpha kept: " + Integer.toHexString(px[32 * tw + 32]));
+        check(px[0] == grey && px[tw - 1] == grey && px[(th - 1) * tw] == grey, "corners untouched");
+        // the red patch is centred on the texture (screen centre → quad centre → UV 0.5)
+        int minX = tw, maxX = -1, minY = th, maxY = -1;
+        for (int y = 0; y < th; y++) for (int x = 0; x < tw; x++) if (px[y * tw + x] == 0x80FF0000) {
+            minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+        }
+        check(Math.abs((minX + maxX) / 2.0 - 31.5) <= 1 && Math.abs((minY + maxY) / 2.0 - 31.5) <= 1, "patch centred: x " + minX + ".." + maxX + " y " + minY + ".." + maxY);
+
+        // 2) opacity blends
+        java.util.Arrays.fill(px, 0xFF000000);
+        UnityPaint.stamp(g, v, UnityPaint.depth(g, v, 400), red(v, 0.1f, 0.5f), px, tw, th, java.util.Arrays.asList(0), java.util.Arrays.asList(0));
+        int c = px[32 * tw + 32];
+        check(Math.abs(((c >> 16) & 255) - 128) <= 1 && (c & 0xFFFF) == 0, "50% opacity: " + Integer.toHexString(c));
+
+        // 3) seen from behind: the quad faces away, nothing painted
+        UnityPaint.View3D back = UnityPaint.camera(180, 0, 1, g.center, g.radius, 400, 400);
+        java.util.Arrays.fill(px, grey);
+        r = UnityPaint.stamp(g, back, UnityPaint.depth(g, back, 400), red(back, 0.5f, 1), px, tw, th, java.util.Arrays.asList(0), java.util.Arrays.asList(0));
+        check(r.painted == 0, "back faces not painted");
+
+        // 4) occlusion + mirrored UVs: a second quad in front (z=0.5) with its own texture; the hidden one behind
+        //    shares UVs with a third quad far away
+        UnityPaint.Geometry g2 = new UnityPaint.Geometry(quads(new float[]{0, 0.5f}, 0, 0, 1, 1));
+        UnityPaint.View3D v2 = UnityPaint.camera(0, 0, 1, g2.center, g2.radius, 400, 400);
+        java.util.Arrays.fill(px, grey);
+        r = UnityPaint.stamp(g2, v2, UnityPaint.depth(g2, v2, 400), red(v2, 0.1f, 1), px, tw, th, java.util.Arrays.asList(0), java.util.Arrays.asList(0));
+        check(r.painted == 0, "hidden surface not painted (" + r.painted + ")");
+        // painting the front one, whose texture area is also used by the hidden one 0.5 away → mirrored warning
+        java.util.Arrays.fill(px, grey);
+        r = UnityPaint.stamp(g2, v2, UnityPaint.depth(g2, v2, 400), red(v2, 0.1f, 1), px, tw, th, java.util.Arrays.asList(1), java.util.Arrays.asList(0, 1));
+        check(r.painted > 0 && r.mirrored(), "shared UV area reported (" + r.shared + "/" + r.painted + ")");
+
+        // 5) seam padding: island covers the middle of the texture only; painting its whole area pads 2 texels out
+        UnityPaint.Geometry g3 = new UnityPaint.Geometry(quads(new float[]{0}, 0.25f, 0.25f, 0.75f, 0.75f));
+        UnityPaint.View3D v3 = UnityPaint.camera(0, 0, 1, g3.center, g3.radius, 400, 400);
+        java.util.Arrays.fill(px, grey);
+        UnityPaint.stamp(g3, v3, UnityPaint.depth(g3, v3, 400), red(v3, 1.5f, 1), px, tw, th, java.util.Arrays.asList(0), java.util.Arrays.asList(0));
+        check(px[32 * tw + 16] == 0x80FF0000, "island edge painted");
+        check(px[32 * tw + 15] == 0x80FF0000 && px[32 * tw + 14] == 0x80FF0000, "2-texel padding outside the island");
+        check(px[32 * tw + 13] == grey && px[0] == grey, "padding stops after 2 texels");
+
+        // 6) the camera matches a hand-checked projection: model centre lands mid-screen
+        float[] s = UnityPaint.project(v, 0, 0, 0);
+        check(Math.abs(s[0] - 200) < 0.01 && Math.abs(s[1] - 200) < 0.01, "centre projects to screen centre");
+        float[] right = UnityPaint.project(v, 1, 0, 0);
+        check(right[0] > 200 && Math.abs(right[1] - 200) < 0.01, "+x is to the right");
     }
 }

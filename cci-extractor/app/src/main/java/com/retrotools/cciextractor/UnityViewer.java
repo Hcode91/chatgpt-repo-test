@@ -7,6 +7,7 @@ import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.DashPathEffect;
 import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Path;
@@ -20,6 +21,7 @@ import android.view.View;
 import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.SeekBar;
 import android.widget.TextView;
 
 import java.io.ByteArrayOutputStream;
@@ -27,39 +29,65 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
 
 /**
- * Full-screen model viewer for a Unity mesh: 3D (drag to rotate, pinch to zoom, double-tap to reset) with each
- * part drawn in its material's main texture, and a UV view that outlines where each part sits on its texture.
+ * Full-screen model viewer for a Unity mesh:
+ *  - 3D: drag to rotate, pinch to zoom, double-tap to reset; each part in its material's main texture;
+ *  - UV: where each part sits on its texture;
+ *  - Paint: place a design over the model (move / pinch / twist, opacity) and project it onto the texture.
  */
 final class UnityViewer {
 
     /** Everything the viewer needs, loaded off the UI thread. */
     static final class Data {
         UnityModels.Mesh mesh;
+        UnityPaint.Geometry geometry;
         String[] partNames;          // material name per part
-        Bitmap[] partTexture;        // texture per part (shared objects), null = none
+        String[] partKey;            // texture key per part ("bundle|file|pathId"), null = none
         String[] partTextureName;
-        String note;                 // anything that couldn't be loaded
+        final Map<String, Bitmap> bitmaps = new HashMap<>();   // shown (premultiplied)
+        final Map<String, int[]> pixels = new HashMap<>();     // straight ARGB, original or painted
+        final Map<String, Object[]> texInfo = new HashMap<>(); // {BundleInfo, Texture}
+        String note;
+        Bitmap bitmap(int part) { return part < 0 || partKey[part] == null ? null : bitmaps.get(partKey[part]); }
     }
 
-    interface Saver { void save(String suggestedName, String mime, byte[] data); }
+    interface ImageCallback { void got(int[] argb, int w, int h); }
 
-    /** Loads mesh, materials and textures. Call on a worker thread. */
-    static Data load(java.nio.channels.FileChannel ch, UnityObb.Info info, UnityModels.Model model) throws Exception {
+    /** What the viewer asks of the activity. */
+    interface Host {
+        void save(String suggestedName, String mime, byte[] data);
+        void pickImage(ImageCallback callback);
+        /** A texture was painted (or undone): remember it for the next rebuild. */
+        void painted(String key, Object[] texInfo, int[] pixels);
+        int paintedCount();
+        /** Encode every painted texture and save a new OBB. */
+        void buildPainted();
+    }
+
+    static String key(UnityModels.Ref r) { return r.bundle + "|" + r.file + "|" + r.pathId; }
+
+    /** Loads mesh, materials and textures. Call on a worker thread. {@code painted}: textures already painted. */
+    static Data load(java.nio.channels.FileChannel ch, UnityObb.Info info, UnityModels.Model model, Map<String, int[]> painted) throws Exception {
         Data d = new Data();
         d.mesh = UnityModels.mesh(ch, info, model.mesh);
+        d.geometry = new UnityPaint.Geometry(d.mesh);
         int parts = d.mesh.parts.length;
         d.partNames = new String[parts];
-        d.partTexture = new Bitmap[parts];
+        d.partKey = new String[parts];
         d.partTextureName = new String[parts];
-        java.util.Map<UnityModels.Ref, Bitmap> cache = new java.util.HashMap<>();
-        java.util.Map<UnityModels.Ref, UnityModels.Material> mats = new java.util.HashMap<>();
+        Map<UnityModels.Ref, UnityModels.Material> mats = new HashMap<>();
         int missing = 0;
         for (int p = 0; p < parts; p++) {
             UnityModels.Ref mref = model.materials.isEmpty() ? null : model.materials.get(Math.min(p, model.materials.size() - 1));
@@ -74,85 +102,132 @@ final class UnityViewer {
             Object[] tex = mat == null ? null : UnityObb.texture(info, mat.texture);
             if (tex == null) { missing++; continue; }
             UnityBundle.Texture t = (UnityBundle.Texture) tex[1];
+            String k = key(mat.texture);
             d.partTextureName[p] = t.name + " (" + UnityTextures.name(t.format) + " " + t.width + "×" + t.height + ")";
-            if (!cache.containsKey(mat.texture)) {
-                Bitmap bmp = null;
-                if (cache.size() < 24 && UnityTextures.supported(t.format)) {
+            if (!d.texInfo.containsKey(k)) {
+                d.texInfo.put(k, tex);
+                if (d.pixels.size() < 24 && UnityTextures.supported(t.format)) {
                     try {
-                        int[] argb = UnityTextures.decode(UnityObb.readTexture(ch, (UnityObb.BundleInfo) tex[0], t), t.format, t.width, t.height);
-                        bmp = Bitmap.createBitmap(t.width, t.height, Bitmap.Config.ARGB_8888);
+                        int[] argb = painted != null && painted.containsKey(k) ? painted.get(k).clone()
+                                : UnityTextures.decode(UnityObb.readTexture(ch, (UnityObb.BundleInfo) tex[0], t), t.format, t.width, t.height);
+                        Bitmap bmp = Bitmap.createBitmap(t.width, t.height, Bitmap.Config.ARGB_8888);
                         bmp.setPixels(argb, 0, t.width, 0, 0, t.width, t.height);
-                    } catch (Exception | OutOfMemoryError e) { bmp = null; }
+                        d.pixels.put(k, argb);
+                        d.bitmaps.put(k, bmp);
+                    } catch (Exception | OutOfMemoryError ignored) { }
                 }
-                cache.put(mat.texture, bmp);
             }
-            d.partTexture[p] = cache.get(mat.texture);
-            if (d.partTexture[p] == null) missing++;
+            if (d.bitmaps.containsKey(k)) d.partKey[p] = k; else missing++;
         }
         if (d.mesh.uv == null) d.note = "This mesh has no texture coordinates.";
         else if (missing > 0) d.note = missing + " part(s) have no texture that could be found or decoded; they're shown grey.";
         return d;
     }
 
-    static void show(Activity activity, Data d, Saver saver) {
+    // ================================================================== screen
+    static void show(Activity activity, Data d, Host host) {
         Dialog dialog = new Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen);
         LinearLayout root = new LinearLayout(activity);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.rgb(20, 24, 40));
         float density = activity.getResources().getDisplayMetrics().density;
+        int pad = (int) (12 * density);
+        ExecutorService work = Executors.newSingleThreadExecutor();
 
         TextView title = new TextView(activity);
         title.setText(d.mesh.name + " · " + d.mesh.vertexCount + " vertices · " + d.mesh.parts.length + " part" + (d.mesh.parts.length == 1 ? "" : "s"));
         title.setTextColor(Color.WHITE); title.setTextSize(15);
-        title.setPadding((int) (12 * density), (int) (10 * density), (int) (12 * density), (int) (4 * density));
+        title.setPadding(pad, (int) (10 * density), pad, (int) (4 * density));
         root.addView(title);
 
         LinearLayout bar = new LinearLayout(activity);
         Button mode = new Button(activity), part = new Button(activity), save = new Button(activity), close = new Button(activity);
         for (Button b : new Button[]{mode, part, save, close}) { b.setAllCaps(false); bar.addView(b, new LinearLayout.LayoutParams(0, (int) (46 * density), 1)); }
-        mode.setText("UV view"); part.setText("Part: all"); save.setText("Save…"); close.setText("Close");
+        part.setText("Part: all"); save.setText("Save…"); close.setText("Close");
         root.addView(bar);
 
         TextView info = new TextView(activity);
         info.setTextColor(Color.rgb(200, 210, 235)); info.setTextSize(12);
-        info.setPadding((int) (12 * density), (int) (2 * density), (int) (12 * density), (int) (6 * density));
+        info.setPadding(pad, (int) (2 * density), pad, (int) (6 * density));
         root.addView(info);
 
         FrameLayout stage = new FrameLayout(activity);
         root.addView(stage, new LinearLayout.LayoutParams(-1, 0, 1));
         ModelView gl = new ModelView(activity, d);
         UvView uv = new UvView(activity, d);
+        DecalView decal = new DecalView(activity);
         stage.addView(gl, new FrameLayout.LayoutParams(-1, -1));
         stage.addView(uv, new FrameLayout.LayoutParams(-1, -1));
+        stage.addView(decal, new FrameLayout.LayoutParams(-1, -1));
         uv.setVisibility(View.GONE);
+        decal.setVisibility(View.GONE);
+
+        // paint controls
+        LinearLayout paintPanel = new LinearLayout(activity);
+        paintPanel.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout pr1 = new LinearLayout(activity);
+        Button pick = new Button(activity), target = new Button(activity), apply = new Button(activity), undo = new Button(activity);
+        for (Button b : new Button[]{pick, target, apply, undo}) { b.setAllCaps(false); pr1.addView(b, new LinearLayout.LayoutParams(0, (int) (46 * density), 1)); }
+        pick.setText("Design…"); apply.setText("Apply"); undo.setText("Undo");
+        paintPanel.addView(pr1);
+        LinearLayout pr2 = new LinearLayout(activity);
+        pr2.setPadding(pad, 0, pad, 0);
+        TextView opLabel = new TextView(activity);
+        opLabel.setTextColor(Color.WHITE); opLabel.setTextSize(13); opLabel.setText("Opacity 100%");
+        SeekBar opacity = new SeekBar(activity);
+        opacity.setMax(100); opacity.setProgress(100);
+        pr2.addView(opLabel, new LinearLayout.LayoutParams((int) (110 * density), -2));
+        pr2.addView(opacity, new LinearLayout.LayoutParams(0, -2, 1));
+        paintPanel.addView(pr2);
+        paintPanel.setVisibility(View.GONE);
+        root.addView(paintPanel);
 
         TextView hint = new TextView(activity);
         hint.setTextColor(Color.rgb(150, 160, 190)); hint.setTextSize(11);
-        hint.setPadding((int) (12 * density), (int) (4 * density), (int) (12 * density), (int) (8 * density));
+        hint.setPadding(pad, (int) (4 * density), pad, (int) (8 * density));
         root.addView(hint);
 
         final int[] selected = {-1};
-        final boolean[] uvMode = {false};
+        final int[] screen = {0};        // 0 = 3D, 1 = UV, 2 = paint
+        final boolean[] busy = {false};
+        final ArrayDeque<Map<String, int[]>> undoStack = new ArrayDeque<>();
+        final String[] status = {null};
+
         Runnable refresh = () -> {
             int s = selected[0];
             int texPart = s >= 0 ? s : firstTextured(d);
             part.setText(s < 0 ? "Part: all" : "Part " + (s + 1) + "/" + d.mesh.parts.length);
             String line = s < 0 ? (d.mesh.parts.length + " parts. Pick a part to highlight it.")
                     : "Part " + (s + 1) + ": " + d.partNames[s] + " · " + (d.partTextureName[s] == null ? "no texture" : d.partTextureName[s]);
-            if (uvMode[0] && texPart >= 0 && d.partTextureName[texPart] != null && s < 0) line = "Texture: " + d.partTextureName[texPart] + ". Pick a part to see others.";
-            info.setText(line + (d.note == null ? "" : "\n" + d.note));
-            hint.setText(uvMode[0] ? "UV view: the selected part's outline (bright) on its texture; other parts on the same texture are dim. Pinch to zoom, drag to move."
+            if (screen[0] == 1 && texPart >= 0 && d.partTextureName[texPart] != null && s < 0)
+                line = "Texture: " + d.partTextureName[texPart] + ". Pick a part to see others.";
+            if (screen[0] == 2) line = (s < 0 ? "Painting onto every part under the design." : "Painting only part " + (s + 1) + ": " + d.partNames[s] + ".") +
+                    (status[0] != null ? "\n" + status[0] : "");
+            info.setText(line + (d.note == null || screen[0] == 2 ? "" : "\n" + d.note));
+            hint.setText(screen[0] == 1 ? "UV view: the selected part's outline (bright) on its texture; other parts on the same texture are dim. Pinch to zoom, drag to move."
+                    : screen[0] == 2 ? (decal.adjustDesign ? "Moving the design: drag, pinch to resize, twist with two fingers. Tap \"Moving\" to turn the model instead."
+                    : "Turning the model: drag / pinch. Tap \"Moving\" to move the design again.") + " Apply paints what you see onto the texture."
                     : "Drag to rotate · pinch to zoom · double-tap to reset");
             gl.select(s);
             uv.select(texPart, s);
-            mode.setText(uvMode[0] ? "3D view" : "UV view");
+            mode.setText(screen[0] == 0 ? "View: 3D" : screen[0] == 1 ? "View: UV" : "View: Paint");
+            target.setText(decal.adjustDesign ? "Moving: design" : "Moving: model");
+            apply.setEnabled(!busy[0] && decal.hasDesign());
+            undo.setEnabled(!busy[0] && !undoStack.isEmpty());
+            pick.setEnabled(!busy[0]);
         };
-        mode.setOnClickListener(v -> {
-            uvMode[0] = !uvMode[0];
-            uv.setVisibility(uvMode[0] ? View.VISIBLE : View.GONE);
-            gl.setVisibility(uvMode[0] ? View.GONE : View.VISIBLE);
-            refresh.run();
-        });
+
+        mode.setOnClickListener(v -> new AlertDialog.Builder(activity).setTitle("View")
+                .setItems(new String[]{"3D", "UV (where parts sit on the texture)", "Paint a design onto the model"}, (dd, w) -> {
+                    screen[0] = w;
+                    uv.setVisibility(w == 1 ? View.VISIBLE : View.GONE);
+                    gl.setVisibility(w == 1 ? View.GONE : View.VISIBLE);
+                    decal.setVisibility(w == 2 ? View.VISIBLE : View.GONE);
+                    paintPanel.setVisibility(w == 2 ? View.VISIBLE : View.GONE);
+                    if (w == 2 && !decal.hasDesign()) pick.performClick();
+                    refresh.run();
+                }).show());
+
         part.setOnClickListener(v -> {
             String[] items = new String[d.mesh.parts.length + 2];
             items[0] = "All parts";
@@ -164,24 +239,108 @@ final class UnityViewer {
                 refresh.run();
             }).show();
         });
+
+        pick.setOnClickListener(v -> host.pickImage((argb, w, h) -> {
+            decal.setDesign(argb, w, h, gl.getWidth(), gl.getHeight());
+            decal.adjustDesign = true;
+            refresh.run();
+        }));
+        target.setOnClickListener(v -> { decal.adjustDesign = !decal.adjustDesign; refresh.run(); });
+        opacity.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar sb, int p, boolean user) { opLabel.setText("Opacity " + p + "%"); decal.setOpacity(p / 100f); }
+            @Override public void onStartTrackingTouch(SeekBar sb) { }
+            @Override public void onStopTrackingTouch(SeekBar sb) { }
+        });
+
+        apply.setOnClickListener(v -> {
+            if (busy[0] || !decal.hasDesign() || d.mesh.uv == null) return;
+            // which textures, and which of their parts get paint
+            Map<String, List<Integer>> paintParts = new LinkedHashMap<>(), textureParts = new LinkedHashMap<>();
+            for (int p = 0; p < d.mesh.parts.length; p++) {
+                String k = d.partKey[p];
+                if (k == null) continue;
+                textureParts.computeIfAbsent(k, x -> new ArrayList<>()).add(p);
+                if (selected[0] < 0 || selected[0] == p) paintParts.computeIfAbsent(k, x -> new ArrayList<>()).add(p);
+            }
+            if (paintParts.isEmpty()) { status[0] = "Nothing to paint: this part has no texture."; refresh.run(); return; }
+            UnityPaint.View3D view = gl.view();
+            UnityPaint.Decal dc = decal.snapshot();
+            busy[0] = true; status[0] = "Painting…"; refresh.run();
+            work.execute(() -> {
+                Map<String, int[]> before = new HashMap<>();
+                int painted = 0; boolean mirrored = false; String err = null;
+                try {
+                    UnityPaint.Depth depth = UnityPaint.depth(d.geometry, view, 640);
+                    for (Map.Entry<String, List<Integer>> e : paintParts.entrySet()) {
+                        int[] px = d.pixels.get(e.getKey());
+                        UnityBundle.Texture t = (UnityBundle.Texture) d.texInfo.get(e.getKey())[1];
+                        int[] copy = px.clone();
+                        UnityPaint.Result r = UnityPaint.stamp(d.geometry, view, depth, dc, px, t.width, t.height, e.getValue(), textureParts.get(e.getKey()));
+                        if (r.painted > 0) before.put(e.getKey(), copy);
+                        painted += r.painted; mirrored |= r.mirrored();
+                    }
+                } catch (Exception | OutOfMemoryError ex) { err = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage(); }
+                final int fp = painted; final boolean fm = mirrored; final String ferr = err;
+                activity.runOnUiThread(() -> {
+                    busy[0] = false;
+                    if (ferr != null) status[0] = "Painting failed: " + ferr;
+                    else if (fp == 0) status[0] = "Nothing was painted: the design isn't over a textured surface facing you.";
+                    else {
+                        undoStack.push(before);
+                        while (undoStack.size() > 8) undoStack.removeLast();
+                        for (String k : before.keySet()) pushTexture(d, gl, uv, host, k);
+                        status[0] = "Painted " + fp + " texels. Saved with the next rebuild (Save… → New OBB)." +
+                                (fm ? "\nHeads-up: part of this texture area is also used by another spot on the model (mirrored), so it shows there too." : "");
+                    }
+                    refresh.run();
+                });
+            });
+        });
+
+        undo.setOnClickListener(v -> {
+            if (busy[0] || undoStack.isEmpty()) return;
+            Map<String, int[]> before = undoStack.pop();
+            for (Map.Entry<String, int[]> e : before.entrySet()) {
+                System.arraycopy(e.getValue(), 0, d.pixels.get(e.getKey()), 0, e.getValue().length);
+                pushTexture(d, gl, uv, host, e.getKey());
+            }
+            status[0] = "Undone.";
+            refresh.run();
+        });
+
         save.setOnClickListener(v -> {
             List<String> options = new ArrayList<>();
-            options.add("Model as OBJ (with UVs)");
             int texPart = selected[0] >= 0 ? selected[0] : firstTextured(d);
-            if (texPart >= 0 && d.partTexture[texPart] != null && d.mesh.uv != null) options.add("UV layout PNG (texture + outlines)");
+            if (host.paintedCount() > 0) options.add("New OBB with painted textures (" + host.paintedCount() + ")");
+            if (texPart >= 0 && d.bitmap(texPart) != null) options.add("Texture as PNG (as shown, incl. paint)");
+            options.add("Model as OBJ (with UVs)");
+            if (texPart >= 0 && d.bitmap(texPart) != null && d.mesh.uv != null) options.add("UV layout PNG (texture + outlines)");
             if (texPart >= 0 && d.mesh.uv != null) options.add("UV outlines only (transparent PNG)");
             new AlertDialog.Builder(activity).setTitle("Save").setItems(options.toArray(new String[0]), (dd, w) -> {
+                String o = options.get(w);
                 try {
-                    if (w == 0) saver.save(UnityObb.safe(d.mesh.name) + ".obj", "application/octet-stream",
-                            UnityModels.toObj(d.mesh).getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                    else {
-                        boolean withTexture = options.get(w).startsWith("UV layout");
+                    if (o.startsWith("New OBB")) host.buildPainted();
+                    else if (o.startsWith("Texture as PNG")) {
+                        String k = d.partKey[texPart];
+                        UnityBundle.Texture t = (UnityBundle.Texture) d.texInfo.get(k)[1];
+                        Bitmap b = Bitmap.createBitmap(t.width, t.height, Bitmap.Config.ARGB_8888);
+                        b.setPremultiplied(false);
+                        b.setPixels(d.pixels.get(k), 0, t.width, 0, 0, t.width, t.height);
+                        ByteArrayOutputStream out = new ByteArrayOutputStream();
+                        b.compress(Bitmap.CompressFormat.PNG, 100, out);
+                        b.recycle();
+                        host.save(UnityObb.safe(t.name) + "__" + t.pathId + ".png", "image/png", out.toByteArray());
+                    } else if (o.startsWith("Model as OBJ")) {
+                        host.save(UnityObb.safe(d.mesh.name) + ".obj", "application/octet-stream",
+                                UnityModels.toObj(d.mesh).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    } else {
+                        boolean withTexture = o.startsWith("UV layout");
                         Bitmap b = uv.render(texPart, selected[0], withTexture);
                         ByteArrayOutputStream out = new ByteArrayOutputStream();
                         b.compress(Bitmap.CompressFormat.PNG, 100, out);
                         b.recycle();
                         String base = UnityObb.safe(d.mesh.name) + (selected[0] >= 0 ? "_part" + (selected[0] + 1) : "");
-                        saver.save(base + (withTexture ? "_uv.png" : "_uv_lines.png"), "image/png", out.toByteArray());
+                        host.save(base + (withTexture ? "_uv.png" : "_uv_lines.png"), "image/png", out.toByteArray());
                     }
                 } catch (Exception | OutOfMemoryError e) {
                     new AlertDialog.Builder(activity).setTitle("Couldn't save").setMessage(String.valueOf(e.getMessage())).setPositiveButton("OK", null).show();
@@ -189,15 +348,102 @@ final class UnityViewer {
             }).show();
         });
         close.setOnClickListener(v -> dialog.dismiss());
-        dialog.setOnDismissListener(x -> { gl.onPause(); uv.release(); });
+        dialog.setOnDismissListener(x -> { gl.onPause(); uv.release(); work.shutdown(); });
         dialog.setContentView(root);
         refresh.run();
         dialog.show();
     }
 
+    /** After pixels of texture {@code key} changed: refresh the shown bitmap, GPU copy, UV view and the activity. */
+    private static void pushTexture(Data d, ModelView gl, UvView uv, Host host, String key) {
+        Bitmap b = d.bitmaps.get(key);
+        int[] px = d.pixels.get(key);
+        b.setPixels(px, 0, b.getWidth(), 0, 0, b.getWidth(), b.getHeight());
+        gl.updateTexture(b);
+        uv.invalidate();
+        host.painted(key, d.texInfo.get(key), px.clone());
+    }
+
     static int firstTextured(Data d) {
-        for (int i = 0; i < d.partTexture.length; i++) if (d.partTexture[i] != null) return i;
+        for (int i = 0; i < d.partKey.length; i++) if (d.partKey[i] != null) return i;
         return d.mesh.parts.length > 0 ? 0 : -1;
+    }
+
+    // ================================================================== design overlay (paint mode)
+    static final class DecalView extends View {
+        boolean adjustDesign = true;
+        private Bitmap shown;
+        private int[] argb; private int w, h;
+        private float cx, cy, size, angle, opacity = 1;
+        private final Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG), frame = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private float lastX, lastY, lastDist, lastAngle; private int lastCount;
+
+        DecalView(Context c) {
+            super(c);
+            frame.setStyle(Paint.Style.STROKE); frame.setColor(Color.argb(200, 255, 255, 255));
+            frame.setStrokeWidth(2 * c.getResources().getDisplayMetrics().density);
+            frame.setPathEffect(new DashPathEffect(new float[]{12, 10}, 0));
+        }
+
+        boolean hasDesign() { return argb != null; }
+
+        void setDesign(int[] pixels, int width, int height, int viewW, int viewH) {
+            argb = pixels; w = width; h = height;
+            if (shown != null) shown.recycle();
+            shown = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            shown.setPixels(argb, 0, w, 0, 0, w, h);
+            int vw = viewW > 0 ? viewW : getWidth(), vh = viewH > 0 ? viewH : getHeight();
+            cx = vw / 2f; cy = vh / 2f; size = Math.max(64, vw * 0.4f); angle = 0;
+            invalidate();
+        }
+
+        void setOpacity(float o) { opacity = o; invalidate(); }
+
+        UnityPaint.Decal snapshot() {
+            UnityPaint.Decal d = new UnityPaint.Decal();
+            d.argb = argb; d.w = w; d.h = h; d.cx = cx; d.cy = cy; d.size = size; d.angle = angle; d.opacity = opacity;
+            return d;
+        }
+
+        @Override protected void onDraw(Canvas canvas) {
+            if (shown == null) return;
+            float hh = size * h / (float) w;
+            canvas.save();
+            canvas.translate(cx, cy);
+            canvas.rotate((float) Math.toDegrees(angle));
+            paint.setAlpha(Math.round(255 * Math.max(0.15f, opacity)));
+            canvas.drawBitmap(shown, null, new android.graphics.RectF(-size / 2, -hh / 2, size / 2, hh / 2), paint);
+            if (adjustDesign) canvas.drawRect(-size / 2, -hh / 2, size / 2, hh / 2, frame);
+            canvas.restore();
+        }
+
+        @Override public boolean onTouchEvent(MotionEvent e) {
+            if (!adjustDesign || shown == null) return false; // let the 3D view handle it
+            int n = e.getPointerCount();
+            if (n >= 2) {
+                float dx = e.getX(1) - e.getX(0), dy = e.getY(1) - e.getY(0);
+                float dist = (float) Math.hypot(dx, dy), ang = (float) Math.atan2(dy, dx);
+                float mx = (e.getX(0) + e.getX(1)) / 2, my = (e.getY(0) + e.getY(1)) / 2;
+                if (lastCount >= 2 && e.getActionMasked() == MotionEvent.ACTION_MOVE && lastDist > 0) {
+                    size = Math.max(16, Math.min(getWidth() * 4f, size * dist / lastDist));
+                    angle += ang - lastAngle;
+                    cx += mx - lastX; cy += my - lastY;
+                }
+                lastDist = dist; lastAngle = ang; lastX = mx; lastY = my;
+            } else {
+                if (e.getActionMasked() == MotionEvent.ACTION_MOVE && lastCount == 1) { cx += e.getX() - lastX; cy += e.getY() - lastY; }
+                lastX = e.getX(); lastY = e.getY();
+            }
+            int a = e.getActionMasked();
+            lastCount = (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) ? 0
+                    : a == MotionEvent.ACTION_POINTER_UP ? n - 1 : n;
+            if (a == MotionEvent.ACTION_POINTER_UP) { // re-anchor on the finger that stays
+                int stay = e.getActionIndex() == 0 ? 1 : 0;
+                lastX = e.getX(stay); lastY = e.getY(stay);
+            }
+            invalidate();
+            return true;
+        }
     }
 
     // ================================================================== 3D
@@ -210,7 +456,6 @@ final class UnityViewer {
         ModelView(Context c, Data d) {
             super(c);
             setEGLContextClientVersion(3);
-            setPreserveEGLContextOnPause(false);
             renderer = new Renderer3D(d);
             setRenderer(renderer);
             setRenderMode(RENDERMODE_WHEN_DIRTY);
@@ -228,6 +473,9 @@ final class UnityViewer {
         void select(int part) { renderer.selected = part; requestRender(); }
         boolean cutout() { return renderer.cutout; }
         void toggleCutout() { renderer.cutout = !renderer.cutout; requestRender(); }
+        /** The exact camera the current frame is drawn with. */
+        UnityPaint.View3D view() { return renderer.view(getWidth(), getHeight()); }
+        void updateTexture(Bitmap b) { queueEvent(() -> renderer.reupload(b)); requestRender(); }
 
         @Override public boolean onTouchEvent(MotionEvent e) {
             scale.onTouchEvent(e);
@@ -247,25 +495,21 @@ final class UnityViewer {
 
     static final class Renderer3D implements GLSurfaceView.Renderer {
         private final Data d;
-        volatile float yaw = 25, pitch = 10, zoom = 1;
+        volatile float yaw = 0, pitch = 0, zoom = 1;
         volatile int selected = -1;
         /** Discard nearly transparent texels (hair cards, eyelashes). Off for textures whose alpha means something else. */
         volatile boolean cutout = true;
         private int program, vbo, aspectW = 1, aspectH = 1;
         private int[] ibo, tex;
-        private float[] center = new float[3]; private float radius = 1;
-        private final float[] proj = new float[16], view = new float[16], model = new float[16], mvp = new float[16], tmp = new float[16];
+        private final Map<Bitmap, Integer> uploaded = new java.util.IdentityHashMap<>();
 
-        Renderer3D(Data d) {
-            this.d = d;
-            UnityModels.Mesh m = d.mesh;
-            for (int k = 0; k < 3; k++) center[k] = (m.min[k] + m.max[k]) / 2;
-            center[0] = -center[0]; // x is mirrored below (Unity is left-handed)
-            float dx = m.max[0] - m.min[0], dy = m.max[1] - m.min[1], dz = m.max[2] - m.min[2];
-            radius = Math.max(1e-4f, (float) Math.sqrt(dx * dx + dy * dy + dz * dz) / 2);
+        Renderer3D(Data d) { this.d = d; }
+
+        void reset() { yaw = 0; pitch = 0; zoom = 1; }
+
+        UnityPaint.View3D view(int w, int h) {
+            return UnityPaint.camera(yaw, pitch, zoom, d.geometry.center, d.geometry.radius, w > 0 ? w : aspectW, h > 0 ? h : aspectH);
         }
-
-        void reset() { yaw = 25; pitch = 10; zoom = 1; }
 
         private static final String VS = "#version 300 es\n" +
                 "uniform mat4 uMvp; uniform mat4 uModel;\n" +
@@ -279,7 +523,7 @@ final class UnityViewer {
                 "  vec4 c = uHasTex == 1 ? texture(uTex, vec2(vUv.x, 1.0 - vUv.y)) : vec4(0.72,0.72,0.75,1.0);\n" +
                 "  if (c.a < uCut) discard;\n" +
                 "  float l = 0.38 + 0.62 * abs(dot(normalize(vNorm), normalize(vec3(0.35,0.55,1.0))));\n" +
-                "  vec3 col = c.rgb * l;\n" +
+                "  vec3 col = (c.a > 0.0 ? c.rgb / c.a : c.rgb) * l;\n" +
                 "  o = vec4(mix(vec3(0.16,0.18,0.25), col, uDim), 1.0);\n" +
                 "}\n";
 
@@ -299,14 +543,13 @@ final class UnityViewer {
             GLES30.glAttachShader(program, shader(GLES30.GL_FRAGMENT_SHADER, FS));
             GLES30.glLinkProgram(program);
 
-            UnityModels.Mesh m = d.mesh;
-            int n = m.vertexCount;
-            float[] normals = m.normal != null ? m.normal : smoothNormals(m);
+            UnityPaint.Geometry g = d.geometry;
+            int n = g.pos.length / 3;
             FloatBuffer fb = ByteBuffer.allocateDirect(n * 8 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
             for (int i = 0; i < n; i++) {
-                fb.put(-m.pos[i * 3]).put(m.pos[i * 3 + 1]).put(m.pos[i * 3 + 2]);
-                fb.put(-normals[i * 3]).put(normals[i * 3 + 1]).put(normals[i * 3 + 2]);
-                if (m.uv != null) fb.put(m.uv[i * 2]).put(m.uv[i * 2 + 1]); else fb.put(0).put(0);
+                fb.put(g.pos[i * 3]).put(g.pos[i * 3 + 1]).put(g.pos[i * 3 + 2]);
+                fb.put(g.normal[i * 3]).put(g.normal[i * 3 + 1]).put(g.normal[i * 3 + 2]);
+                if (g.uv != null) fb.put(g.uv[i * 2]).put(g.uv[i * 2 + 1]); else fb.put(0).put(0);
             }
             fb.position(0);
             int[] ids = new int[1];
@@ -314,20 +557,20 @@ final class UnityViewer {
             GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vbo);
             GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, n * 32, fb, GLES30.GL_STATIC_DRAW);
 
-            ibo = new int[m.parts.length];
+            ibo = new int[g.parts.length];
             if (ibo.length > 0) GLES30.glGenBuffers(ibo.length, ibo, 0);
-            for (int p = 0; p < m.parts.length; p++) {
-                int[] idx = m.parts[p];
+            for (int p = 0; p < g.parts.length; p++) {
+                int[] idx = g.parts[p];
                 IntBuffer ib = ByteBuffer.allocateDirect(Math.max(4, idx.length * 4)).order(ByteOrder.nativeOrder()).asIntBuffer();
                 ib.put(idx); ib.position(0);
                 GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, ibo[p]);
                 GLES30.glBufferData(GLES30.GL_ELEMENT_ARRAY_BUFFER, idx.length * 4, ib, GLES30.GL_STATIC_DRAW);
             }
 
-            tex = new int[m.parts.length];
-            java.util.Map<Bitmap, Integer> uploaded = new java.util.IdentityHashMap<>();
-            for (int p = 0; p < m.parts.length; p++) {
-                Bitmap b = d.partTexture[p];
+            uploaded.clear();
+            tex = new int[g.parts.length];
+            for (int p = 0; p < g.parts.length; p++) {
+                Bitmap b = d.bitmap(p);
                 if (b == null || b.isRecycled()) continue;
                 Integer id = uploaded.get(b);
                 if (id == null) {
@@ -350,16 +593,13 @@ final class UnityViewer {
             GLES30.glClearColor(0.08f, 0.09f, 0.15f, 1f);
         }
 
-        static float[] smoothNormals(UnityModels.Mesh m) {
-            float[] n = new float[m.vertexCount * 3];
-            for (int[] part : m.parts) for (int i = 0; i + 2 < part.length; i += 3) {
-                int a = part[i], b = part[i + 1], c = part[i + 2];
-                float ux = m.pos[b * 3] - m.pos[a * 3], uy = m.pos[b * 3 + 1] - m.pos[a * 3 + 1], uz = m.pos[b * 3 + 2] - m.pos[a * 3 + 2];
-                float vx = m.pos[c * 3] - m.pos[a * 3], vy = m.pos[c * 3 + 1] - m.pos[a * 3 + 1], vz = m.pos[c * 3 + 2] - m.pos[a * 3 + 2];
-                float nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
-                for (int v : new int[]{a, b, c}) { n[v * 3] += nx; n[v * 3 + 1] += ny; n[v * 3 + 2] += nz; }
-            }
-            return n;
+        /** Runs on the GL thread: copy a repainted bitmap to its texture. */
+        void reupload(Bitmap b) {
+            Integer id = uploaded.get(b);
+            if (id == null || b.isRecycled()) return;
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, id);
+            GLUtils.texSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, 0, b);
+            GLES30.glGenerateMipmap(GLES30.GL_TEXTURE_2D);
         }
 
         @Override public void onSurfaceChanged(GL10 unused, int w, int h) {
@@ -369,19 +609,10 @@ final class UnityViewer {
 
         @Override public void onDrawFrame(GL10 unused) {
             GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT | GLES30.GL_DEPTH_BUFFER_BIT);
-            float dist = radius / (float) Math.sin(Math.toRadians(20)) * 1.05f / zoom;
-            android.opengl.Matrix.perspectiveM(proj, 0, 40, aspectW / (float) aspectH, Math.max(dist - radius * 3, dist * 0.01f), dist + radius * 3);
-            android.opengl.Matrix.setLookAtM(view, 0, 0, 0, dist, 0, 0, 0, 0, 1, 0);
-            android.opengl.Matrix.setIdentityM(model, 0);
-            android.opengl.Matrix.rotateM(model, 0, pitch, 1, 0, 0);
-            android.opengl.Matrix.rotateM(model, 0, yaw, 0, 1, 0);
-            android.opengl.Matrix.translateM(model, 0, -center[0], -center[1], -center[2]);
-            android.opengl.Matrix.multiplyMM(tmp, 0, view, 0, model, 0);
-            android.opengl.Matrix.multiplyMM(mvp, 0, proj, 0, tmp, 0);
-
+            UnityPaint.View3D v = view(aspectW, aspectH);
             GLES30.glUseProgram(program);
-            GLES30.glUniformMatrix4fv(GLES30.glGetUniformLocation(program, "uMvp"), 1, false, mvp, 0);
-            GLES30.glUniformMatrix4fv(GLES30.glGetUniformLocation(program, "uModel"), 1, false, model, 0);
+            GLES30.glUniformMatrix4fv(GLES30.glGetUniformLocation(program, "uMvp"), 1, false, v.mvp, 0);
+            GLES30.glUniformMatrix4fv(GLES30.glGetUniformLocation(program, "uModel"), 1, false, v.model, 0);
             GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uTex"), 0);
             int uHas = GLES30.glGetUniformLocation(program, "uHasTex"), uDim = GLES30.glGetUniformLocation(program, "uDim"),
                     uCut = GLES30.glGetUniformLocation(program, "uCut");
@@ -392,14 +623,14 @@ final class UnityViewer {
             GLES30.glActiveTexture(GLES30.GL_TEXTURE0);
             int sel = selected;
             for (int p = 0; p < ibo.length; p++) {
-                if (d.mesh.parts[p].length == 0) continue;
+                if (d.geometry.parts[p].length == 0) continue;
                 boolean has = tex[p] != 0;
                 if (has) GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, tex[p]);
                 GLES30.glUniform1i(uHas, has ? 1 : 0);
                 GLES30.glUniform1f(uDim, sel < 0 || sel == p ? 1f : 0.18f);
                 GLES30.glUniform1f(uCut, cutout ? 0.3f : -1f);
                 GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, ibo[p]);
-                GLES30.glDrawElements(GLES30.GL_TRIANGLES, d.mesh.parts[p].length, GLES30.GL_UNSIGNED_INT, 0);
+                GLES30.glDrawElements(GLES30.GL_TRIANGLES, d.geometry.parts[p].length, GLES30.GL_UNSIGNED_INT, 0);
             }
         }
     }
@@ -427,12 +658,8 @@ final class UnityViewer {
             });
         }
 
-        int size() {
-            Bitmap t = texPart >= 0 ? d.partTexture[texPart] : null;
-            return t != null ? Math.max(t.getWidth(), t.getHeight()) : 1024;
-        }
-        int texW() { Bitmap t = texPart >= 0 ? d.partTexture[texPart] : null; return t != null ? t.getWidth() : 1024; }
-        int texH() { Bitmap t = texPart >= 0 ? d.partTexture[texPart] : null; return t != null ? t.getHeight() : 1024; }
+        int texW() { Bitmap t = d.bitmap(texPart); return t != null ? t.getWidth() : 1024; }
+        int texH() { Bitmap t = d.bitmap(texPart); return t != null ? t.getHeight() : 1024; }
 
         void select(int texturePart, int selectedPart) {
             boolean changed = texturePart != texPart;
@@ -447,7 +674,7 @@ final class UnityViewer {
 
         /** Texture-sized image: optionally the texture, plus outlines of every part using it (selected bright). */
         Bitmap render(int texturePart, int selectedPart, boolean withTexture) {
-            Bitmap tex = texturePart >= 0 ? d.partTexture[texturePart] : null;
+            Bitmap tex = d.bitmap(texturePart);
             int w = tex != null ? tex.getWidth() : 1024, h = tex != null ? tex.getHeight() : 1024;
             Bitmap out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
             Canvas c = new Canvas(out);
@@ -461,11 +688,11 @@ final class UnityViewer {
 
         private void drawOutlines(Canvas c, int w, int h, int texturePart, int selectedPart) {
             if (d.mesh.uv == null) return;
-            Bitmap tex = texturePart >= 0 ? d.partTexture[texturePart] : null;
+            String key = texturePart >= 0 ? d.partKey[texturePart] : null;
             float stroke = Math.max(1f, Math.max(w, h) / 1024f);
             for (int pass = 0; pass < 2; pass++) {
                 for (int p = 0; p < d.mesh.parts.length; p++) {
-                    boolean sameTexture = tex != null ? d.partTexture[p] == tex : p == texturePart;
+                    boolean sameTexture = key != null ? key.equals(d.partKey[p]) : p == texturePart;
                     if (!sameTexture) continue;
                     boolean bright = selectedPart < 0 || selectedPart == p;
                     if ((pass == 0) == bright) continue; // dim first, bright on top
@@ -477,8 +704,7 @@ final class UnityViewer {
                     int[] t = d.mesh.parts[p];
                     float[] uv = d.mesh.uv;
                     for (int i = 0; i + 2 < t.length; i += 3) {
-                        float ax = uv[t[i] * 2] * w, ay = (1 - uv[t[i] * 2 + 1]) * h;
-                        path.moveTo(ax, ay);
+                        path.moveTo(uv[t[i] * 2] * w, (1 - uv[t[i] * 2 + 1]) * h);
                         path.lineTo(uv[t[i + 1] * 2] * w, (1 - uv[t[i + 1] * 2 + 1]) * h);
                         path.lineTo(uv[t[i + 2] * 2] * w, (1 - uv[t[i + 2] * 2 + 1]) * h);
                         path.close();
@@ -513,7 +739,7 @@ final class UnityViewer {
             }
             canvas.save();
             canvas.concat(matrix);
-            Bitmap tex = texPart >= 0 ? d.partTexture[texPart] : null;
+            Bitmap tex = d.bitmap(texPart);
             if (tex != null) canvas.drawBitmap(tex, 0, 0, bitmapPaint);
             if (overlay != null) {
                 canvas.scale(w / (float) overlay.getWidth(), h / (float) overlay.getHeight());
@@ -535,5 +761,4 @@ final class UnityViewer {
             return true;
         }
     }
-
 }
