@@ -19,6 +19,7 @@ final class UnrealAssets {
     static final class Package {
         List<String> names = new ArrayList<>();
         List<String[]> imports = new ArrayList<>(); // {class name, object name}
+        List<Integer> importOuter = new ArrayList<>();
         List<Export> exports = new ArrayList<>();
         int totalHeaderSize;
     }
@@ -33,12 +34,14 @@ final class UnrealAssets {
         final List<Mip> mips = new ArrayList<>();
     }
 
-    private static final class Le {
+    static final class Le {
         final byte[] b; int p;
         Le(byte[] b, int p) { this.b = b; this.p = p; }
         void need(int n) throws IOException { if (n < 0 || p < 0 || p + n > b.length) throw new IOException("Unexpected end of package"); }
         int u8() throws IOException { need(1); return b[p++] & 255; }
         int i32() throws IOException { need(4); int v = (b[p] & 255) | ((b[p + 1] & 255) << 8) | ((b[p + 2] & 255) << 16) | (b[p + 3] << 24); p += 4; return v; }
+        int u16() throws IOException { need(2); int v = (b[p] & 255) | ((b[p + 1] & 255) << 8); p += 2; return v; }
+        float f32() throws IOException { return Float.intBitsToFloat(i32()); }
         long i64() throws IOException { long lo = i32() & 0xffffffffL, hi = i32() & 0xffffffffL; return lo | (hi << 32); }
         void skip(int n) throws IOException { need(n); p += n; }
         String fstr() throws IOException {
@@ -116,9 +119,10 @@ final class UnrealAssets {
         for (int i = 0; i < importCount; i++) {
             r.skip(8);                  // class package
             String cls = name(pk, r.i32(), r.i32());
-            r.i32();                    // outer
+            int outer = r.i32();
             String obj = name(pk, r.i32(), r.i32());
             pk.imports.add(new String[]{cls, obj});
+            pk.importOuter.add(outer);
         }
         r.p = exportOffset;
         for (int i = 0; i < exportCount; i++) {
@@ -135,7 +139,7 @@ final class UnrealAssets {
         return pk;
     }
 
-    private static String name(Package pk, int index, int number) throws IOException {
+    static String name(Package pk, int index, int number) throws IOException {
         if (index < 0 || index >= pk.names.size()) throw new IOException("Bad name reference");
         String n = pk.names.get(index);
         return number == 0 ? n : n + "_" + (number - 1);
@@ -145,6 +149,81 @@ final class UnrealAssets {
         if (classIndex < 0 && -classIndex - 1 < pk.imports.size()) return pk.imports.get(-classIndex - 1)[1];
         if (classIndex > 0 && classIndex - 1 < pk.exports.size()) return pk.exports.get(classIndex - 1).name;
         return null;
+    }
+
+    /** Full object path of an import, e.g. /Game/Characters/Max/MT_Max/MT_Max; null if the index isn't an import. */
+    static String importPath(Package pk, int index) {
+        if (index >= 0) return null;
+        StringBuilder sb = new StringBuilder();
+        for (int guard = 0; index < 0 && guard < 64; guard++) {
+            int i = -index - 1;
+            if (i >= pk.imports.size()) return null;
+            sb.insert(0, "/" + pk.imports.get(i)[1]);
+            index = pk.importOuter.get(i);
+        }
+        String path = sb.toString();
+        return path.startsWith("//") ? path.substring(1) : path;
+    }
+
+    // ------------------------------------------------------------------ tagged properties
+    static final class Prop {
+        String name, type, extra; // extra: struct name, enum name, array/set inner type
+        int size, pos, boolValue; // pos: start of the value in the package
+    }
+
+    /** Reads a tagged property list up to and including "None". */
+    static List<Prop> properties(Le r, Package pk) throws IOException {
+        List<Prop> out = new ArrayList<>();
+        for (int guard = 0; guard < 100_000; guard++) {
+            Prop p = new Prop();
+            p.name = name(pk, r.i32(), r.i32());
+            if (p.name.equals("None")) return out;
+            p.type = name(pk, r.i32(), r.i32());
+            p.size = r.i32();
+            r.i32();                                   // array index
+            switch (p.type) {
+                case "StructProperty": p.extra = name(pk, r.i32(), r.i32()); r.skip(16); break;
+                case "BoolProperty": p.boolValue = r.u8(); break;
+                case "ByteProperty": case "EnumProperty": case "ArrayProperty": case "SetProperty": p.extra = name(pk, r.i32(), r.i32()); break;
+                case "MapProperty": r.skip(16); break;
+                default: break;
+            }
+            if (r.u8() != 0) r.skip(16);
+            if (p.size < 0) throw new IOException("Bad property size");
+            p.pos = r.p;
+            r.skip(p.size);
+            out.add(p);
+        }
+        throw new IOException("Too many properties");
+    }
+
+    static Prop find(List<Prop> props, String name) {
+        for (Prop p : props) if (p.name.equals(name)) return p;
+        return null;
+    }
+
+    static int i32At(byte[] b, int p) throws IOException { return new Le(b, p).i32(); }
+
+    /** Elements of an ArrayProperty of structs, each as its own property list. */
+    static List<List<Prop>> structArray(byte[] b, Package pk, Prop p) throws IOException {
+        Le r = new Le(b, p.pos);
+        int count = r.i32();
+        if (count < 0 || count > 100_000) throw new IOException("Bad array size");
+        List<List<Prop>> out = new ArrayList<>();
+        if (count == 0) return out;
+        name(pk, r.i32(), r.i32()); name(pk, r.i32(), r.i32()); r.i32(); r.i32();   // inner tag: name, type, size, index
+        name(pk, r.i32(), r.i32()); r.skip(16);                                   // struct name, guid
+        if (r.u8() != 0) r.skip(16);
+        for (int i = 0; i < count; i++) out.add(properties(r, pk));
+        if (r.p != p.pos + p.size) throw new IOException("Struct array doesn't end where expected");
+        return out;
+    }
+
+    /** Value of a ByteProperty / EnumProperty that holds an enum name. */
+    static String enumValue(byte[] b, Package pk, Prop p) throws IOException {
+        if (p.size != 8) return null;
+        Le r = new Le(b, p.pos);
+        return name(pk, r.i32(), r.i32());
     }
 
     static int formatOf(String pf) {

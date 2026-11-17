@@ -3,3 +3,5 @@ Game/Content/Tex/T_Etc.uasset	0	T_Etc	PF_ETC2_RGB	16	8	3	c9d79ce8066668b443cf583
 Game/Content/Tex/T_Bgra.uasset	0	T_Bgra	PF_B8G8R8A8	4	4	1	e38ba3d37dd8862757bc4872088674af8e491597
 Game/Content/Maps/Level.umap	0	T_LevelA	PF_ETC2_RGBA	8	8	2	aa9c5619bf4128d455396684bab2f9aa5167eac6
 Game/Content/Maps/Level.umap	1	T_LevelB	PF_G8	4	4	1	b9b1bf4b1cb0964243b94ae9103db2530f1be797
+Game/Content/Chars/Hero/T_Hero_D.uasset	0	T_Hero_D	PF_ETC2_RGB	32	32	3	46ed4f3b1e48a1f85f933a334938b398a9e69714
+Game/Content/Chars/Hero/T_Cloth_D.uasset	0	T_Cloth_D	PF_B8G8R8A8	16	16	1	d3a694b8ea07b1152791d15dde7ccfd99ad6ab81

@@ -25,6 +25,7 @@ import android.widget.SeekBar;
 import android.widget.TextView;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
@@ -58,7 +59,10 @@ final class UnityViewer {
         String[] partTextureName;
         final Map<String, Bitmap> bitmaps = new HashMap<>();   // shown (premultiplied)
         final Map<String, int[]> pixels = new HashMap<>();     // straight ARGB, original or painted
-        final Map<String, Object[]> texInfo = new HashMap<>(); // {BundleInfo, Texture}
+        final Map<String, Object[]> texInfo = new HashMap<>(); // engine-specific, handed back to the host
+        final Map<String, int[]> texSize = new HashMap<>();     // {width, height}
+        final Map<String, String> texFile = new HashMap<>();    // suggested PNG name
+        boolean[] partCutout;        // per part: alpha means see-through (null: every part)
         String note;
         Bitmap bitmap(int part) { return part < 0 || partKey[part] == null ? null : bitmaps.get(partKey[part]); }
     }
@@ -106,6 +110,8 @@ final class UnityViewer {
             d.partTextureName[p] = t.name + " (" + UnityTextures.name(t.format) + " " + t.width + "×" + t.height + ")";
             if (!d.texInfo.containsKey(k)) {
                 d.texInfo.put(k, tex);
+                d.texSize.put(k, new int[]{t.width, t.height});
+                d.texFile.put(k, UnityObb.safe(t.name) + "__" + t.pathId + ".png");
                 if (d.pixels.size() < 24 && UnityTextures.supported(t.format)) {
                     try {
                         int[] argb = painted != null && painted.containsKey(k) ? painted.get(k).clone()
@@ -121,6 +127,74 @@ final class UnityViewer {
         }
         if (d.mesh.uv == null) d.note = "This mesh has no texture coordinates.";
         else if (missing > 0) d.note = missing + " part(s) have no texture that could be found or decoded; they're shown grey.";
+        return d;
+    }
+
+    /** Unreal Engine 4: loads a mesh, its materials and textures for the viewer. {@code painted}: textures already painted, by key. */
+    static Data loadUnreal(UnrealObb.Info info, UnrealModels.MeshRef ref, Map<String, int[]> painted) throws Exception {
+        UnrealPak pak = info.paks.get(ref.pak).pak;
+        UnrealPak.Entry entry = pak.byName.get(ref.path);
+        if (entry == null) throw new IOException("Package not found: " + ref.path);
+        byte[] bytes = pak.read(entry);
+        UnrealAssets.Package pk = UnrealAssets.parse(bytes);
+        if (ref.export < 0 || ref.export >= pk.exports.size()) throw new IOException("Mesh not found");
+        UnrealModels.Loaded l = UnrealModels.mesh(bytes, pk, pk.exports.get(ref.export));
+        String project = UnrealModels.project(ref.path);
+        Map<String, byte[]> cache = new HashMap<>();
+        UnrealModels.PackageSource src = file -> {
+            if (cache.containsKey(file)) return cache.get(file);
+            byte[] b = null;
+            for (UnrealObb.PakInfo p : info.paks) {
+                if (p.pak == null) continue;
+                UnrealPak.Entry e = p.pak.byName.get(file);
+                if (e != null && !e.encrypted) { b = p.pak.read(e); break; }
+            }
+            cache.put(file, b);
+            return b;
+        };
+
+        Data d = new Data();
+        d.mesh = l.mesh;
+        d.geometry = new UnityPaint.Geometry(d.mesh);
+        int parts = d.mesh.parts.length;
+        d.partNames = new String[parts];
+        d.partKey = new String[parts];
+        d.partTextureName = new String[parts];
+        d.partCutout = new boolean[parts];
+        Map<String, UnrealModels.Material> mats = new HashMap<>();
+        int missing = 0;
+        for (int p = 0; p < parts; p++) {
+            String mp = l.partMaterial[p];
+            UnrealModels.Material mat = null;
+            if (mp != null) {
+                if (!mats.containsKey(mp)) mats.put(mp, UnrealModels.material(src, mp, project));
+                mat = mats.get(mp);
+            }
+            d.partNames[p] = mat != null && mat.name != null ? mat.name : "part " + (p + 1);
+            d.partCutout[p] = mat != null && mat.cutout;
+            Object[] tex = mat == null || mat.texture == null ? null : UnrealModels.findTexture(info, mat.texture, project);
+            if (tex == null) { missing++; continue; }
+            UnrealObb.PackageInfo tp = (UnrealObb.PackageInfo) tex[0];
+            UnrealAssets.Texture t = (UnrealAssets.Texture) tex[1];
+            String k = UnrealModels.key(tp.pak, tp.path, t.export);
+            d.partTextureName[p] = t.name + " (" + t.pixelFormat + " " + t.width + "×" + t.height + ")";
+            if (!d.texInfo.containsKey(k)) {
+                d.texInfo.put(k, tex);
+                d.texSize.put(k, new int[]{t.width, t.height});
+                d.texFile.put(k, UnityObb.safe(t.name) + ".png");
+                if (d.pixels.size() < 24 && t.format >= 0 && UnityTextures.supported(t.format)) {
+                    try {
+                        int[] argb = painted != null && painted.containsKey(k) ? painted.get(k).clone() : UnrealObb.decode(info, tp, t);
+                        Bitmap bmp = Bitmap.createBitmap(t.width, t.height, Bitmap.Config.ARGB_8888);
+                        bmp.setPixels(argb, 0, t.width, 0, 0, t.width, t.height);
+                        d.pixels.put(k, argb);
+                        d.bitmaps.put(k, bmp);
+                    } catch (Exception | OutOfMemoryError ignored) { }
+                }
+            }
+            if (d.bitmaps.containsKey(k)) d.partKey[p] = k; else missing++;
+        }
+        if (missing > 0) d.note = missing + " part(s) have no texture that could be found or decoded; they're shown grey.";
         return d;
     }
 
@@ -296,9 +370,9 @@ final class UnityViewer {
                     UnityPaint.Depth depth = UnityPaint.depth(d.geometry, view, 640);
                     for (Map.Entry<String, List<Integer>> e : paintParts.entrySet()) {
                         int[] px = d.pixels.get(e.getKey());
-                        UnityBundle.Texture t = (UnityBundle.Texture) d.texInfo.get(e.getKey())[1];
+                        int[] size = d.texSize.get(e.getKey());
                         int[] copy = px.clone();
-                        UnityPaint.Result r = UnityPaint.stamp(d.geometry, view, depth, dc, px, t.width, t.height, e.getValue(), textureParts.get(e.getKey()));
+                        UnityPaint.Result r = UnityPaint.stamp(d.geometry, view, depth, dc, px, size[0], size[1], e.getValue(), textureParts.get(e.getKey()));
                         if (r.painted > 0) before.put(e.getKey(), copy);
                         painted += r.painted; mirrored |= r.mirrored();
                     }
@@ -345,14 +419,14 @@ final class UnityViewer {
                     if (o.startsWith("New OBB")) host.buildPainted();
                     else if (o.startsWith("Texture as PNG")) {
                         String k = d.partKey[texPart];
-                        UnityBundle.Texture t = (UnityBundle.Texture) d.texInfo.get(k)[1];
-                        Bitmap b = Bitmap.createBitmap(t.width, t.height, Bitmap.Config.ARGB_8888);
+                        int[] size = d.texSize.get(k);
+                        Bitmap b = Bitmap.createBitmap(size[0], size[1], Bitmap.Config.ARGB_8888);
                         b.setPremultiplied(false);
-                        b.setPixels(d.pixels.get(k), 0, t.width, 0, 0, t.width, t.height);
+                        b.setPixels(d.pixels.get(k), 0, size[0], 0, 0, size[0], size[1]);
                         ByteArrayOutputStream out = new ByteArrayOutputStream();
                         b.compress(Bitmap.CompressFormat.PNG, 100, out);
                         b.recycle();
-                        host.save(UnityObb.safe(t.name) + "__" + t.pathId + ".png", "image/png", out.toByteArray());
+                        host.save(d.texFile.get(k), "image/png", out.toByteArray());
                     } else if (o.startsWith("Model as OBJ")) {
                         host.save(UnityObb.safe(d.mesh.name) + ".obj", "application/octet-stream",
                                 UnityModels.toObj(d.mesh).getBytes(java.nio.charset.StandardCharsets.UTF_8));
@@ -653,7 +727,7 @@ final class UnityViewer {
                 if (has) GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, tex[p]);
                 GLES30.glUniform1i(uHas, has ? 1 : 0);
                 GLES30.glUniform1f(uDim, sel < 0 || sel == p ? 1f : 0.18f);
-                GLES30.glUniform1f(uCut, cutout ? 0.3f : -1f);
+                GLES30.glUniform1f(uCut, cutout && (d.partCutout == null || d.partCutout[p]) ? 0.3f : -1f);
                 GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, ibo[p]);
                 GLES30.glDrawElements(GLES30.GL_TRIANGLES, d.geometry.parts[p].length, GLES30.GL_UNSIGNED_INT, 0);
             }
