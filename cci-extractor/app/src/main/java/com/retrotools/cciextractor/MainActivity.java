@@ -76,6 +76,9 @@ public class MainActivity extends Activity {
     private static final int SAVE_VIEWER_FILE = 327;
     private static final int PICK_DECAL = 328;
     private static final int PICK_MGS_FOLDER = 329;
+    private static final int PICK_MGS_DISC = 330;
+    private static final int SAVE_MGS_DISC = 331;
+    private Uri pendingMgsDisc;
     private static final String DIR_MIME = DocumentsContract.Document.MIME_TYPE_DIR;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -90,6 +93,10 @@ public class MainActivity extends Activity {
     private MgsVox.Info voxInfo;
     private MgsStage.Info mgsInfo;   // Metal Gear Solid STAGE.DIR / FACE.DAT
     private int mgsOnly = -1;
+    /** Textures painted in the 3D viewer, by MgsStage.Entry key: {entry, null, argb}. */
+    private final Map<String, Object[]> mgsPainted = new java.util.LinkedHashMap<>();
+    private Map<String, byte[]> mgsEdits;          // encoded, ready to save
+    private Uri mgsRebuiltUri;                     // the last STAGE.DIR saved, for writing into a disc image
     private RenpyArchive.Info rpaInfo;
     private Ps3Trophy.Info trpInfo;
     private UnityObb.Info unityInfo;
@@ -371,6 +378,15 @@ public class MainActivity extends Activity {
             if (mgsInfo != null) {
                 if (position >= mgsInfo.parts.size()) return;
                 MgsStage.Part part = mgsInfo.parts.get(position);
+                if (!mgsInfo.face && part.models() > 0) {
+                    new AlertDialog.Builder(this).setTitle("Area " + part.name + " · " + mgsInfo.label(position).replaceFirst("^\\S+ \\S+ · ", ""))
+                            .setItems(new String[]{"View 3D models (" + part.models() + ")", "Extract this area"}, (d, w) -> {
+                                if (w == 0) showMgsModels(position); else beginMgsExtract(position);
+                            })
+                            .setNegativeButton("Cancel", null)
+                            .show();
+                    return;
+                }
                 new AlertDialog.Builder(this).setTitle(mgsInfo.face ? "Portrait group " + part.name : "Area " + part.name)
                         .setMessage(mgsInfo.label(position).replaceFirst("^\\S+ ", "") + "\n\nExtract this " +
                                 (mgsInfo.face ? "group" : "area") + "?")
@@ -496,6 +512,7 @@ public class MainActivity extends Activity {
             unrealChanged = null;
             unityPatches = null;
             unityPainted.clear();
+            mgsPainted.clear();
             unrealPainted.clear();
             if (search.length() > 0) search.setText("");
             retroMode = null;
@@ -776,6 +793,22 @@ public class MainActivity extends Activity {
             extractVox(uri);
         } else if (request == PICK_MGS_FOLDER && mgsInfo != null) {
             extractMgs(uri);
+        } else if (request == PICK_UNITY_EDITS && mgsInfo != null) {
+            prepareMgsEdits(uri);
+        } else if (request == SAVE_UNITY && mgsInfo != null && mgsEdits != null) {
+            writeMgsRebuild(uri);
+        } else if (request == PICK_MGS_DISC && mgsRebuiltUri != null) {
+            pendingMgsDisc = uri;
+            Intent save = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+            save.addCategory(Intent.CATEGORY_OPENABLE);
+            save.setType("application/octet-stream");
+            String name = getFilename(uri);
+            save.putExtra(Intent.EXTRA_TITLE, (name.contains(".") ? name.substring(0, name.lastIndexOf('.')) : name) + "_edited" +
+                    (name.contains(".") ? name.substring(name.lastIndexOf('.')) : ".bin"));
+            save.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            startActivityForResult(save, SAVE_MGS_DISC);
+        } else if (request == SAVE_MGS_DISC && mgsRebuiltUri != null && pendingMgsDisc != null) {
+            writeMgsDisc(pendingMgsDisc, mgsRebuiltUri, uri);
         } else if (request == PICK_PS1_FOLDER && ps1Info != null) {
             extractPs1(uri);
         } else if (request == PICK_PAK_FOLDER && pakInfo != null) {
@@ -934,7 +967,8 @@ public class MainActivity extends Activity {
         if (pakInfo != null) location.setText("/PAK   (" + displayed.size() + " bundles)");
         if (voxInfo != null) location.setText("/VOX   (" + displayed.size() + " clips)");
         if (mgsInfo != null) location.setText(mgsInfo.face ? "/FACE.DAT   (" + displayed.size() + " groups, " + mgsInfo.files + " portraits)"
-                : "/STAGE.DIR   (" + displayed.size() + " areas, " + mgsInfo.textures + " textures)");
+                : "/STAGE.DIR   (" + displayed.size() + " areas, " + mgsInfo.textures + " textures" +
+                  (mgsPainted.isEmpty() ? ")" : ", " + mgsPainted.size() + " painted — tap rebuild to save)"));
         if (trpInfo != null) location.setText("/TROPHY.TRP   (" + displayed.size() + " files)");
         if (unrealInfo != null) location.setText("/Unreal   (" + displayed.size() + " packages, " + unrealInfo.textures + " textures" +
                 (unrealPainted.isEmpty() ? ")" : ", " + unrealPainted.size() + " painted — tap rebuild to save)"));
@@ -954,9 +988,11 @@ public class MainActivity extends Activity {
         paletteButton.setVisibility(retroInfo!=null || nesInfo!=null?View.VISIBLE:View.GONE);
         paletteButton.setText("Palette: "+viewPaletteName);
         pngToRetro.setVisibility(retroInfo!=null?View.VISIBLE:View.GONE);
-        pngToUnity.setVisibility(unityInfo != null || unrealInfo != null ? View.VISIBLE : View.GONE);
-        pngToUnity.setEnabled(!busy && (unityInfo != null || unrealInfo != null));
-        pngToUnity.setText(unrealInfo != null ? "Edited PNGs → rebuild Unreal OBB / pak" : "Edited PNGs → rebuild Unity OBB / bundle");
+        boolean mgsStage = mgsInfo != null && !mgsInfo.face;
+        pngToUnity.setVisibility(unityInfo != null || unrealInfo != null || mgsStage ? View.VISIBLE : View.GONE);
+        pngToUnity.setEnabled(!busy && (unityInfo != null || unrealInfo != null || mgsStage));
+        pngToUnity.setText(mgsStage ? "Edited PNGs → rebuild STAGE.DIR" :
+                unrealInfo != null ? "Edited PNGs → rebuild Unreal OBB / pak" : "Edited PNGs → rebuild Unity OBB / bundle");
         if(retroMode!=null)retroFormat.setText("Format: "+retroMode.slug);
         extractAll.setText((nesInfo != null || retroInfo != null) ? "Export all tile PNGs" : (unityInfo != null || unrealInfo != null) ? "Extract all textures" : "Extract all");
         extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null || pakInfo != null || ps1Info != null || voxInfo != null || mgsInfo != null || rpaInfo != null || trpInfo != null || unityInfo != null || unrealInfo != null));
@@ -2139,6 +2175,317 @@ public class MainActivity extends Activity {
                     busy = false; render(); summary.setText("Extraction failed"); detail.setText(message(e));
                     new AlertDialog.Builder(this).setTitle("Extraction failed")
                             .setMessage(message(e)).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+    // ---------------------------------------------------------------- MGS: 3D models, painting, rebuild
+
+    private void showMgsModels(int partIndex) {
+        if (busy || mgsInfo == null || imageUri == null) return;
+        final MgsStage.Info info = mgsInfo;
+        final MgsStage.Part part = info.parts.get(partIndex);
+        busy = true; render();
+        summary.setText("Reading models in " + part.name + "...");
+        worker.execute(() -> {
+            try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                if (descriptor == null) throw new IOException("Could not reopen the file");
+                List<MgsStage.Model> models = new ArrayList<>();
+                try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor()); FileChannel channel = stream.getChannel()) {
+                    for (MgsStage.Entry e : part.entries) {
+                        if (!e.isModel()) continue;
+                        try { models.add(MgsStage.readModel(e, MgsStage.read(channel, e))); } catch (IOException skip) { }
+                    }
+                }
+                models.sort((a, b) -> b.faces - a.faces);
+                String[] labels = new String[models.size()];
+                for (int i = 0; i < labels.length; i++) labels[i] = models.get(i).label();
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText(info.description());
+                    if (models.isEmpty()) {
+                        new AlertDialog.Builder(this).setTitle("No readable models").setPositiveButton("OK", null).show();
+                        return;
+                    }
+                    new AlertDialog.Builder(this).setTitle(part.name + " · " + models.size() + " model(s) · biggest first")
+                            .setItems(labels, (d, w) -> viewMgsModel(models.get(w)))
+                            .setNegativeButton("Close", null).show();
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Couldn't read models"); detail.setText(why);
+                    new AlertDialog.Builder(this).setTitle("Couldn't read models").setMessage(why).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+    private void viewMgsModel(MgsStage.Model model) {
+        if (busy || mgsInfo == null || imageUri == null) return;
+        final MgsStage.Info info = mgsInfo;
+        busy = true; render();
+        summary.setText("Loading model " + model.label() + "...");
+        worker.execute(() -> {
+            try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                if (descriptor == null) throw new IOException("Could not reopen the file");
+                Map<String, int[]> painted = new HashMap<>();
+                for (Map.Entry<String, Object[]> e : mgsPainted.entrySet()) painted.put(e.getKey(), (int[]) e.getValue()[2]);
+                UnityViewer.Data data;
+                try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor()); FileChannel channel = stream.getChannel()) {
+                    data = UnityViewer.loadMgs(channel, info, model, painted);
+                }
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText(info.description());
+                    UnityViewer.show(this, data, mgsViewerHost());
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Couldn't open the model"); detail.setText(why);
+                    new AlertDialog.Builder(this).setTitle("Couldn't open the model").setMessage(why).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+    private UnityViewer.Host mgsViewerHost() {
+        UnityViewer.Host base = viewerHost(false);
+        return new UnityViewer.Host() {
+            @Override public void save(String name, String mime, byte[] bytes) { base.save(name, mime, bytes); }
+            @Override public void pickImage(UnityViewer.ImageCallback callback) { base.pickImage(callback); }
+            @Override public void painted(String key, Object[] texInfo, int[] pixels) {
+                mgsPainted.put(key, new Object[]{texInfo[0], null, pixels});
+                render();
+            }
+            @Override public int paintedCount() { return mgsPainted.size(); }
+            @Override public void buildPainted() { prepareMgsEdits(null); }
+        };
+    }
+
+    private void startMgsRebuild() {
+        String how = "Pick the MGS_… folder you extracted from this STAGE.DIR. Only PNGs you changed are used.\n\n" +
+                "Each texture keeps its size and its own palette: colours are matched to the nearest the texture already has, " +
+                "and see-through pixels become black (see-through in the game). Every area must still fit in its original space.";
+        if (!mgsPainted.isEmpty()) {
+            new AlertDialog.Builder(this).setTitle("Rebuild STAGE.DIR")
+                    .setMessage(mgsPainted.size() + " texture(s) painted in the 3D viewer will be included. Add edited PNGs from an " +
+                            "extracted folder too? (If the same texture is in both, the painted version wins.)")
+                    .setNegativeButton("Painted only", (d, w) -> prepareMgsEdits(null))
+                    .setPositiveButton("Also pick a folder", (d, w) -> {
+                        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                        startActivityForResult(intent, PICK_UNITY_EDITS);
+                    }).show();
+            return;
+        }
+        new AlertDialog.Builder(this).setTitle("Rebuild STAGE.DIR with edited textures").setMessage(how)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Pick folder", (d, w) -> {
+                    Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    startActivityForResult(intent, PICK_UNITY_EDITS);
+                }).show();
+    }
+
+    /** Collects edited PNGs (from {@code tree}, if given) and painted textures, encodes them and checks they fit. */
+    private void prepareMgsEdits(Uri tree) {
+        if (busy || mgsInfo == null || imageUri == null) return;
+        final MgsStage.Info info = mgsInfo;
+        final List<Object[]> painted = new ArrayList<>(mgsPainted.values());
+        busy = true; cancelled.set(false); render();
+        summary.setText(tree == null ? "Encoding painted textures..." : "Looking for edited PNGs...");
+        worker.execute(() -> {
+            try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                if (descriptor == null) throw new IOException("Could not reopen STAGE.DIR");
+                Map<String, byte[]> edits = new java.util.LinkedHashMap<>();
+                List<String> edited = new ArrayList<>(), problems = new ArrayList<>();
+                try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor()); FileChannel channel = stream.getChannel()) {
+                    if (tree != null) {
+                        Map<String, Uri> files = new HashMap<>();
+                        listTree(tree, DocumentsContract.getTreeDocumentId(tree), "", files, 0);
+                        Map<String, String> names = MgsStage.extractedNames(info);
+                        // The picked folder may be the MGS_… folder itself or the folder holding it
+                        Map<String, Uri> byName = new HashMap<>();
+                        for (Map.Entry<String, Uri> f : files.entrySet()) {
+                            String k = f.getKey();
+                            if (names.containsKey(k)) byName.put(k, f.getValue());
+                            else if (k.indexOf('/') > 0 && names.containsKey(k.substring(k.indexOf('/') + 1))) byName.put(k.substring(k.indexOf('/') + 1), f.getValue());
+                        }
+                        if (byName.isEmpty()) throw new IOException("No extracted textures here. Pick the MGS_… folder this app made from this STAGE.DIR.");
+                        int checked = 0;
+                        for (Map.Entry<String, Uri> f : byName.entrySet()) {
+                            if (cancelled.get()) throw new IOException("Cancelled");
+                            if (++checked % 50 == 0) { final int n = checked; runOnUiThread(() -> summary.setText("Checking PNGs " + n + "/" + byName.size() + "...")); }
+                            MgsStage.Entry e = MgsStage.byKey(info, names.get(f.getKey()));
+                            if (e == null) continue;
+                            byte[] png = readUri(f.getValue());
+                            BitmapFactory.Options o = new BitmapFactory.Options();
+                            o.inScaled = false; o.inPremultiplied = false; o.inPreferredConfig = Bitmap.Config.ARGB_8888;
+                            Bitmap bmp = BitmapFactory.decodeByteArray(png, 0, png.length, o);
+                            if (bmp == null) { problems.add(f.getKey() + ": not a readable PNG"); continue; }
+                            int w = bmp.getWidth(), h = bmp.getHeight();
+                            int[] argb = new int[w * h];
+                            bmp.getPixels(argb, 0, w, 0, 0, w, h);
+                            bmp.recycle();
+                            byte[] original = MgsStage.read(channel, e);
+                            MgsStage.Image now = MgsStage.decodePcx(original);
+                            if (w == now.width && h == now.height && sameTexture(argb, now.argb)) continue;   // unchanged
+                            try {
+                                edits.put(e.key(), MgsStage.encodePcx(original, argb, w, h));
+                                edited.add(f.getKey());
+                            } catch (IOException bad) { problems.add(f.getKey() + ": " + bad.getMessage()); }
+                        }
+                    }
+                    for (Object[] p : painted) {
+                        MgsStage.Entry e = (MgsStage.Entry) p[0];
+                        int[] argb = (int[]) p[2];
+                        byte[] original = MgsStage.read(channel, e);
+                        MgsStage.Image now = MgsStage.decodePcx(original);
+                        try {
+                            edits.put(e.key(), MgsStage.encodePcx(original, argb, now.width, now.height));
+                            edited.add(e.path().replace(".pcx", ".png") + " (painted in 3D viewer)");
+                        } catch (IOException bad) { problems.add(e.path() + ": " + bad.getMessage()); }
+                    }
+                    if (!edits.isEmpty()) problems.addAll(MgsStage.checkFit(channel, info, edits));
+                }
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    if (edits.isEmpty() || !problems.isEmpty()) {
+                        summary.setText(edits.isEmpty() ? "No edits found" : "Some edits don't fit");
+                        StringBuilder msg = new StringBuilder(edits.isEmpty() ? "No changed textures were found." : "");
+                        if (!problems.isEmpty()) {
+                            msg.append(msg.length() > 0 ? "\n\n" : "").append("Nothing was saved, because:\n");
+                            for (String p : problems.subList(0, Math.min(12, problems.size()))) msg.append("• ").append(p).append('\n');
+                            if (problems.size() > 12) msg.append("…and ").append(problems.size() - 12).append(" more.");
+                        }
+                        new AlertDialog.Builder(this).setTitle(edits.isEmpty() ? "Nothing to rebuild" : "Edits don't fit")
+                                .setMessage(msg.toString()).setPositiveButton("OK", null).show();
+                        return;
+                    }
+                    mgsEdits = edits;
+                    summary.setText(edits.size() + " edited texture(s) ready");
+                    StringBuilder msg = new StringBuilder(edits.size() + " texture(s) will be saved:\n");
+                    for (String e : edited.subList(0, Math.min(10, edited.size()))) msg.append("• ").append(e).append('\n');
+                    if (edited.size() > 10) msg.append("…and ").append(edited.size() - 10).append(" more.\n");
+                    msg.append("\nEverything fits. Choose where to save the new STAGE.DIR; the original is unchanged.");
+                    new AlertDialog.Builder(this).setTitle("Ready to rebuild").setMessage(msg.toString())
+                            .setNegativeButton("Cancel", null)
+                            .setPositiveButton("Save", (d, w) -> {
+                                Intent save = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                                save.addCategory(Intent.CATEGORY_OPENABLE);
+                                save.setType("application/octet-stream");
+                                save.putExtra(Intent.EXTRA_TITLE, "STAGE.DIR");
+                                save.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                                startActivityForResult(save, SAVE_UNITY);
+                            }).show();
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Couldn't prepare the rebuild"); detail.setText(why);
+                    new AlertDialog.Builder(this).setTitle("Couldn't prepare the rebuild").setMessage(why).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+    /** Same picture as the game would show it (see-through pixels compare equal whatever their colour). */
+    private static boolean sameTexture(int[] png, int[] original) {
+        for (int i = 0; i < png.length; i++) {
+            int a = png[i], b = original[i];
+            boolean clearA = (a >>> 24) < 128, clearB = (b >>> 24) < 128;
+            if (clearA != clearB || !clearA && ((a ^ b) & 0xffffff) != 0) return false;
+        }
+        return true;
+    }
+
+    private void writeMgsRebuild(Uri target) {
+        if (busy || mgsInfo == null || mgsEdits == null || imageUri == null) return;
+        final MgsStage.Info info = mgsInfo;
+        final Map<String, byte[]> edits = mgsEdits;
+        busy = true; render();
+        summary.setText("Writing STAGE.DIR...");
+        worker.execute(() -> {
+            try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                if (descriptor == null) throw new IOException("Could not reopen STAGE.DIR");
+                try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor()); FileChannel channel = stream.getChannel();
+                     OutputStream os = getContentResolver().openOutputStream(target, "wt")) {
+                    if (os == null) throw new IOException("Cannot write the new file");
+                    java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(os, 1 << 20);
+                    MgsStage.rebuild(channel, info, edits, out, what -> runOnUiThread(() -> summary.setText(what)));
+                    out.flush();
+                }
+                runOnUiThread(() -> {
+                    busy = false; mgsEdits = null; mgsRebuiltUri = target; render();
+                    summary.setText("STAGE.DIR saved");
+                    detail.setText(edits.size() + " texture(s) changed. Same size as the original, every area in its place.");
+                    new AlertDialog.Builder(this).setTitle("STAGE.DIR saved")
+                            .setMessage(edits.size() + " texture(s) changed. The new file is the same size as the original, with every " +
+                                    "area in its place.\n\nTo play it, it has to go back into the disc image. Do that now? You'll pick your " +
+                                    ".bin disc image and where to save the edited copy; the original disc image is not changed.")
+                            .setNegativeButton("Later", null)
+                            .setPositiveButton("Pick disc image", (d, w) -> {
+                                Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                                pick.addCategory(Intent.CATEGORY_OPENABLE);
+                                pick.setType("*/*");
+                                startActivityForResult(pick, PICK_MGS_DISC);
+                            }).show();
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Couldn't write STAGE.DIR"); detail.setText(why);
+                    new AlertDialog.Builder(this).setTitle("Couldn't write STAGE.DIR").setMessage(why).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+    /** Copies the disc image with its STAGE.DIR replaced by the rebuilt one (error codes recomputed). */
+    private void writeMgsDisc(Uri disc, Uri stage, Uri target) {
+        if (busy) return;
+        busy = true; cancelled.set(false); render();
+        summary.setText("Writing the disc image...");
+        worker.execute(() -> {
+            try (ParcelFileDescriptor dd = getContentResolver().openFileDescriptor(disc, "r");
+                 ParcelFileDescriptor sd = getContentResolver().openFileDescriptor(stage, "r")) {
+                if (dd == null || sd == null) throw new IOException("Could not open the disc image or the new STAGE.DIR");
+                try (FileInputStream ds = new FileInputStream(dd.getFileDescriptor()); FileChannel dc = ds.getChannel();
+                     FileInputStream ss = new FileInputStream(sd.getFileDescriptor()); FileChannel sc = ss.getChannel()) {
+                    if (!Ps1Disc.isDisc(dc)) throw new IOException("That isn't a PlayStation disc image (.bin / .iso).");
+                    Ps1Disc.Info info = Ps1Disc.parse(dc);
+                    Ps1Disc.FileEntry stageFile = null;
+                    for (Ps1Disc.FileEntry f : info.files)
+                        if (f.path.toUpperCase(Locale.ROOT).matches("(.*/)?STAGE\\.DIR")) { stageFile = f; break; }
+                    if (stageFile == null) throw new IOException("This disc has no STAGE.DIR. Pick the Metal Gear Solid disc it came from.");
+                    if (stageFile.size != sc.size())
+                        throw new IOException("This disc's STAGE.DIR is " + stageFile.size + " bytes but the new one is " + sc.size() +
+                                ". Pick the same disc (and disc number) the STAGE.DIR was extracted from.");
+                    try (OutputStream os = getContentResolver().openOutputStream(target, "wt")) {
+                        if (os == null) throw new IOException("Cannot write the new disc image");
+                        java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(os, 1 << 20);
+                        Ps1Disc.replaceFile(dc, info.layout, stageFile, sc, out, (written, total) -> {
+                            final int pct = (int) (written * 100 / Math.max(1, total));
+                            runOnUiThread(() -> summary.setText("Writing the disc image... " + pct + "%"));
+                        });
+                        out.flush();
+                    }
+                }
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    summary.setText("Edited disc image saved");
+                    detail.setText("Load the new .bin in your emulator. If you use a .cue file, copy it and point it at the new .bin.");
+                    new AlertDialog.Builder(this).setTitle("Edited disc image saved")
+                            .setMessage("STAGE.DIR was replaced and the error-check codes of its sectors were recalculated; everything " +
+                                    "else is unchanged.\n\nIf your emulator loads a .cue file, make a copy of it that names the new .bin.")
+                            .setPositiveButton("OK", null).show();
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Couldn't write the disc image"); detail.setText(why);
+                    new AlertDialog.Builder(this).setTitle("Couldn't write the disc image").setMessage(why).setPositiveButton("OK", null).show();
                 });
             }
         });
@@ -3617,6 +3964,7 @@ public class MainActivity extends Activity {
 
     private void startUnityRebuild() {
         if (busy) return;
+        if (mgsInfo != null && !mgsInfo.face) { startMgsRebuild(); return; }
         if (unrealInfo != null && !unrealPainted.isEmpty()) {
             new AlertDialog.Builder(this).setTitle("Rebuild")
                     .setMessage(unrealPainted.size() + " texture(s) painted in the 3D viewer will be included. Add edited PNGs from an " +
