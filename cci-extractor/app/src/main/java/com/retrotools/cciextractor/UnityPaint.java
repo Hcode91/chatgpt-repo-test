@@ -193,6 +193,15 @@ final class UnityPaint {
      */
     static Result stamp(Geometry g, View3D v, Depth depth, Decal d, int[] pixels, int tw, int th,
                         List<Integer> paintParts, List<Integer> textureParts) {
+        return stamp(g, v, depth, d, pixels, tw, th, paintParts, textureParts, null);
+    }
+
+    /**
+     * As above, limited to an area: {@code area[part][triangle]} must be true for a triangle to get paint
+     * ({@code area == null}: no limit; {@code area[part] == null}: none of that part).
+     */
+    static Result stamp(Geometry g, View3D v, Depth depth, Decal d, int[] pixels, int tw, int th,
+                        List<Integer> paintParts, List<Integer> textureParts, boolean[][] area) {
         Result res = new Result();
         if (g.uv == null) return res;
         int n = tw * th;
@@ -220,7 +229,10 @@ final class UnityPaint {
 
         for (int p : paintParts) {
             final int part = p;
+            final boolean[] allowed = area == null ? null : area[part];
+            if (area != null && allowed == null) continue;
             rasterize(g, p, tw, th, (texel, tri, w0, w1, w2) -> {
+                if (allowed != null && !allowed[tri]) return;
                 int[] idx = g.parts[part];
                 int ia = idx[tri * 3], ib = idx[tri * 3 + 1], ic = idx[tri * 3 + 2];
                 float x = w0 * g.pos[ia * 3] + w1 * g.pos[ib * 3] + w2 * g.pos[ic * 3];
@@ -293,6 +305,76 @@ final class UnityPaint {
             done = next;
         }
         return res;
+    }
+
+    // ------------------------------------------------------------------ areas (connected pieces)
+    /**
+     * Splits every part into connected pieces: triangles that share a corner position (welded, so UV seams don't
+     * split a piece) belong together. Clothing layers modelled separately (a T-shirt under a hoodie) come out as
+     * separate pieces. Returns piece ids per part, per triangle.
+     */
+    static int[][] pieces(Geometry g) {
+        int n = g.pos.length / 3;
+        float q = Math.max(1e-6f, g.radius * 1e-4f);
+        java.util.HashMap<Long, Integer> weld = new java.util.HashMap<>();
+        int[] welded = new int[n];
+        for (int i = 0; i < n; i++) {
+            long x = Math.round(g.pos[i * 3] / q), y = Math.round(g.pos[i * 3 + 1] / q), z = Math.round(g.pos[i * 3 + 2] / q);
+            long key = (x & 0x1FFFFF) | ((y & 0x1FFFFF) << 21) | ((z & 0x1FFFFF) << 42);
+            Integer id = weld.get(key);
+            if (id == null) { id = weld.size(); weld.put(key, id); }
+            welded[i] = id;
+        }
+        int[][] out = new int[g.parts.length][];
+        for (int p = 0; p < g.parts.length; p++) {
+            int[] idx = g.parts[p];
+            int[] parent = new int[weld.size()];
+            for (int i = 0; i < parent.length; i++) parent[i] = i;
+            for (int t = 0; t + 2 < idx.length; t += 3) {
+                int a = find(parent, welded[idx[t]]);
+                union(parent, a, welded[idx[t + 1]]);
+                union(parent, a, welded[idx[t + 2]]);
+            }
+            int[] tri = new int[idx.length / 3];
+            for (int t = 0; t < tri.length; t++) tri[t] = find(parent, welded[idx[t * 3]]);
+            out[p] = tri;
+        }
+        return out;
+    }
+    private static int find(int[] p, int a) { while (p[a] != a) { p[a] = p[p[a]]; a = p[a]; } return a; }
+    private static void union(int[] p, int a, int b) { a = find(p, a); b = find(p, b); if (a != b) p[b] = a; }
+
+    /** The front-most triangle under a screen point: {part, triangle}, or null if the point misses the model. */
+    static int[] pick(Geometry g, View3D v, float sx, float sy) {
+        int n = g.pos.length / 3;
+        float[][] sp = new float[n][];
+        for (int i = 0; i < n; i++) sp[i] = project(v, g.pos[i * 3], g.pos[i * 3 + 1], g.pos[i * 3 + 2]);
+        int[] best = null; float bestZ = Float.MAX_VALUE;
+        for (int p = 0; p < g.parts.length; p++) {
+            int[] idx = g.parts[p];
+            for (int t = 0; t + 2 < idx.length; t += 3) {
+                float[] a = sp[idx[t]], b = sp[idx[t + 1]], c = sp[idx[t + 2]];
+                if (a == null || b == null || c == null) continue;
+                float area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+                if (Math.abs(area) < 1e-9f) continue;
+                float w0 = ((b[0] - sx) * (c[1] - sy) - (b[1] - sy) * (c[0] - sx)) / area;
+                float w1 = ((c[0] - sx) * (a[1] - sy) - (c[1] - sy) * (a[0] - sx)) / area;
+                float w2 = 1 - w0 - w1;
+                if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+                float z = w0 * a[2] + w1 * b[2] + w2 * c[2];
+                if (z < bestZ) { bestZ = z; best = new int[]{p, t / 3}; }
+            }
+        }
+        return best;
+    }
+
+    /** Area mask for {@link #stamp}: only the piece containing {@code triangle} of {@code part}. */
+    static boolean[][] areaOf(int[][] pieces, int part, int triangle) {
+        boolean[][] area = new boolean[pieces.length][];
+        int id = pieces[part][triangle];
+        area[part] = new boolean[pieces[part].length];
+        for (int t = 0; t < pieces[part].length; t++) area[part][t] = pieces[part][t] == id;
+        return area;
     }
 
     interface TexelVisitor { void visit(int texel, int triangle, float w0, float w1, float w2); }
