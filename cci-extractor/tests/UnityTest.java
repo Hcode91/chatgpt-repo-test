@@ -407,5 +407,19 @@ public class UnityTest {
         check(Math.abs(s[0] - 200) < 0.01 && Math.abs(s[1] - 200) < 0.01, "centre projects to screen centre");
         float[] right = UnityPaint.project(v, 1, 0, 0);
         check(right[0] > 200 && Math.abs(right[1] - 200) < 0.01, "+x is to the right");
+
+        // 7) view buttons: at "Left" the model's left side (+x after mirroring) is nearest the camera, at "Right" the
+        //    other side; "Back" shows the back. A character facing the camera has its left on the right of the screen.
+        UnityPaint.View3D left = UnityPaint.camera(UnityPaint.YAW_LEFT, 0, 1, g.center, g.radius, 400, 400);
+        check(UnityPaint.project(left, 1, 0, 0)[2] < UnityPaint.project(left, -1, 0, 0)[2], "Left view: +x side nearest");
+        UnityPaint.View3D rightV = UnityPaint.camera(UnityPaint.YAW_RIGHT, 0, 1, g.center, g.radius, 400, 400);
+        check(UnityPaint.project(rightV, -1, 0, 0)[2] < UnityPaint.project(rightV, 1, 0, 0)[2], "Right view: -x side nearest");
+        UnityPaint.View3D backV = UnityPaint.camera(UnityPaint.YAW_BACK, 0, 1, g.center, g.radius, 400, 400);
+        check(UnityPaint.project(backV, 0, 0, -1)[2] < UnityPaint.project(backV, 0, 0, 1)[2], "Back view: -z nearest");
+        // and a Unity model's own +x (its right) shows on the left of the screen from the front
+        UnityModels.Mesh one = quads(new float[]{0}, 0, 0, 1, 1);
+        one.pos[0] = 0.5f; // nudge a vertex so the mirror is visible: Unity x=+0.5 → drawn at x=-0.5
+        UnityPaint.Geometry gm = new UnityPaint.Geometry(one);
+        check(gm.pos[0] == -0.5f, "Unity +x drawn mirrored");
     }
 }

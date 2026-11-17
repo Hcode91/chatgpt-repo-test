@@ -1,4 +1,9 @@
-# Game Asset Extractor (Android v0.18.0)
+# Game Asset Extractor (Android v0.18.1)
+
+## v0.18.1: view buttons for painting all the way round
+
+**Front / Left / Back / Right** under the viewer's top bar snap the model to those exact angles, keeping the zoom. In paint mode the design stays where you put it on screen, so you can stamp the front, tap **Left**, stamp, tap **Back**, stamp, and so on, and each stamp lines up the same way. Left and Right are the model's own sides (Left shows its left side). Tips: limit painting to the part with **Part**, overlap stamps slightly, and use 100% opacity where stamps overlap, or the overlap is painted twice and looks stronger. The CI test checks that each button shows the expected side.
+
 
 ## New in v0.18: paint designs straight onto Unity models (projection painting)
 

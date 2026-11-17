@@ -55,6 +55,12 @@ final class UnityPaint {
         float[] m = identity(); m[0] = c; m[2] = -s; m[8] = s; m[10] = c; return m;
     }
 
+    /**
+     * Snap angles (yaw) for the view buttons. Unity models face +z, so yaw 0 is the front. The viewer mirrors x into a
+     * right-handed space, which puts the model's own left side at +x; turning by -90° brings it to the camera.
+     */
+    static final float YAW_FRONT = 0, YAW_LEFT = 270, YAW_BACK = 180, YAW_RIGHT = 90;
+
     /** The viewer's orbit camera: model rotated (pitch, then yaw) about its centre, seen from distance along +z. */
     static View3D camera(float yaw, float pitch, float zoom, float[] center, float radius, int width, int height) {
         View3D v = new View3D();

@@ -151,6 +151,20 @@ final class UnityViewer {
         info.setPadding(pad, (int) (2 * density), pad, (int) (6 * density));
         root.addView(info);
 
+        // exact views, so stamps from several sides line up (the design stays put on screen)
+        LinearLayout views = new LinearLayout(activity);
+        views.setPadding((int) (4 * density), 0, (int) (4 * density), 0);
+        String[] viewNames = {"Front", "Left", "Back", "Right"};
+        float[] viewYaw = {UnityPaint.YAW_FRONT, UnityPaint.YAW_LEFT, UnityPaint.YAW_BACK, UnityPaint.YAW_RIGHT};
+        Button[] viewButtons = new Button[4];
+        for (int i = 0; i < 4; i++) {
+            Button b = new Button(activity);
+            b.setAllCaps(false); b.setText(viewNames[i]); b.setTextSize(12);
+            views.addView(b, new LinearLayout.LayoutParams(0, (int) (40 * density), 1));
+            viewButtons[i] = b;
+        }
+        root.addView(views);
+
         FrameLayout stage = new FrameLayout(activity);
         root.addView(stage, new LinearLayout.LayoutParams(-1, 0, 1));
         ModelView gl = new ModelView(activity, d);
@@ -192,7 +206,6 @@ final class UnityViewer {
         final boolean[] busy = {false};
         final ArrayDeque<Map<String, int[]>> undoStack = new ArrayDeque<>();
         final String[] status = {null};
-
         Runnable refresh = () -> {
             int s = selected[0];
             int texPart = s >= 0 ? s : firstTextured(d);
@@ -217,6 +230,15 @@ final class UnityViewer {
             pick.setEnabled(!busy[0]);
         };
 
+        for (int i = 0; i < 4; i++) {
+            final float yawTo = viewYaw[i]; final String name = viewNames[i];
+            viewButtons[i].setOnClickListener(v -> {
+                gl.setAngles(yawTo, 0);
+                status[0] = name + " view: the model's " + name.toLowerCase() + (name.equals("Front") || name.equals("Back") ? "" : " side") + " faces you.";
+                refresh.run();
+            });
+        }
+
         mode.setOnClickListener(v -> new AlertDialog.Builder(activity).setTitle("View")
                 .setItems(new String[]{"3D", "UV (where parts sit on the texture)", "Paint a design onto the model"}, (dd, w) -> {
                     screen[0] = w;
@@ -224,6 +246,7 @@ final class UnityViewer {
                     gl.setVisibility(w == 1 ? View.GONE : View.VISIBLE);
                     decal.setVisibility(w == 2 ? View.VISIBLE : View.GONE);
                     paintPanel.setVisibility(w == 2 ? View.VISIBLE : View.GONE);
+                    views.setVisibility(w == 1 ? View.GONE : View.VISIBLE);
                     if (w == 2 && !decal.hasDesign()) pick.performClick();
                     refresh.run();
                 }).show());
@@ -471,6 +494,8 @@ final class UnityViewer {
         }
 
         void select(int part) { renderer.selected = part; requestRender(); }
+        /** Snap to an exact angle (zoom is kept). */
+        void setAngles(float yaw, float pitch) { renderer.yaw = yaw; renderer.pitch = pitch; requestRender(); }
         boolean cutout() { return renderer.cutout; }
         void toggleCutout() { renderer.cutout = !renderer.cutout; requestRender(); }
         /** The exact camera the current frame is drawn with. */
