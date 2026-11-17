@@ -101,6 +101,8 @@ public class MainActivity extends Activity {
     private UnityViewer.ImageCallback pendingDecal;
     /** Textures painted in the 3D viewer this session: key → {BundleInfo, Texture, int[] straight ARGB}. */
     private final Map<String, Object[]> unityPainted = new java.util.LinkedHashMap<>();
+    /** Unreal textures painted in the 3D viewer: key → {PackageInfo, Texture, int[] straight ARGB, top-down}. */
+    private final Map<String, Object[]> unrealPainted = new java.util.LinkedHashMap<>();
     private int trpOnly = -1;
     /** For RPA-1.0: the archive data file (the opened file is its .rpi index); otherwise the opened file. */
     private Uri rpaDataUri;
@@ -295,10 +297,12 @@ public class MainActivity extends Activity {
                 for (UnrealAssets.Texture t : pkgInfo.textures)
                     m.append("• ").append(t.name).append(" — ").append(t.pixelFormat).append(" ").append(t.width).append("×").append(t.height)
                             .append(", ").append(t.mips.size()).append(" mips").append(t.format < 0 ? " (not supported yet)" : "").append('\n');
-                new AlertDialog.Builder(this).setTitle(pkgInfo.path)
+                AlertDialog.Builder dlg = new AlertDialog.Builder(this).setTitle(pkgInfo.path)
                         .setMessage(m + "\nExtract as PNG?")
                         .setNegativeButton("Cancel", null)
-                        .setPositiveButton("Extract", (d, w) -> beginUnrealExtract(position)).show();
+                        .setPositiveButton("Extract", (d, w) -> beginUnrealExtract(position));
+                if (!unrealInfo.meshes.isEmpty()) dlg.setNeutralButton("3D models…", (d, w) -> openUnrealModels());
+                dlg.show();
                 return;
             }
             if (unityInfo != null) {
@@ -461,6 +465,7 @@ public class MainActivity extends Activity {
             unrealChanged = null;
             unityPatches = null;
             unityPainted.clear();
+            unrealPainted.clear();
             retroMode = null;
             ndsNodes.clear();
             expandedNds.clear();
@@ -837,7 +842,8 @@ public class MainActivity extends Activity {
         if (pakInfo != null) location.setText("/PAK   (" + displayed.size() + " bundles)");
         if (voxInfo != null) location.setText("/VOX   (" + displayed.size() + " clips)");
         if (trpInfo != null) location.setText("/TROPHY.TRP   (" + displayed.size() + " files)");
-        if (unrealInfo != null) location.setText("/Unreal   (" + displayed.size() + " packages, " + unrealInfo.textures + " textures)");
+        if (unrealInfo != null) location.setText("/Unreal   (" + displayed.size() + " packages, " + unrealInfo.textures + " textures" +
+                (unrealPainted.isEmpty() ? ")" : ", " + unrealPainted.size() + " painted — tap rebuild to save)"));
         if (unityInfo != null) location.setText("/Unity   (" + displayed.size() + " bundles, " + unityInfo.textures + " textures" +
                 (unityPainted.isEmpty() ? ")" : ", " + unityPainted.size() + " painted — tap rebuild to save)"));
         if (rpaInfo != null) location.setText("/RPA   (" + displayed.size() + " files, " + human(rpaInfo.totalBytes) + ")");
@@ -2711,10 +2717,140 @@ public class MainActivity extends Activity {
         voxInfo = null; rpaInfo = null; trpInfo = null;
         busy = false;
         summary.setText(info.description());
-        detail.setText("Extract all textures as PNG, or tap a package. Edit the PNGs (keep their names), then use " +
+        detail.setText("Extract all textures as PNG, or tap a package" + (info.meshes.isEmpty() ? "" : " (also to open the 3D models and paint on them)") +
+                ". Edit the PNGs (keep their names), then use " +
                 "\"Edited PNGs → rebuild\" to write a new " + (info.single ? "pak" : "OBB") + ". Each texture goes back in its " +
                 "original format with all its mipmaps.");
         render();
+        if (!info.meshes.isEmpty()) {
+            new AlertDialog.Builder(this).setTitle("3D models found")
+                    .setMessage(info.meshes.size() + " models. Open one to see it textured, check which texture is which part, and paint designs onto it.")
+                    .setNegativeButton("Later", null)
+                    .setPositiveButton("Browse models", (d, w) -> openUnrealModels()).show();
+        }
+    }
+
+    /** Searchable list of every mesh in the pak(s): characters first, then by size. */
+    private void openUnrealModels() {
+        if (busy || unrealInfo == null) return;
+        final List<UnrealModels.MeshRef> all = unrealInfo.meshes;
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int pad = (int) (12 * getResources().getDisplayMetrics().density);
+        box.setPadding(pad, pad / 2, pad, 0);
+        android.widget.EditText search = new android.widget.EditText(this);
+        search.setHint("Search (e.g. Max, Chloe, Car)");
+        search.setSingleLine(true);
+        box.addView(search);
+        ListView lv = new ListView(this);
+        box.addView(lv, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (int) (getResources().getDisplayMetrics().heightPixels * 0.6)));
+        final List<UnrealModels.MeshRef> shown = new ArrayList<>();
+        final ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, new ArrayList<>());
+        lv.setAdapter(adapter);
+        Runnable filter = () -> {
+            String q = search.getText().toString().trim().toLowerCase(java.util.Locale.ROOT);
+            shown.clear(); adapter.clear();
+            for (UnrealModels.MeshRef m : all) {
+                if (!q.isEmpty() && !m.path.toLowerCase(java.util.Locale.ROOT).contains(q) && !m.name.toLowerCase(java.util.Locale.ROOT).contains(q)) continue;
+                shown.add(m); adapter.add(m.label());
+                if (shown.size() >= 400) break;
+            }
+            adapter.notifyDataSetChanged();
+        };
+        filter.run();
+        search.addTextChangedListener(new android.text.TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence c, int a, int b, int d) { }
+            @Override public void onTextChanged(CharSequence c, int a, int b, int d) { filter.run(); }
+            @Override public void afterTextChanged(android.text.Editable e) { }
+        });
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle(all.size() + " 3D models").setView(box)
+                .setNegativeButton("Close", null).create();
+        lv.setOnItemClickListener((parent, view, pos, id) -> {
+            if (pos < 0 || pos >= shown.size()) return;
+            dialog.dismiss();
+            viewUnrealModel(shown.get(pos));
+        });
+        dialog.show();
+    }
+
+    private void viewUnrealModel(UnrealModels.MeshRef ref) {
+        if (busy || unrealInfo == null || imageUri == null) return;
+        final UnrealObb.Info info = unrealInfo;
+        busy = true; render();
+        summary.setText("Loading " + ref.name + "...");
+        worker.execute(() -> {
+            try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                if (descriptor == null) throw new IOException("Could not reopen the file");
+                UnityViewer.Data data;
+                Map<String, int[]> painted = new HashMap<>();
+                for (Map.Entry<String, Object[]> e : unrealPainted.entrySet()) painted.put(e.getKey(), (int[]) e.getValue()[2]);
+                try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
+                     FileChannel channel = stream.getChannel()) {
+                    data = UnityViewer.loadUnreal(reopenUnreal(channel, info), ref, painted);
+                }
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText(info.description());
+                    UnityViewer.show(this, data, viewerHost(true));
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Couldn't open the model"); detail.setText(why);
+                    new AlertDialog.Builder(this).setTitle("Couldn't open " + ref.name).setMessage(why).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+    /** Encodes painted Unreal textures into their packages and asks where to save the new OBB / pak. */
+    private void buildPaintedUnreal() {
+        if (busy || unrealInfo == null || unrealPainted.isEmpty() || imageUri == null) return;
+        final UnrealObb.Info info = unrealInfo;
+        final List<Object[]> painted = new ArrayList<>(unrealPainted.values());
+        busy = true; render();
+        summary.setText("Encoding painted textures...");
+        worker.execute(() -> {
+            try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                if (descriptor == null) throw new IOException("Could not reopen the file");
+                Map<Integer, Map<String, byte[]>> changed = new java.util.LinkedHashMap<>();
+                try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor()); FileChannel channel = stream.getChannel()) {
+                    addUnrealPainted(reopenUnreal(channel, info), changed, painted);
+                }
+                final int count = painted.size();
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    summary.setText(count + " texture(s) ready");
+                    unrealChanged = changed; unityEditCount = count;
+                    Intent save = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                    save.addCategory(Intent.CATEGORY_OPENABLE);
+                    save.setType("application/octet-stream");
+                    save.putExtra(Intent.EXTRA_TITLE, getFilename(imageUri));
+                    save.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                    startActivityForResult(save, SAVE_UNITY);
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Couldn't encode the painted textures"); detail.setText(why);
+                    new AlertDialog.Builder(this).setTitle("Couldn't encode the painted textures").setMessage(why).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+    /** Patches painted textures into the changed-package map (reading packages not changed yet). Runs on the worker. */
+    private void addUnrealPainted(UnrealObb.Info live, Map<Integer, Map<String, byte[]>> changed, List<Object[]> painted) throws IOException {
+        int n = 0;
+        for (Object[] p : painted) {
+            UnrealObb.PackageInfo pi = (UnrealObb.PackageInfo) p[0];
+            UnrealAssets.Texture t = (UnrealAssets.Texture) p[1];
+            final int at = ++n;
+            runOnUiThread(() -> summary.setText("Encoding painted texture " + at + "/" + painted.size() + " (" + t.name + ")..."));
+            Map<String, byte[]> pkgs = changed.computeIfAbsent(pi.pak, k -> new java.util.LinkedHashMap<>());
+            byte[] bytes = pkgs.get(pi.path);
+            if (bytes == null) { bytes = live.paks.get(pi.pak).pak.read(UnrealObb.entry(live, pi)); pkgs.put(pi.path, bytes); }
+            UnrealObb.patch(bytes, t, (int[]) p[2], t.width, t.height);
+        }
     }
 
     private void beginUnrealExtract(int only) {
@@ -2821,6 +2957,7 @@ public class MainActivity extends Activity {
             live.paks.add(q);
         }
         live.packages.addAll(scanned.packages);
+        live.meshes.addAll(scanned.meshes);
         live.textures = scanned.textures;
         return live;
     }
@@ -2886,6 +3023,12 @@ public class MainActivity extends Activity {
                                 UnrealObb.patch(pkgBytes, t, argb, t.width, t.height);
                                 edited.add(r.name + " (" + t.pixelFormat + " " + t.width + "×" + t.height + ")");
                             } catch (IOException e) { problems.add(e.getMessage()); }
+                        }
+                        // textures painted in the 3D viewer win over a PNG of the same texture
+                        List<Object[]> painted = new ArrayList<>(unrealPainted.values());
+                        if (!painted.isEmpty()) {
+                            addUnrealPainted(live, changed, painted);
+                            for (Object[] p : painted) edited.add(((UnrealAssets.Texture) p[1]).name + " (painted in 3D viewer)");
                         }
                     }
                 }
@@ -3182,7 +3325,7 @@ public class MainActivity extends Activity {
                 }
                 runOnUiThread(() -> {
                     busy = false; render(); summary.setText(info.description());
-                    UnityViewer.show(this, data, viewerHost());
+                    UnityViewer.show(this, data, viewerHost(false));
                 });
             } catch (Exception | OutOfMemoryError e) {
                 String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
@@ -3194,7 +3337,7 @@ public class MainActivity extends Activity {
         });
     }
 
-    private UnityViewer.Host viewerHost() {
+    private UnityViewer.Host viewerHost(boolean unreal) {
         return new UnityViewer.Host() {
             @Override public void save(String name, String mime, byte[] bytes) {
                 pendingViewerFile = bytes;
@@ -3213,11 +3356,11 @@ public class MainActivity extends Activity {
                 startActivityForResult(pick, PICK_DECAL);
             }
             @Override public void painted(String key, Object[] texInfo, int[] pixels) {
-                unityPainted.put(key, new Object[]{texInfo[0], texInfo[1], pixels});
+                (unreal ? unrealPainted : unityPainted).put(key, new Object[]{texInfo[0], texInfo[1], pixels});
                 render();
             }
-            @Override public int paintedCount() { return unityPainted.size(); }
-            @Override public void buildPainted() { buildPaintedObb(null); }
+            @Override public int paintedCount() { return (unreal ? unrealPainted : unityPainted).size(); }
+            @Override public void buildPainted() { if (unreal) buildPaintedUnreal(); else buildPaintedObb(null); }
         };
     }
 
@@ -3266,6 +3409,18 @@ public class MainActivity extends Activity {
 
     private void startUnityRebuild() {
         if (busy) return;
+        if (unrealInfo != null && !unrealPainted.isEmpty()) {
+            new AlertDialog.Builder(this).setTitle("Rebuild")
+                    .setMessage(unrealPainted.size() + " texture(s) painted in the 3D viewer will be included. Add edited PNGs from an " +
+                            "extracted folder too? (If the same texture is in both, the painted version wins.)")
+                    .setNegativeButton("Painted only", (d, w) -> buildPaintedUnreal())
+                    .setPositiveButton("Also pick a folder", (d, w) -> {
+                        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                        startActivityForResult(intent, PICK_UNITY_EDITS);
+                    }).show();
+            return;
+        }
         if (unrealInfo != null) {
             new AlertDialog.Builder(this).setTitle("Rebuild with edited textures")
                     .setMessage("Pick the Unreal_Textures_… folder you extracted from this file (the one containing " + UnrealObb.INDEX_NAME +

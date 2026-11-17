@@ -29,12 +29,13 @@ final class UnrealObb {
         final List<UnityObb.Entry> zipEntries = new ArrayList<>();
         final List<PakInfo> paks = new ArrayList<>();
         final List<PackageInfo> packages = new ArrayList<>();
+        final List<UnrealModels.MeshRef> meshes = new ArrayList<>();
         int textures, unsupported, failed;
         String description() {
             int files = 0;
             for (PakInfo p : paks) if (p.pak != null) files += p.pak.entries.size();
             return "Unreal Engine " + (single ? "pak" : "OBB") + " · " + paks.size() + " pak(s), " + files + " files · " + textures +
-                    " textures in " + packages.size() + " packages" + (unsupported > 0 ? " (" + unsupported + " in formats not supported yet)" : "") +
+                    " textures in " + packages.size() + " packages" + (meshes.isEmpty() ? "" : " · " + meshes.size() + " 3D models") + (unsupported > 0 ? " (" + unsupported + " in formats not supported yet)" : "") +
                     (failed > 0 ? " · " + failed + " couldn't be read" : "");
         }
     }
@@ -89,7 +90,15 @@ final class UnrealObb {
                     if (hs <= 0 || hs > e.usize || hs > 64 << 20) continue;
                     UnrealAssets.Package pkg = UnrealAssets.parse(pak.read(e, 0, hs));
                     boolean any = false;
-                    for (UnrealAssets.Export x : pkg.exports) if ("Texture2D".equals(UnrealAssets.className(pkg, x.classIndex))) any = true;
+                    for (UnrealAssets.Export x : pkg.exports) {
+                        String cls = UnrealAssets.className(pkg, x.classIndex);
+                        if ("Texture2D".equals(cls)) any = true;
+                        else if (UnrealModels.isMeshClass(cls)) {
+                            UnrealModels.MeshRef m = new UnrealModels.MeshRef();
+                            m.pak = pi; m.path = e.name; m.name = x.name; m.cls = cls; m.export = x.index; m.size = x.serialSize;
+                            info.meshes.add(m);
+                        }
+                    }
                     if (!any) continue;
                     byte[] all = pak.read(e);
                     PackageInfo pi2 = new PackageInfo(); pi2.pak = pi; pi2.path = e.name;
@@ -106,6 +115,8 @@ final class UnrealObb {
                 } catch (IOException ex) { info.failed++; }
             }
         }
+        // characters first, then the biggest models
+        info.meshes.sort((a, b) -> a.skeletal() != b.skeletal() ? (a.skeletal() ? -1 : 1) : Integer.compare(b.size, a.size));
         return info;
     }
 

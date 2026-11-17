@@ -7,6 +7,12 @@
                         Game/Content/Tex/T_Etc.uasset     ETC2_RGB 16x8, 3 mips, zlib in 512-byte blocks (several)
                         Game/Content/Tex/T_Bgra.uasset    B8G8R8A8 4x4, 1 mip, zlib
                         Game/Content/Maps/Level.umap      two textures: ETC2_RGBA 8x8 (2 mips) + G8 4x4, zlib
+                        Game/Content/Chars/…              a two-quad SkeletalMesh (front quad: material instance MI_Hero
+                                                          whose Diffusemap is T_Hero_D and whose parent material is
+                                                          BLEND_Masked; back quad: opaque M_Cloth importing T_Cloth_N and
+                                                          T_Cloth_D) and the textures it uses
+                        Game/Content/Props/SM_Box.uasset  a one-triangle StaticMesh whose material is only in the native
+                                                          slot list at the end of the export (as cooked games store it)
                         Game/Config/Game.ini              plain text, zlib
                       Packages follow the cooked, unversioned UE 4.14/4.15 layout (summary, names, imports, 96-byte
                       export entries, tagged properties, cooked platform data with inline mips).
@@ -113,6 +119,136 @@ def package(path, textures):
     assert len(head) == total, (len(head), total)
     return head + b''.join(b for _, b in bodies) + struct.pack('<I', TAG)
 
+# ---------------------------------------------------------------------------------------------- models and materials
+def summary(names_count, total, no, eo, io_, ec, ic, ar, bulk):
+    s = struct.pack('<Iiiiii', TAG, -7, 0, 0, 0, 0)
+    s += struct.pack('<i', total) + fstr('None') + struct.pack('<I', 0x80000000)
+    s += struct.pack('<ii', names_count, no) + struct.pack('<ii', 0, 0)
+    s += struct.pack('<iiiii', ec, eo, ic, io_, 0) + struct.pack('<iiii', 0, 0, 0, 0)
+    s += b'\0' * 16 + struct.pack('<i', 1) + struct.pack('<ii', ec, names_count)
+    for _ in range(2): s += struct.pack('<HHHI', 4, 15, 0, 0) + fstr('')
+    s += struct.pack('<IiIi', 0, 0, 0x12345678, 0) + struct.pack('<i', ar) + struct.pack('<q', bulk)
+    s += struct.pack('<iiii', 0, 0, -1, total)
+    return s
+
+class Pkg:
+    """Generic cooked package: imports (class package, class, outer, object) and exports (class import, name, body fn)."""
+    def __init__(self): self.names = ['None']; self.N = {'None': 0}; self.imports = []; self.exports = []
+    def fname(self, n):
+        if n not in self.N: self.N[n] = len(self.names); self.names.append(n)
+        return struct.pack('<ii', self.N[n], 0)
+    def imp(self, cls_pkg, cls, outer, obj):
+        self.imports.append((cls_pkg, cls, outer, obj)); return -len(self.imports)
+    def obj(self, cls, path):
+        """Imports object path /Game/A/B/Obj as Package /Game/A/B + object Obj; returns the object's index."""
+        pk = self.imp('/Script/CoreUObject', 'Package', 0, path.rsplit('/', 1)[0])
+        return self.imp('/Script/Engine', cls, pk, path.rsplit('/', 1)[1])
+    def build(self):
+        bodies = [(c, n, b(self)) for c, n, b in self.exports]
+        imp = b''.join(self.fname(a) + self.fname(b) + struct.pack('<i', o) + self.fname(c) for a, b, o, c in self.imports)
+        for c, n, _ in bodies: self.fname(n)
+        no = len(summary(0, 0, 0, 0, 0, 0, 0, 0, 0))
+        nb = b''.join(fstr(n) + b'\0\0\0\0' for n in self.names)
+        io_ = no + len(nb); eo = io_ + len(imp); ar = eo + 96 * len(bodies); total = ar + 4
+        exp = b''; at = total
+        for c, n, body in bodies:
+            e = struct.pack('<iiii', c, 0, 0, 0) + self.fname(n) + struct.pack('<I', 0x0B) + struct.pack('<ii', len(body), at)
+            e += b'\0' * 12 + b'\0' * 16 + struct.pack('<iii', 0, 1, 1) + struct.pack('<i', -1) + b'\0' * 16
+            exp += e; at += len(body)
+        head = summary(len(self.names), total, no, eo, io_, len(bodies), len(self.imports), ar, at) + nb + imp + exp + struct.pack('<i', 0)
+        assert len(head) == total
+        return head + b''.join(b for _, _, b in bodies) + struct.pack('<I', TAG)
+
+def prop(P, name, typ, value, extra=b''):
+    return P.fname(name) + P.fname(typ) + struct.pack('<ii', len(value), 0) + extra + b'\0' + value
+
+def struct_array(P, name, struct_name, elements):
+    inner = b''.join(elements)
+    value = struct.pack('<i', len(elements)) + P.fname(name) + P.fname('StructProperty') + struct.pack('<ii', len(inner), 0) + \
+            P.fname(struct_name) + b'\0' * 16 + b'\0' + inner
+    return prop(P, name, 'ArrayProperty', value, P.fname('StructProperty'))
+
+def material_instance(diffuse, normal, parent):
+    P = Pkg()
+    cls = P.imp('/Script/CoreUObject', 'Class', 0, 'MaterialInstanceConstant')
+    n_obj, d_obj, par = P.obj('Texture2D', normal), P.obj('Texture2D', diffuse), P.obj('Material', parent)
+    def body(P):
+        el = lambda pn, o: prop(P, 'ParameterName', 'NameProperty', P.fname(pn)) + prop(P, 'ParameterValue', 'ObjectProperty', struct.pack('<i', o)) + P.fname('None')
+        return (struct_array(P, 'TextureParameterValues', 'TextureParameterValue', [el('NormalMap+Roughness', n_obj), el('Diffusemap', d_obj)]) +
+                prop(P, 'Parent', 'ObjectProperty', struct.pack('<i', par)) + P.fname('None') + struct.pack('<i', 0) + b'\0' * 32)
+    P.exports.append((cls, 'MI_Hero', body))
+    return P.build()
+
+def material(textures, blend):
+    """Base material; textures are only imports (as in cooked games). blend: EBlendMode name or None (opaque)."""
+    P = Pkg()
+    cls = P.imp('/Script/CoreUObject', 'Class', 0, 'Material')
+    for t in textures: P.obj('Texture2D', t)
+    def body(P):
+        props = prop(P, 'BlendMode', 'ByteProperty', P.fname(blend), P.fname('EBlendMode')) if blend else b''
+        return props + P.fname('None') + struct.pack('<i', 0) + b'\0' * 24
+    return cls, body, P
+
+def half(f): return struct.unpack('<H', struct.pack('<e', f))[0]
+
+# Two quads, 1 m wide/tall. Unreal space: X right, Y towards the viewer (the character's front), Z up, cm.
+QUADS = [  # (y, material slot)
+    (10.0, 0), (-10.0, 1)]
+def quad_vertices():
+    verts = []
+    for y, _ in QUADS:
+        for x, z, u, v in [(-50, 0, 0, 1), (50, 0, 1, 1), (50, 100, 1, 0), (-50, 100, 0, 0)]:
+            verts.append((x, y, z, u, v, (0, 1 if y > 0 else -1, 0)))
+    return verts
+def quad_indices(q): b = q * 4; return [b, b + 1, b + 2, b, b + 2, b + 3]
+def packed_normal(n): return bytes(int(round((c + 1) * 127.5)) for c in n) + b'\xff'
+
+def skeletal_mesh(mat_paths):
+    P = Pkg()
+    cls = P.imp('/Script/CoreUObject', 'Class', 0, 'SkeletalMesh')
+    mats = [P.obj('MaterialInstanceConstant' if 'MI_' in m else 'Material', m) for m in mat_paths]
+    def body(P):
+        b = P.fname('None') + struct.pack('<i', 0) + b'\0\0' + b'\0' * 28
+        b += struct.pack('<i', len(mats)) + b''.join(struct.pack('<i', m) + P.fname('Slot%d' % i) + b'\0' * 24 for i, m in enumerate(mats))
+        b += struct.pack('<i', 1) + P.fname('Root') + struct.pack('<i', -1)       # bones
+        b += struct.pack('<i', 1) + b'\0' * 40 + struct.pack('<i', 1) + P.fname('Root') + struct.pack('<i', 0)
+        b += struct.pack('<i', 1) + b'\0\0'                                         # LODs, strip flags
+        b += struct.pack('<i', len(QUADS))
+        for q, (y, slot) in enumerate(QUADS):
+            b += b'\0\0' + struct.pack('<HII', slot, q * 6, 2) + b'\0' * 20 + struct.pack('<i', 1) + struct.pack('<H', 0)
+            b += struct.pack('<ii', 4, 1) + struct.pack('<iii', 0, 0, 0) + b'\0' * 4
+        idx = [i for q in range(len(QUADS)) for i in quad_indices(q)]
+        b += b'\0' + struct.pack('<ii', 2, len(idx)) + b''.join(struct.pack('<H', i) for i in idx)
+        verts = quad_vertices()
+        b += struct.pack('<i', 0) + struct.pack('<i', 0) + struct.pack('<I', len(verts)) + struct.pack('<i', 0) + struct.pack('<i', 0) + struct.pack('<i', 0)
+        b += struct.pack('<I', 1) + b'\0\0' + struct.pack('<II', 1, 0) + b'\0' * 24
+        b += struct.pack('<ii', 24, len(verts))
+        for x, y, z, u, v, n in verts:
+            b += b'\x80\x80\x80\xff' + packed_normal(n) + struct.pack('<fff', x, y, z) + struct.pack('<HH', half(u), half(v))
+        return b + b'\0' * 40                                                     # skin weights etc. (not read)
+    P.exports.append((cls, 'SK_Hero', body))
+    return P.build()
+
+def static_mesh(mat_path):
+    P = Pkg()
+    cls = P.imp('/Script/CoreUObject', 'Class', 0, 'StaticMesh')
+    mat = P.obj('Material', mat_path)
+    def body(P):
+        el = prop(P, 'MaterialSlotName', 'NameProperty', P.fname('Box')) + P.fname('None')   # cooked: no MaterialInterface here
+        b = struct_array(P, 'StaticMaterials', 'StaticMaterial', [el]) + P.fname('None')
+        b += struct.pack('<i', 0) + b'\0\0' + struct.pack('<i', 1) + struct.pack('<ii', 0, 0) + b'\0' * 16 + struct.pack('<i', 0)
+        b += struct.pack('<i', 1) + b'\0\0' + struct.pack('<i', 1) + struct.pack('<iii', 0, 0, 1) + b'\0' * 16 + b'\0' * 4
+        verts = [(0, 0, 0, 0, 1), (30, 0, 0, 1, 1), (0, 0, 30, 0, 0)]
+        b += struct.pack('<IIii', 12, 3, 12, 3) + b''.join(struct.pack('<fff', x, y, z) for x, y, z, u, v in verts)
+        b += b'\0\0' + struct.pack('<IIIii', 1, 12, 3, 0, 0) + struct.pack('<ii', 12, 3)
+        b += b''.join(b'\x80\x80\x80\xff' + packed_normal((0, 1, 0)) + struct.pack('<HH', half(u), half(v)) for x, y, z, u, v in verts)
+        b += b'\0\0' + struct.pack('<II', 4, 0) + struct.pack('<iii', 0, 1, 6) + struct.pack('<HHH', 0, 1, 2)
+        b += b'\0' * 20                                                           # distance field / misc (not read)
+        b += struct.pack('<i', 1) + struct.pack('<i', mat) + P.fname('Box') + struct.pack('<ii', 1, 0) + struct.pack('<ffff', 1, 0, 0, 0)
+        return b
+    P.exports.append((cls, 'SM_Box', body))
+    return P.build()
+
 def pak(files, block=512):
     """files: list of (path, data, compress). Pak version 3."""
     out = bytearray(); index = []
@@ -156,6 +292,22 @@ def main():
         built = [tex(path, *t) for t in texs]
         for i, e in enumerate(expected[start:]): e[1] = i
         files.append((path, package('/Game/' + path.split('/Content/')[1].rsplit('.', 1)[0], built), comp))
+    # a small "character": textures, a material instance with a masked parent, an opaque material, two meshes
+    for path, texs in [('Game/Content/Chars/Hero/T_Hero_D.uasset', [('T_Hero_D', 'PF_ETC2_RGB', 32, 32, 3, 6, False)]),
+                       ('Game/Content/Chars/Hero/T_Cloth_D.uasset', [('T_Cloth_D', 'PF_B8G8R8A8', 16, 16, 1, 7, True)])]:
+        start = len(expected)
+        built = [tex(path, *t) for t in texs]
+        for i, e in enumerate(expected[start:]): e[1] = i
+        files.append((path, package('/Game/' + path.split('/Content/')[1].rsplit('.', 1)[0], built), True))
+    files.append(('Game/Content/Chars/Hero/MI_Hero.uasset',
+                  material_instance('/Game/Chars/Hero/T_Hero_D/T_Hero_D', '/Game/Chars/Hero/T_Hero_N/T_Hero_N', '/Game/Chars/Shared/M_Masked/M_Masked'), True))
+    for path, texs, blend in [('Game/Content/Chars/Shared/M_Masked.uasset', ['/Game/Chars/Shared/T_Noise/T_Noise'], 'BLEND_Masked'),
+                              ('Game/Content/Chars/Hero/M_Cloth.uasset', ['/Game/Chars/Hero/T_Cloth_N/T_Cloth_N', '/Game/Chars/Hero/T_Cloth_D/T_Cloth_D'], None)]:
+        cls, body, P = material(texs, blend)
+        P.exports.append((cls, path.rsplit('/', 1)[1][:-7], body))
+        files.append((path, P.build(), True))
+    files.append(('Game/Content/Chars/Hero/SK_Hero.uasset', skeletal_mesh(['/Game/Chars/Hero/MI_Hero/MI_Hero', '/Game/Chars/Hero/M_Cloth/M_Cloth']), True))
+    files.append(('Game/Content/Props/SM_Box.uasset', static_mesh('/Game/Chars/Hero/M_Cloth/M_Cloth'), False))
     files.append(('Game/Config/Game.ini', b'[Section]\nKey=Value\n' * 40, True))
     pakbytes = pak(files)
     buf = io.BytesIO()

@@ -31,6 +31,103 @@ public class UnrealTest {
         return UnityObb.sha1(buf);
     }
 
+    static float[] vertex(UnityModels.Mesh m, int i) { return new float[]{m.pos[i * 3], m.pos[i * 3 + 1], m.pos[i * 3 + 2], m.uv[i * 2], m.uv[i * 2 + 1], m.normal[i * 3], m.normal[i * 3 + 1], m.normal[i * 3 + 2]}; }
+    static boolean near(float a, float b) { return Math.abs(a - b) < 1e-3f; }
+
+    /** Meshes, materials, the axis conversion, projection painting and rebuilding a painted texture. */
+    static void models(File obb) throws Exception {
+        try (FileInputStream in = new FileInputStream(obb); FileChannel ch = in.getChannel()) {
+            UnrealObb.Info info = UnrealObb.scan(ch, obb.getName(), null);
+            check(info.meshes.size() == 2 && info.meshes.get(0).skeletal() && info.meshes.get(0).name.equals("SK_Hero") &&
+                    info.meshes.get(1).name.equals("SM_Box") && "StaticMesh".equals(info.meshes.get(1).cls), "two meshes, skinned first");
+            check(info.description().contains("2 3D models"), "models counted in the description");
+            UnrealPak pak = info.paks.get(0).pak;
+            UnrealModels.PackageSource src = f -> { UnrealPak.Entry e = pak.byName.get(f); return e == null ? null : pak.read(e); };
+
+            UnrealModels.MeshRef sk = info.meshes.get(0);
+            byte[] b = pak.read(pak.byName.get(sk.path));
+            UnrealAssets.Package pk = UnrealAssets.parse(b);
+            UnrealModels.Loaded l = UnrealModels.mesh(b, pk, pk.exports.get(sk.export));
+            UnityModels.Mesh m = l.mesh;
+            check(m.vertexCount == 8 && m.parts.length == 2 && m.parts[0].length == 6 && m.parts[1].length == 6, "skinned mesh: 8 vertices, 2 parts of 2 triangles");
+            // Unreal (x, y, z) = (-50, 10, 0), uv (0, 1) → viewer (50, 0, 10), uv (0, 0); normal +Y → +Z
+            float[] v0 = vertex(m, 0), v2 = vertex(m, 2);
+            check(near(v0[0], 50) && near(v0[1], 0) && near(v0[2], 10) && near(v0[3], 0) && near(v0[4], 0), "axis and v flip, vertex 0");
+            check(near(v2[0], -50) && near(v2[1], 100) && near(v2[2], 10) && near(v2[3], 1) && near(v2[4], 1), "axis and v flip, vertex 2");
+            check(Math.abs(v0[5]) < 0.01f && Math.abs(v0[6]) < 0.01f && v0[7] > 0.99f, "normal converted");
+            check(near(m.min[1], 0) && near(m.max[1], 100) && near(m.min[2], -10) && near(m.max[2], 10), "bounds");
+            check("/Game/Chars/Hero/MI_Hero/MI_Hero".equals(l.partMaterial[0]) && "/Game/Chars/Hero/M_Cloth/M_Cloth".equals(l.partMaterial[1]), "material per part");
+            check("Game".equals(UnrealModels.project(sk.path)), "project folder");
+            check("Game/Content/Chars/Hero/MI_Hero.uasset".equals(UnrealModels.packagePath(l.partMaterial[0], "Game")) &&
+                    "Engine/Content/A/B.uasset".equals(UnrealModels.packagePath("/Engine/A/B/B", "Game")) && UnrealModels.packagePath("/Script/X", "Game") == null, "object path → package file");
+
+            UnrealModels.Material mi = UnrealModels.material(src, l.partMaterial[0], "Game");
+            check("/Game/Chars/Hero/T_Hero_D/T_Hero_D".equals(mi.texture), "instance: Diffusemap parameter chosen over the normal map");
+            check(mi.cutout, "instance inherits BLEND_Masked from its parent");
+            UnrealModels.Material cloth = UnrealModels.material(src, l.partMaterial[1], "Game");
+            check("/Game/Chars/Hero/T_Cloth_D/T_Cloth_D".equals(cloth.texture) && !cloth.cutout, "base material: *_D import, opaque");
+            check(UnrealModels.pickDiffuse(java.util.Collections.singletonList(new String[]{null, "/G/TX_Max01_EyeLashes"})) != null, "'_Max' isn't read as a mask suffix");
+            check(UnrealModels.pickDiffuse(java.util.Arrays.asList(new String[]{null, "/G/T_Body_N"}, new String[]{null, "/G/T_Body_S"})) == null, "data maps aren't diffuse");
+
+            UnrealModels.MeshRef sm = info.meshes.get(1);
+            byte[] sb = pak.read(pak.byName.get(sm.path));
+            UnrealAssets.Package spk = UnrealAssets.parse(sb);
+            UnrealModels.Loaded sl = UnrealModels.mesh(sb, spk, spk.exports.get(sm.export));
+            check(sl.mesh.vertexCount == 3 && sl.mesh.parts.length == 1 && sl.mesh.parts[0].length == 3, "static mesh: one triangle");
+            float[] s1 = vertex(sl.mesh, 1);
+            check(near(s1[0], -30) && near(s1[1], 0) && near(s1[2], 0) && near(s1[3], 1) && near(s1[4], 0), "static vertex converted");
+            check("/Game/Chars/Hero/M_Cloth/M_Cloth".equals(sl.partMaterial[0]), "static material read from the native slot list");
+
+            // paint from the Front view: only the front quad's texture changes
+            Object[] heroTex = UnrealModels.findTexture(info, mi.texture, "Game"), clothTex = UnrealModels.findTexture(info, cloth.texture, "Game");
+            check(heroTex != null && clothTex != null, "textures found from material paths");
+            UnrealObb.PackageInfo hp = (UnrealObb.PackageInfo) heroTex[0]; UnrealAssets.Texture ht = (UnrealAssets.Texture) heroTex[1];
+            UnrealObb.PackageInfo cp = (UnrealObb.PackageInfo) clothTex[0]; UnrealAssets.Texture ct = (UnrealAssets.Texture) clothTex[1];
+            int[] hero = UnrealObb.decode(info, hp, ht), clothPx = UnrealObb.decode(info, cp, ct);
+            int[] heroBefore = hero.clone(), clothBefore = clothPx.clone();
+            UnityPaint.Geometry g = new UnityPaint.Geometry(m);
+            UnityPaint.View3D view = UnityPaint.camera(UnityPaint.YAW_FRONT, 0, 1, g.center, g.radius, 400, 400);
+            UnityPaint.Depth depth = UnityPaint.depth(g, view, 400);
+            UnityPaint.Decal dc = new UnityPaint.Decal();
+            dc.w = dc.h = 4; dc.argb = new int[16]; java.util.Arrays.fill(dc.argb, 0xFFFF0000);
+            float[] centre = UnityPaint.project(view, g.center[0], g.center[1], g.center[2]);
+            dc.cx = centre[0]; dc.cy = centre[1]; dc.size = 400;   // covers the whole view
+            UnityPaint.Result r0 = UnityPaint.stamp(g, view, depth, dc, hero, ht.width, ht.height, java.util.Arrays.asList(0), java.util.Arrays.asList(0));
+            UnityPaint.Result r1 = UnityPaint.stamp(g, view, depth, dc, clothPx, ct.width, ct.height, java.util.Arrays.asList(1), java.util.Arrays.asList(1));
+            check(r0.painted > ht.width * ht.height * 9 / 10, "front quad painted (" + r0.painted + " texels)");
+            check(r1.painted == 0 && java.util.Arrays.equals(clothPx, clothBefore), "back quad untouched");
+            check(hero[ht.width * ht.height / 2 + ht.width / 2] == 0xFFFF0000 && !java.util.Arrays.equals(hero, heroBefore), "painted texels are the decal colour");
+            // the left of the model as seen from the front is texture u = 0 (Unreal x = -50)
+            float[] pl = UnityPaint.project(view, -50f, 50f, 10f);   // drawn geometry x is Unreal x
+            check(pl != null && pl[0] < 200, "Unreal -x shows on the left from the front");
+
+            // write it into the package, rebuild, read back
+            byte[] pkgBytes = pak.read(UnrealObb.entry(info, hp));
+            UnrealObb.patch(pkgBytes, ht, hero, ht.width, ht.height);
+            Map<Integer, Map<String, byte[]>> changed = new HashMap<>();
+            changed.computeIfAbsent(0, k -> new LinkedHashMap<>()).put(hp.path, pkgBytes);
+            File out = File.createTempFile("unreal_painted", ".obb"); out.deleteOnExit();
+            try (FileOutputStream fo = new FileOutputStream(out)) { UnrealObb.rebuild(ch, info, changed, fo, null); }
+            try (FileInputStream ri = new FileInputStream(out); FileChannel rc = ri.getChannel()) {
+                UnrealObb.Info again = UnrealObb.scan(rc, "painted", null);
+                check(again.meshes.size() == 2 && again.textures == info.textures, "painted OBB rescans");
+                Object[] t2 = UnrealModels.findTexture(again, mi.texture, "Game");
+                int[] back = UnrealObb.decode(again, (UnrealObb.PackageInfo) t2[0], (UnrealAssets.Texture) t2[1]);
+                int red = 0;
+                for (int c : back) if (((c >> 16) & 255) > 200 && ((c >> 8) & 255) < 60 && (c & 255) < 60) red++;
+                check(red > back.length * 9 / 10, "painted texture reads back red after ETC2 encoding (" + red + "/" + back.length + ")");
+            }
+
+            // corrupt mesh data fails cleanly
+            byte[] bad = b.clone();
+            UnrealAssets.Export x = pk.exports.get(sk.export);
+            int matCount = x.serialOffset + 8 + 4 + 2 + 28;   // after "None", guid flag, strip flags, bounds
+            check(UnrealAssets.i32At(b, matCount) == 2, "material count where expected");
+            for (int i = matCount; i < matCount + 4; i++) bad[i] = (byte) 0x7f;
+            try { UnrealModels.mesh(bad, pk, x); check(false, "corrupt mesh accepted"); } catch (java.io.IOException expectedFailure) { checks++; }
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         File dir = new File(args.length > 0 ? args[0] : "tests/fixtures/unreal");
         File obb = new File(dir, "unreal_fixture.obb");
@@ -45,8 +142,8 @@ public class UnrealTest {
             check(!UnityObb.isUnity(ch), "not mistaken for Unity");
             UnrealObb.Info info = UnrealObb.scan(ch, obb.getName(), null);
             check(!info.single && info.paks.size() == 1 && info.paks.get(0).entry.endsWith(".pak"), "one pak inside the OBB");
-            check(info.paks.get(0).pak.version == 3 && info.paks.get(0).pak.entries.size() == 5, "pak v3 with 5 files");
-            check(info.textures == expected.size() && info.packages.size() == 4 && info.failed == 0, info.description());
+            check(info.paks.get(0).pak.version == 3 && info.paks.get(0).pak.entries.size() == 12, "pak v3 with 12 files");
+            check(info.textures == expected.size() && info.packages.size() == 6 && info.failed == 0, info.description());
             for (String[] e : expected) {
                 UnrealObb.Row r = new UnrealObb.Row();
                 r.pak = info.paks.get(0).entry; r.pkg = e[0]; r.export = Integer.parseInt(e[1]);
@@ -146,6 +243,7 @@ public class UnrealTest {
             check(!UnrealPak.isPak(UnityBundle.of(junk)), "junk isn't a pak");
             try { UnrealAssets.parse(junk); check(false, "junk package accepted"); } catch (java.io.IOException expectedFailure) { checks++; }
         }
+        models(obb);
         System.out.println("UnrealTest OK (" + checks + " checks)");
     }
 }

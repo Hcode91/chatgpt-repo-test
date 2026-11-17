@@ -1,6 +1,29 @@
-# Game Asset Extractor (Android v0.20.0)
+# Game Asset Extractor (Android v0.21.0)
 
-## New in v0.20: Unreal Engine 4 games (OBB with .pak inside, or a loose .pak)
+## New in v0.21: 3D models and painting for Unreal Engine 4 games
+
+Unreal OBBs and paks now get the same 3D viewer, UV view and projection painting as Unity games. After opening one, **Browse models** lists every model, with characters first, and has a search box (e.g. "Max", "Chloe"). Tapping any package also offers **3D models…**. In the viewer, each part shows its real texture. Paint works as before: pick a design, place it, then tap Apply. **Save… → New OBB with painted textures** writes the paint back in the original texture format with all its mips. **Edited PNGs → rebuild** includes painted textures too, and a painted texture wins over a PNG of the same texture.
+
+How it works:
+- **Meshes:** LOD 0 of cooked SkeletalMesh (characters) and StaticMesh (props, scenery).
+  - Skinned vertices: packed normal, position, half-float UV.
+  - Static meshes: separate position buffer, then normals and UVs in packed or high-precision form.
+  - Unreal is Z-up and left-handed, so positions are turned so that **Front** shows the character's face. Texture rows run top-down, so V is flipped for the viewer.
+- **Materials:** a mesh's material slot leads to a material instance, whose Diffusemap/BaseColor parameter gives the texture. The app follows its parent materials until it finds one. A base material falls back to its *_D texture import.
+  - The blend mode, read from the base material or an instance override, decides whether alpha is see-through. Masked and translucent parts get cutouts; on opaque parts, alpha is ignored because it's usually a mask for something else.
+  - Cooked static meshes leave the material out of their property list. It's read from the native slot list at the end of the mesh data instead.
+
+**How it was checked**, on Life is Strange (original):
+- All 1,978 models (130 skinned, 1,848 static) decode with every index inside its vertex buffer.
+- 2,532 of 2,665 parts find their texture. The rest really have none: eye corneas, black planes, engine helper meshes.
+- An independent Python decoder gives the same vertices (positions, normals and UVs) as the app for Chloe. Software renders of Max and Chloe with their textures look right, including reading text on Max's shirt the right way round.
+- A design painted from the Front view onto Chloe's top, through the same Java code the app runs, was rebuilt into the pak. repak read all 27,835 files back, and only that one texture had changed (same size). An independent render from the repak copy shows the design exactly where it was placed and nothing on her back.
+- The CI test adds a synthetic skinned mesh, static mesh, material instance and materials to the Unreal fixture. It checks the axis and UV conversion, the material and blend-mode choice, the static-mesh native slots, that a front paint leaves the back untouched, and that the painted texture survives a rebuild.
+
+**Not yet checked:** painted OBBs haven't been run in the game on a phone yet. Only LOD 0 is shown and painted. Distant LODs use their own lower-resolution textures (e.g. `_LOD2` materials), so those may still show the old look from far away.
+
+
+## v0.20: Unreal Engine 4 games (OBB with .pak inside, or a loose .pak)
 
 Open an Unreal OBB (e.g. `main.<version>.<package>.obb` holding `…/Content/Paks/pakchunk0-Android_ETC2.pak`) or a `.pak` with **Open ROM**. Every package with textures is listed. **Extract all textures** (or tap a package) writes `Unreal_Textures_<time>/`, mirroring the game's folders, with one PNG per texture and `unreal_textures.tsv`. Edit the PNGs, open the original again, then **Edited PNGs → rebuild Unreal OBB / pak** and pick the folder. Each changed texture is re-encoded in its original format, with every stored mip regenerated at its size. A PNG of another size is scaled back. Then copy the new OBB over the original in `Android/obb/<package>/` with the same name. No signing is needed. For OBBs that live inside an APK, the done screen offers **Put into APK…**.
 
@@ -16,7 +39,7 @@ How it works:
 - Four edited textures (one per format) were rebuilt into a new OBB. **repak**, an independent Rust pak library, read all 27,835 files from it, and exactly those 4 packages differed. Their textures decoded with texture2ddecoder exactly as the app intended. G8 and BGRA came out lossless; ETC2 re-encodes the way any ETC2 encoder does (43 dB on Max's hair).
 - The CI test (`tests/run-unreal-test.sh`) runs the same on a synthetic OBB built by `tests/fixtures/unreal/gen_unreal_fixture.py`: stored and multi-block zlib packages, a map holding two textures, all four formats, a loose pak, and checks that damaged files are rejected. That pak is also re-read by repak.
 
-**Not yet checked:** the rebuilt OBB hasn't been run in the game on a phone yet. Unreal 3D model viewing and painting aren't supported (Unity only). Newer Unreal versions (4.16+ split `.uexp` files, IoStore) and encrypted paks aren't supported yet.
+**Not yet checked:** the rebuilt OBB hasn't been run in the game on a phone yet. Newer Unreal versions (4.16+ split `.uexp` files, IoStore) and encrypted paks aren't supported yet.
 
 
 ## New in v0.19: put a modified file back into an APK and sign it
