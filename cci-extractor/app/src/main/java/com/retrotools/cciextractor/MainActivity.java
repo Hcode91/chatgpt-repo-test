@@ -3131,9 +3131,12 @@ public class MainActivity extends Activity {
                     busy = false; render();
                     summary.setText("Saved " + name);
                     detail.setText(count + " texture(s) written. " + where);
-                    new AlertDialog.Builder(this).setTitle("New file saved")
-                            .setMessage(name + "\n\n" + count + " texture(s) replaced in " + patches.size() + " bundle(s); everything else is byte-for-byte the original.\n\n" + where)
-                            .setPositiveButton("OK", null).show();
+                    AlertDialog.Builder done = new AlertDialog.Builder(this).setTitle("New file saved")
+                            .setMessage(name + "\n\n" + count + " texture(s) replaced in " + patches.size() + " bundle(s); everything else is byte-for-byte the original.\n\n" + where +
+                                    (info.single || info.apk ? "" : "\n\nIf this file came from inside the game's APK, tap \"Put into APK…\" to put it back and sign the APK."))
+                            .setPositiveButton("OK", null);
+                    if (!info.single && !info.apk) done.setNeutralButton("Put into APK…", (d, w) -> { showTab(true); convertTab.startApkRepack(dest); });
+                    done.show();
                 });
             } catch (Exception | OutOfMemoryError e) {
                 try { DocumentsContract.deleteDocument(getContentResolver(), dest); } catch (Exception ignored) { }

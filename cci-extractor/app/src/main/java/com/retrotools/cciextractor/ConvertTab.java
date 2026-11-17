@@ -40,7 +40,8 @@ final class ConvertTab {
     static final int PICK_CIA = 401, SAVE_CCI = 402, PICK_CCI = 403, SAVE_CIA = 404, PICK_CERT_CIA = 405,
             PICK_TEXTURES = 406, PICK_TEXTURE_DIR = 407, PICK_CERT_FILE = 408, PICK_RPA_SOURCE = 409, SAVE_RPA = 410,
             PICK_TRP_SOURCE = 411, SAVE_TRP = 412, PICK_TRP_EDIT = 413, PICK_TROPHY_ICON = 414, SAVE_TRP_EDIT = 415,
-            PICK_TROPUSR = 416, SAVE_TROPUSR = 417, SAVE_TROPHY_MOD = 418, PICK_TRP_FOR_MOD = 419, PICK_TROPHY_MOD = 420;
+            PICK_TROPUSR = 416, SAVE_TROPUSR = 417, SAVE_TROPHY_MOD = 418, PICK_TRP_FOR_MOD = 419, PICK_TROPHY_MOD = 420,
+            PICK_APK = 421, PICK_APK_FILE = 422, SAVE_APK = 423;
 
     private static final String[] OUTPUTS = {"PNG", "DDS · RGBA8 (uncompressed)", "DDS · BC1 / DXT1", "DDS · BC3 / DXT5",
             "KTX · RGBA8", "KTX · ETC1", "DS NCGR + NCLR · 4bpp (16 colours)", "DS NCGR + NCLR · 8bpp (256 colours)"};
@@ -55,7 +56,10 @@ final class ConvertTab {
     private int textureOutput, textureResize;
     private boolean busy;
     private TextView status, certStatus, log;
-    private Button ciaToCci, cciToCia, saveCert, textures, folderToRpa, folderToTrp, addTrophies, applyTrophyMod, cancel;
+    private Button ciaToCci, cciToCia, saveCert, textures, folderToRpa, folderToTrp, addTrophies, applyTrophyMod, apkRepack, cancel;
+    // APK repack session
+    private Uri apkUri, apkReplacement, apkPresetReplacement;
+    private String apkEntry;
     // Trophy editor session
     private Ps3TrophyMod.Pack trophyPack;
     private boolean trophyFromMod;
@@ -124,6 +128,13 @@ final class ConvertTab {
         applyTrophyMod = button("Apply a trophy mod (.zip)…");
         box.addView(applyTrophyMod, new LinearLayout.LayoutParams(-1, dp(52)));
 
+        box.addView(text("Android APK", 17, Color.rgb(35, 45, 91)));
+        box.addView(text("Put a modified file (e.g. a rebuilt OBB / game data) back into a game's APK and sign it so Android " +
+                "installs it. Signed with this app's own key, so the original game must be uninstalled first (back up your saves). " +
+                "Later rebuilds signed by this app install over it.", 12, Color.DKGRAY));
+        apkRepack = button("Put a file into an APK & sign…");
+        box.addView(apkRepack, new LinearLayout.LayoutParams(-1, dp(52)));
+
         cancel = button("Cancel");
         box.addView(cancel, new LinearLayout.LayoutParams(-1, dp(46)));
         status = text("Ready.", 14, Color.rgb(36, 49, 105));
@@ -162,6 +173,7 @@ final class ConvertTab {
             tree.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             activity.startActivityForResult(tree, PICK_RPA_SOURCE);
         });
+        apkRepack.setOnClickListener(v -> startApkRepack(null));
         cancel.setOnClickListener(v -> { cancelled.set(true); NativeCia.cancel(); status.setText("Cancelling…"); });
 
         ScrollView scroll = new ScrollView(activity);
@@ -172,6 +184,7 @@ final class ConvertTab {
     private void refresh() {
         ciaToCci.setEnabled(!busy); cciToCia.setEnabled(!busy); saveCert.setEnabled(!busy); textures.setEnabled(!busy);
         folderToRpa.setEnabled(!busy); folderToTrp.setEnabled(!busy); addTrophies.setEnabled(!busy); applyTrophyMod.setEnabled(!busy);
+        apkRepack.setEnabled(!busy);
         cancel.setEnabled(busy);
         certStatus.setText(loadCertChain() != null ? "Certificate chain: saved ✓ (CCI → CIA is ready)"
                 : "Certificate chain: not saved yet (needed for CCI → CIA)");
@@ -207,7 +220,7 @@ final class ConvertTab {
     private static String message(Exception e) { return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(); }
 
     // ---------------------------------------------------------------- results
-    boolean handles(int request) { return request >= 401 && request <= 420; }
+    boolean handles(int request) { return request >= 401 && request <= 423; }
 
     void onResult(int request, Intent data) {
         if (request == PICK_TEXTURES) {
@@ -251,6 +264,9 @@ final class ConvertTab {
             case PICK_TROPUSR: pickedTropusr(uri); break;
             case SAVE_TROPUSR: saveTropusr(uri); break;
             case SAVE_TROPHY_MOD: saveTrophyMod(uri); break;
+            case PICK_APK: apkUri = uri; listApkEntries(uri); break;
+            case PICK_APK_FILE: apkReplacement = uri; save(SAVE_APK, stem(filename(apkUri)) + "_modded.apk"); break;
+            case SAVE_APK: runApkRepack(apkUri, apkEntry, apkReplacement, uri); break;
         }
     }
 
@@ -899,6 +915,158 @@ final class ConvertTab {
                 });
             } catch (Exception e) {
                 activity.runOnUiThread(() -> { busy = false; refresh(); error("Texture conversion failed", e); });
+            }
+        });
+    }
+
+    // ---------------------------------------------------------------- APK repack + sign
+
+    /** Starts "put a file into an APK". {@code replacement}: a file already chosen (e.g. the OBB just rebuilt), or null. */
+    void startApkRepack(Uri replacement) {
+        if (busy) return;
+        apkPresetReplacement = replacement;
+        new AlertDialog.Builder(activity).setTitle("Put a file into an APK")
+                .setMessage("1. Pick the game's original APK.\n2. Pick which file inside it to replace" +
+                        (replacement == null ? ".\n3. Pick your modified file." : " with " + filename(replacement) + ".") +
+                        "\nThen choose where to save the new, signed APK.\n\nWhile it works it needs free space for about two extra copies of the APK.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Pick APK", (d, w) -> pick(PICK_APK, "*/*", false)).show();
+    }
+
+    private void listApkEntries(Uri apk) {
+        busy = true; refresh(); status.setText("Reading APK…");
+        worker.execute(() -> {
+            try (ParcelFileDescriptor pfd = activity.getContentResolver().openFileDescriptor(apk, "r")) {
+                if (pfd == null) throw new IOException("Can't open the APK");
+                List<UnityObb.Entry> entries;
+                try (FileInputStream in = new FileInputStream(pfd.getFileDescriptor()); FileChannel ch = in.getChannel()) {
+                    entries = ApkRepack.entriesBySize(ch);
+                }
+                boolean manifest = false;
+                for (UnityObb.Entry e : entries) if (e.name.equals("AndroidManifest.xml")) manifest = true;
+                if (!manifest) throw new IOException("That isn't an APK (no AndroidManifest.xml inside)");
+                int n = Math.min(entries.size(), 300);
+                String[] labels = new String[n];
+                for (int i = 0; i < n; i++) {
+                    UnityObb.Entry e = entries.get(i);
+                    labels[i] = e.name + "  ·  " + human(e.usize) + (e.method == 0 ? " · stored" : " · compressed");
+                }
+                activity.runOnUiThread(() -> {
+                    busy = false; refresh(); status.setText(filename(apk) + ": pick the file to replace");
+                    new AlertDialog.Builder(activity).setTitle("Which file to replace? (largest first)")
+                            .setItems(labels, (d, w) -> {
+                                apkEntry = entries.get(w).name;
+                                log.setText("Replacing " + apkEntry + " (" + human(entries.get(w).usize) + ")");
+                                if (apkPresetReplacement != null) {
+                                    apkReplacement = apkPresetReplacement;
+                                    save(SAVE_APK, stem(filename(apkUri)) + "_modded.apk");
+                                } else pick(PICK_APK_FILE, "*/*", false);
+                            })
+                            .setNegativeButton("Cancel", null).show();
+                });
+            } catch (Exception e) {
+                activity.runOnUiThread(() -> { busy = false; refresh(); error("Couldn't read the APK", e); });
+            }
+        });
+    }
+
+    private static String human(long b) {
+        if (b < 1024) return b + " B";
+        if (b < 1 << 20) return String.format(Locale.UK, "%.1f KB", b / 1024.0);
+        if (b < 1L << 30) return String.format(Locale.UK, "%.1f MB", b / 1048576.0);
+        return String.format(Locale.UK, "%.2f GB", b / 1073741824.0);
+    }
+
+    private UnityObb.Content content(Uri uri) {
+        return new UnityObb.Content() {
+            public long length() throws IOException {
+                try (ParcelFileDescriptor p = activity.getContentResolver().openFileDescriptor(uri, "r")) {
+                    if (p == null) throw new IOException("Can't open " + filename(uri));
+                    return p.getStatSize();
+                }
+            }
+            public InputStream open() throws IOException {
+                InputStream in = activity.getContentResolver().openInputStream(uri);
+                if (in == null) throw new IOException("Can't open " + filename(uri));
+                return new java.io.BufferedInputStream(in, 1 << 20);
+            }
+        };
+    }
+
+    private void runApkRepack(Uri apk, String entry, Uri replacement, Uri dest) {
+        if (apk == null || entry == null || replacement == null) return;
+        busy = true; cancelled.set(false); refresh();
+        status.setText("Building APK…");
+        final String destName = filename(dest);
+        worker.execute(() -> {
+            File unsigned = null, signedTemp = null;
+            try (ParcelFileDescriptor pfd = activity.getContentResolver().openFileDescriptor(apk, "r")) {
+                if (pfd == null) throw new IOException("Can't open the APK");
+                // the unsigned and the signed copy both sit in the cache for a moment
+                long need = 2 * (pfd.getStatSize() + content(replacement).length());
+                File cache = activity.getCacheDir();
+                if (cache.getUsableSpace() < need + (64L << 20))
+                    throw new IOException("Not enough free space: about " + human(need) + " is needed while building, " +
+                            human(cache.getUsableSpace()) + " is free.");
+                ApkKeys.Signer signer = ApkKeys.get();
+                UnityObb.Progress progress = new UnityObb.Progress() {
+                    @Override public void step(int done, int total, String what) {
+                        activity.runOnUiThread(() -> status.setText(what.length() > 60 ? what.substring(0, 60) + "…" : what));
+                    }
+                    @Override public boolean cancelled() { return cancelled.get(); }
+                };
+                unsigned = File.createTempFile("unsigned", ".apk", cache);
+                try (FileInputStream in = new FileInputStream(pfd.getFileDescriptor()); FileChannel ch = in.getChannel();
+                     java.io.FileOutputStream fo = new java.io.FileOutputStream(unsigned);
+                     java.io.BufferedOutputStream bo = new java.io.BufferedOutputStream(fo, 1 << 20)) {
+                    ApkRepack.writeUnsigned(ch, entry, content(replacement), bo, progress);
+                }
+                if (cancelled.get()) throw new IOException("Cancelled");
+                activity.runOnUiThread(() -> status.setText("Signing (this reads the whole APK a few times)…"));
+                // sign into the cache (apksig reads its own output back), then copy to the chosen destination
+                signedTemp = File.createTempFile("signed", ".apk", cache);
+                ApkRepack.sign(unsigned, signedTemp, signer.key, signer.cert, 21);
+                //noinspection ResultOfMethodCallIgnored
+                unsigned.delete();
+                activity.runOnUiThread(() -> status.setText("Saving " + destName + "…"));
+                try (InputStream in = new FileInputStream(signedTemp);
+                     OutputStream out = activity.getContentResolver().openOutputStream(dest, "w")) {
+                    if (out == null) throw new IOException("Can't write " + destName);
+                    byte[] buf = new byte[1 << 20]; int n;
+                    while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                }
+                // independent check of what was written, like the installer would
+                try (ParcelFileDescriptor check = activity.getContentResolver().openFileDescriptor(dest, "r");
+                     FileInputStream ci = new FileInputStream(check.getFileDescriptor()); FileChannel cc = ci.getChannel()) {
+                    com.android.apksig.ApkVerifier.Result r;
+                    try {
+                        r = new com.android.apksig.ApkVerifier.Builder(com.android.apksig.util.DataSources.asDataSource(cc)).build().verify();
+                    } catch (com.android.apksig.apk.MinSdkVersionException unreadableManifest) {
+                        r = new com.android.apksig.ApkVerifier.Builder(com.android.apksig.util.DataSources.asDataSource(cc))
+                                .setMinCheckedPlatformVersion(21).build().verify();
+                    }
+                    if (!r.isVerified()) throw new IOException("The signed APK didn't verify: " + r.getErrors());
+                }
+                activity.runOnUiThread(() -> {
+                    busy = false; refresh();
+                    status.setText("Saved " + destName);
+                    log.setText("Signed (v1/v2/v3) and verified.");
+                    new AlertDialog.Builder(activity).setTitle("Modded APK ready")
+                            .setMessage(destName + " is signed and verified.\n\nTo install it:\n1. Back up your saves if the game has " +
+                                    "no cloud save.\n2. Uninstall the original game (Android won't update an app signed by someone " +
+                                    "else).\n3. Open " + destName + " and install it.\n\nNext time you rebuild, the new APK installs " +
+                                    "straight over this one, as long as this app isn't uninstalled.")
+                            .setPositiveButton("OK", null).show();
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                try { DocumentsContract.deleteDocument(activity.getContentResolver(), dest); } catch (Exception ignored) { }
+                final Exception ex = e instanceof Exception ? (Exception) e : new IOException("Out of memory");
+                activity.runOnUiThread(() -> { busy = false; refresh(); error("APK repack failed", ex); });
+            } finally {
+                if (unsigned != null) //noinspection ResultOfMethodCallIgnored
+                    unsigned.delete();
+                if (signedTemp != null) //noinspection ResultOfMethodCallIgnored
+                    signedTemp.delete();
             }
         });
     }

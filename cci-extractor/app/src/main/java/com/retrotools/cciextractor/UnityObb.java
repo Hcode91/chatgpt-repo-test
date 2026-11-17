@@ -386,8 +386,25 @@ final class UnityObb {
     private static void w16(OutputStream o, int v) throws IOException { o.write(v); o.write(v >>> 8); }
     private static void w32(OutputStream o, long v) throws IOException { w16(o, (int) v & 0xFFFF); w16(o, (int) (v >>> 16) & 0xFFFF); }
 
+    /** Replacement content for a zip entry: read twice (once for the CRC, once to copy), never held in memory. */
+    interface Content { long length() throws IOException; java.io.InputStream open() throws IOException; }
+
+    static Content of(final File f) {
+        return new Content() {
+            public long length() { return f.length(); }
+            public java.io.InputStream open() throws IOException { return new FileInputStream(f); }
+        };
+    }
+
     /** Stored-only zip writer (what Unity OBBs require). Entries keep their order, names, dates and attributes. */
     static void writeZip(FileChannel src, List<Entry> entries, Map<String, File> replace, OutputStream rawOut, Progress progress) throws IOException {
+        Map<String, Content> c = new LinkedHashMap<>();
+        for (Map.Entry<String, File> e : replace.entrySet()) c.put(e.getKey(), of(e.getValue()));
+        writeZipContent(src, entries, c, rawOut, progress);
+    }
+
+    /** As {@link #writeZip}, with replacements from any source. Replaced entries are stored uncompressed. */
+    static void writeZipContent(FileChannel src, List<Entry> entries, Map<String, Content> replace, OutputStream rawOut, Progress progress) throws IOException {
         Counting out = new Counting(rawOut);
         long[] offsets = new long[entries.size()], crcs = new long[entries.size()], sizes = new long[entries.size()];
         int[] methods = new int[entries.size()]; long[] usizes = new long[entries.size()];
@@ -395,12 +412,14 @@ final class UnityObb {
         for (int i = 0; i < entries.size(); i++) {
             Entry e = entries.get(i);
             if (progress != null && i % 50 == 0) { if (progress.cancelled()) throw new IOException("Cancelled"); progress.step(i, entries.size(), "Writing " + e.name); }
-            File rep = replace.get(e.name);
+            Content rep = replace.get(e.name);
             long crc = e.crc, size = e.csize, usize = e.usize; int method = e.method;
             if (rep != null) {
                 CRC32 c = new CRC32();
-                try (FileInputStream in = new FileInputStream(rep)) { int n; while ((n = in.read(buf)) > 0) c.update(buf, 0, n); }
-                crc = c.getValue(); size = rep.length(); usize = size; method = 0;
+                long counted = 0;
+                try (java.io.InputStream in = rep.open()) { int n; while ((n = in.read(buf)) > 0) { c.update(buf, 0, n); counted += n; } }
+                if (counted != rep.length()) throw new IOException("Replacement for " + e.name + " changed size while reading");
+                crc = c.getValue(); size = counted; usize = size; method = 0;
             }
             if (out.n > 0xFFFFFFFFL || size > 0xFFFFFFFFL) throw new IOException("Output is over 4 GB, which this zip writer doesn't support");
             byte[] name = e.name.getBytes((e.flags & 0x800) != 0 ? StandardCharsets.UTF_8 : StandardCharsets.ISO_8859_1);
@@ -409,7 +428,9 @@ final class UnityObb {
             w16(out, e.time); w16(out, e.date); w32(out, crc); w32(out, size); w32(out, usize);
             w16(out, name.length); w16(out, 0); out.write(name);
             if (rep != null) {
-                try (FileInputStream in = new FileInputStream(rep)) { int n; while ((n = in.read(buf)) > 0) out.write(buf, 0, n); }
+                long copied = 0;
+                try (java.io.InputStream in = rep.open()) { int n; while ((n = in.read(buf)) > 0) { out.write(buf, 0, n); copied += n; } }
+                if (copied != size) throw new IOException("Replacement for " + e.name + " changed size while reading");
             } else {
                 long at = e.dataOffset, left = e.csize;
                 while (left > 0) {
