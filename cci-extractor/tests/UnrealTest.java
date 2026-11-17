@@ -252,6 +252,19 @@ public class UnrealTest {
         String one = "v 0 0 0\nv -1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 3/3 2/2\n";   // Blender kept one face
         ObjEdit.Edit e2 = ObjEdit.read(m, w, one);
         check(e2.hiddenCount == 0, "one face in the OBJ keeps both sides of a double-sided face");
+
+        // OBJs from before v0.25: one point per vertex. Both sides survive as faces; each keeps its own UVs.
+        String old = UnityModels.toObj(m);
+        check(old.split("\n(?=v )").length - 1 == 6, "old-style export has a point per vertex");
+        ObjEdit.Edit e3 = ObjEdit.read(m, w, old.replace("vt 1.000000 0.000000\nvt 0.000000 1.000000\nvt 0.000000 0.000000\nvt 1.000000 0.000000",
+                "vt 1.000000 0.000000\nvt 0.000000 1.000000\nvt 0.500000 0.500000\nvt 1.000000 0.000000"));
+        check(e3.moved == 0 && e3.hiddenCount == 0 && near(e3.uv[6], 0.5f) && near(e3.uv[0], 0f), "old-style OBJ: back side's UV change lands on the back side only");
+        // a torn seam: one copy of point 0 moved, the other not → both end up at the average
+        String torn = old.replaceFirst("v -0\\.000000 0\\.000000 0\\.000000|v 0\\.000000 0\\.000000 0\\.000000", "v 0.000000 0.000000 2.000000");
+        ObjEdit.Edit e4 = ObjEdit.read(m, w, torn);
+        check(near(e4.pos[2], 1f) && near(e4.pos[3 * 3 + 2], 1f), "torn seam joined at the average (" + e4.pos[2] + ", " + e4.pos[11] + ")");
+        try { ObjEdit.read(m, w, old + "v 9 9 9\n"); check(false, "7 points accepted"); }
+        catch (java.io.IOException ex) { check(ex.getMessage().contains("before 0.25"), "wrong count names both formats"); }
     }
 
     public static void main(String[] args) throws Exception {
