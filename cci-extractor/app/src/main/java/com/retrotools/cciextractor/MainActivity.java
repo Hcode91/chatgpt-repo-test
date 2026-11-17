@@ -74,6 +74,7 @@ public class MainActivity extends Activity {
     private static final int PICK_UNITY_EDITS = 325;
     private static final int SAVE_UNITY = 326;
     private static final int SAVE_VIEWER_FILE = 327;
+    private static final int PICK_DECAL = 328;
     private static final String DIR_MIME = DocumentsContract.Document.MIME_TYPE_DIR;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -94,6 +95,9 @@ public class MainActivity extends Activity {
     private Map<String, java.util.TreeMap<Long, byte[]>> unityPatches;
     private int unityEditCount;
     private byte[] pendingViewerFile;
+    private UnityViewer.ImageCallback pendingDecal;
+    /** Textures painted in the 3D viewer this session: key → {BundleInfo, Texture, int[] straight ARGB}. */
+    private final Map<String, Object[]> unityPainted = new java.util.LinkedHashMap<>();
     private int trpOnly = -1;
     /** For RPA-1.0: the archive data file (the opened file is its .rpi index); otherwise the opened file. */
     private Uri rpaDataUri;
@@ -437,6 +441,7 @@ public class MainActivity extends Activity {
             trpInfo = null;
             unityInfo = null;
             unityPatches = null;
+            unityPainted.clear();
             retroMode = null;
             ndsNodes.clear();
             expandedNds.clear();
@@ -636,6 +641,35 @@ public class MainActivity extends Activity {
             scanUnityEdits(uri);
         } else if (request == SAVE_UNITY && unityInfo != null && unityPatches != null) {
             rebuildUnity(uri);
+        } else if (request == PICK_DECAL && pendingDecal != null) {
+            UnityViewer.ImageCallback cb = pendingDecal;
+            pendingDecal = null;
+            try {
+                byte[] bytes = readUri(uri);
+                BitmapFactory.Options o = new BitmapFactory.Options();
+                o.inScaled = false; o.inPremultiplied = false; o.inPreferredConfig = Bitmap.Config.ARGB_8888;
+                BitmapFactory.Options bounds = new BitmapFactory.Options();
+                bounds.inJustDecodeBounds = true;
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.length, bounds);
+                int sample = 1;
+                while (Math.max(bounds.outWidth, bounds.outHeight) / sample > 4096) sample *= 2;
+                o.inSampleSize = sample;
+                Bitmap b = BitmapFactory.decodeByteArray(bytes, 0, bytes.length, o);
+                if (b == null) throw new IOException("That isn't an image Android can read");
+                if (Math.max(b.getWidth(), b.getHeight()) > 2048) {
+                    float k = 2048f / Math.max(b.getWidth(), b.getHeight());
+                    Bitmap s2 = Bitmap.createScaledBitmap(b, Math.max(1, Math.round(b.getWidth() * k)), Math.max(1, Math.round(b.getHeight() * k)), true);
+                    if (s2 != b) b.recycle();
+                    b = s2;
+                }
+                int[] argb = new int[b.getWidth() * b.getHeight()];
+                b.getPixels(argb, 0, b.getWidth(), 0, 0, b.getWidth(), b.getHeight());
+                int w = b.getWidth(), h = b.getHeight();
+                b.recycle();
+                cb.got(argb, w, h);
+            } catch (Exception | OutOfMemoryError e) {
+                new AlertDialog.Builder(this).setTitle("Couldn't use that image").setMessage(String.valueOf(e.getMessage())).setPositiveButton("OK", null).show();
+            }
         } else if (request == SAVE_VIEWER_FILE && pendingViewerFile != null) {
             byte[] bytes = pendingViewerFile;
             pendingViewerFile = null;
@@ -768,7 +802,8 @@ public class MainActivity extends Activity {
         if (pakInfo != null) location.setText("/PAK   (" + displayed.size() + " bundles)");
         if (voxInfo != null) location.setText("/VOX   (" + displayed.size() + " clips)");
         if (trpInfo != null) location.setText("/TROPHY.TRP   (" + displayed.size() + " files)");
-        if (unityInfo != null) location.setText("/Unity   (" + displayed.size() + " bundles, " + unityInfo.textures + " textures)");
+        if (unityInfo != null) location.setText("/Unity   (" + displayed.size() + " bundles, " + unityInfo.textures + " textures" +
+                (unityPainted.isEmpty() ? ")" : ", " + unityPainted.size() + " painted — tap rebuild to save)"));
         if (rpaInfo != null) location.setText("/RPA   (" + displayed.size() + " files, " + human(rpaInfo.totalBytes) + ")");
         if (ps1Info != null) location.setText("/" + ps1Info.title() + "   (" + displayed.size() + " files, " + human(ps1Info.totalBytes) + ")");
         open.setEnabled(!busy);
@@ -2819,21 +2854,15 @@ public class MainActivity extends Activity {
             try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
                 if (descriptor == null) throw new IOException("Could not reopen the file");
                 UnityViewer.Data data;
+                Map<String, int[]> painted = new HashMap<>();
+                for (Map.Entry<String, Object[]> e : unityPainted.entrySet()) painted.put(e.getKey(), (int[]) e.getValue()[2]);
                 try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
                      FileChannel channel = stream.getChannel()) {
-                    data = UnityViewer.load(channel, info, model);
+                    data = UnityViewer.load(channel, info, model, painted);
                 }
                 runOnUiThread(() -> {
                     busy = false; render(); summary.setText(info.description());
-                    UnityViewer.show(this, data, (name, mime, bytes) -> {
-                        pendingViewerFile = bytes;
-                        Intent save = new Intent(Intent.ACTION_CREATE_DOCUMENT);
-                        save.addCategory(Intent.CATEGORY_OPENABLE);
-                        save.setType(mime);
-                        save.putExtra(Intent.EXTRA_TITLE, name);
-                        save.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-                        startActivityForResult(save, SAVE_VIEWER_FILE);
-                    });
+                    UnityViewer.show(this, data, viewerHost());
                 });
             } catch (Exception | OutOfMemoryError e) {
                 String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
@@ -2845,8 +2874,90 @@ public class MainActivity extends Activity {
         });
     }
 
+    private UnityViewer.Host viewerHost() {
+        return new UnityViewer.Host() {
+            @Override public void save(String name, String mime, byte[] bytes) {
+                pendingViewerFile = bytes;
+                Intent save = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                save.addCategory(Intent.CATEGORY_OPENABLE);
+                save.setType(mime);
+                save.putExtra(Intent.EXTRA_TITLE, name);
+                save.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                startActivityForResult(save, SAVE_VIEWER_FILE);
+            }
+            @Override public void pickImage(UnityViewer.ImageCallback callback) {
+                pendingDecal = callback;
+                Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                pick.addCategory(Intent.CATEGORY_OPENABLE);
+                pick.setType("image/*");
+                startActivityForResult(pick, PICK_DECAL);
+            }
+            @Override public void painted(String key, Object[] texInfo, int[] pixels) {
+                unityPainted.put(key, new Object[]{texInfo[0], texInfo[1], pixels});
+                render();
+            }
+            @Override public int paintedCount() { return unityPainted.size(); }
+            @Override public void buildPainted() { buildPaintedObb(null); }
+        };
+    }
+
+    /** Encodes painted textures (plus any edits from a folder) and asks where to save the new file. */
+    private void buildPaintedObb(Map<String, java.util.TreeMap<Long, byte[]>> extra) {
+        if (busy || unityInfo == null || unityPainted.isEmpty() && (extra == null || extra.isEmpty())) return;
+        final List<Object[]> painted = new ArrayList<>(unityPainted.values());
+        busy = true; render();
+        summary.setText("Encoding painted textures...");
+        worker.execute(() -> {
+            try {
+                Map<String, java.util.TreeMap<Long, byte[]>> patches = new java.util.LinkedHashMap<>();
+                if (extra != null) for (Map.Entry<String, java.util.TreeMap<Long, byte[]>> e : extra.entrySet())
+                    patches.computeIfAbsent(e.getKey(), k -> new java.util.TreeMap<>()).putAll(e.getValue());
+                int n = 0;
+                for (Object[] p : painted) {
+                    UnityObb.BundleInfo b = (UnityObb.BundleInfo) p[0];
+                    UnityBundle.Texture t = (UnityBundle.Texture) p[1];
+                    final int at = ++n;
+                    runOnUiThread(() -> summary.setText("Encoding painted texture " + at + "/" + painted.size() + " (" + t.name + ")..."));
+                    patches.computeIfAbsent(b.entry, k -> new java.util.TreeMap<>()).put(t.dataPos, UnityObb.encodeFor(t, (int[]) p[2], t.width, t.height));
+                }
+                int total = 0;
+                for (java.util.TreeMap<Long, byte[]> m : patches.values()) total += m.size();
+                final int count = total;
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    summary.setText(count + " texture(s) ready");
+                    unityPatches = patches; unityEditCount = count;
+                    Intent save = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                    save.addCategory(Intent.CATEGORY_OPENABLE);
+                    save.setType("application/octet-stream");
+                    save.putExtra(Intent.EXTRA_TITLE, getFilename(imageUri));
+                    save.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                    startActivityForResult(save, SAVE_UNITY);
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Couldn't encode the painted textures"); detail.setText(why);
+                    new AlertDialog.Builder(this).setTitle("Couldn't encode the painted textures").setMessage(why).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
     private void startUnityRebuild() {
         if (busy || unityInfo == null) return;
+        if (!unityPainted.isEmpty()) {
+            new AlertDialog.Builder(this).setTitle("Rebuild")
+                    .setMessage(unityPainted.size() + " texture(s) painted in the 3D viewer will be included. Add edited PNGs from an " +
+                            "extracted folder too? (If the same texture is in both, the painted version wins.)")
+                    .setNegativeButton("Painted only", (d, w) -> buildPaintedObb(null))
+                    .setPositiveButton("Also pick a folder", (d, w) -> {
+                        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                        startActivityForResult(intent, PICK_UNITY_EDITS);
+                    }).show();
+            return;
+        }
         new AlertDialog.Builder(this).setTitle("Rebuild with edited textures")
                 .setMessage("Pick the Unity_Textures_… folder you extracted from this file (the one containing " +
                         UnityObb.INDEX_NAME + ").\n\nOnly PNGs you changed are used. Each goes back in its original format, " +
@@ -2958,9 +3069,13 @@ public class MainActivity extends Activity {
                         msg.append("\n\nSkipped:");
                         for (int i = 0; i < Math.min(problems.size(), 8); i++) msg.append("\n• ").append(problems.get(i));
                     }
-                    summary.setText(edited.isEmpty() ? "No edits found" : edited.size() + " edited texture(s) ready");
+                    summary.setText(edited.isEmpty() && unityPainted.isEmpty() ? "No edits found" : edited.size() + " edited texture(s) ready");
                     AlertDialog.Builder dlg = new AlertDialog.Builder(this).setTitle("Edited textures").setMessage(msg.toString());
-                    if (edited.isEmpty()) dlg.setPositiveButton("OK", null);
+                    if (!unityPainted.isEmpty()) {
+                        msg.append("\n\nPlus ").append(unityPainted.size()).append(" painted texture(s) from the 3D viewer.");
+                        dlg.setMessage(msg.toString());
+                        dlg.setNegativeButton("Cancel", null).setPositiveButton("Save new file", (d, w) -> buildPaintedObb(patches));
+                    } else if (edited.isEmpty()) dlg.setPositiveButton("OK", null);
                     else dlg.setNegativeButton("Cancel", null).setPositiveButton("Save new file", (d, w) -> {
                         unityPatches = patches; unityEditCount = edited.size();
                         Intent save = new Intent(Intent.ACTION_CREATE_DOCUMENT);

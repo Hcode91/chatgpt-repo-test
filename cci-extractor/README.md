@@ -1,4 +1,20 @@
-# Game Asset Extractor (Android v0.17.0)
+# Game Asset Extractor (Android v0.18.0)
+
+## New in v0.18: paint designs straight onto Unity models (projection painting)
+
+In the model viewer, **View → Paint a design onto the model**:
+1. **Design…** picks an image (PNG transparency works). It floats over the model, see-through so you can line it up.
+2. With **Moving: design**, drag to move it, pinch to resize and twist two fingers to rotate. Switch to **Moving: model** to turn or zoom the model and line it up from any angle. The **Opacity** slider sets how strongly it's painted.
+3. **Apply** projects it onto everything under it that faces you, as seen from that view, and writes it into the texture. The 3D view, UV view and texture update at once, and **Undo** steps back (up to 8).
+4. **Part** limits painting to one part (e.g. only the outfit, not the hair in front of it). Otherwise every textured part under the design is painted.
+5. **Save… → New OBB with painted textures** encodes them to their original format, size and mipmaps and writes a new OBB. **Save… → Texture as PNG** exports one. Painted textures also stay for the session, so the main screen's rebuild button includes them, together with edited PNGs from a folder (the painted version wins if both changed the same texture).
+
+How it works: like Blender's stencil projection paint. Every texel a triangle covers is mapped back to its 3D point and projected with the viewer's own camera. It's painted only if it faces you (surfaces turned more than ~75° away are skipped, so designs don't smear along the sides), isn't hidden behind other geometry (depth buffer; thin strands like a necklace don't punch holes in the design), and falls inside the design. Paint is padded 2 texels into the gaps around UV islands so seams don't show with mipmapping. The texture's own alpha is kept. If a real share of what you painted is also used by another spot on the model (mirrored UVs), the viewer tells you.
+
+**How it was checked:** a design stamped onto Chloe's shirt from the front view (same camera code as the viewer) landed on the shirt front where it was placed, at the chosen angle and opacity. An independent software render of the model with the painted texture showed it there and nowhere on the back. The CI test checks placement, opacity, alpha preservation, back faces, occlusion, seam padding, the mirrored-UV warning and the camera projection on synthetic models.
+
+**Not yet checked:** the paint screen hasn't been run on a device yet.
+
 
 ## New in v0.17: Unity 3D model viewer, with UV view
 
