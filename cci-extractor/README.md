@@ -1,4 +1,30 @@
-# Game Asset Extractor (Android v0.15.0)
+# Game Asset Extractor (Android v0.16.0)
+
+## New in v0.16: Unity games: extract textures, edit, rebuild (OBB / APK / asset bundles)
+
+**Extract:** open a Unity game's OBB (`main.<version>.<package>.obb`), an APK, or a loose asset bundle with **Open ROM**. Every bundle is listed with its texture count. Tap **Extract all textures**, or tap a bundle for just that one. You get a `Unity_Textures_<time>/` folder:
+- one folder per bundle, each texture saved as `<name>__<path id>.png`;
+- `unity_textures.tsv`: where each PNG came from. Don't edit or delete it;
+- textures in formats the app can't convert yet are saved as raw `.bin` data.
+
+**Edit and rebuild:** edit the PNGs in place and keep their names. Then open the original file again and tap **Edited PNGs → rebuild Unity OBB / bundle**, pick the `Unity_Textures_…` folder and save. Only PNGs that changed are used. Each one goes back in its original format, size and mipmap count. A PNG of a different size is scaled back to the original size. Everything else is copied byte-for-byte: other zip entries keep their data and CRCs, and inside a patched bundle only the compressed blocks holding the new pixels change. Those blocks are stored uncompressed, so the bundle grows a little.
+
+Then:
+- **OBB:** copy it over the original in `Android/obb/<package>/` with the same file name (keep a backup). No re-signing needed.
+- **APK:** it needs signing again before Android will install it, and the original game has to be uninstalled first.
+
+Formats: ETC2 RGBA8 (EAC alpha), ETC2 RGB, ETC1, RGBA32, ARGB32, BGRA32, RGB24, RGB565, ARGB4444, RGBA4444, Alpha8 and R8. Alpha8/R8 are exported as greyscale PNGs (white = full), and brightness is written back. Not supported yet: ASTC, PVRTC, DXT/BC, crunched textures and LZMA-compressed bundles. Bundles must be stored, not deflated, inside the zip, which is how Unity OBBs always are.
+
+How it works: UnityFS bundles v6–8 (Unity 5.3 to 6), LZ4/LZ4HC or uncompressed blocks, with random-access block decompression. SerializedFiles are read through their type trees, so field layouts aren't hard-coded. Files whose type trees were stripped at build time (usually `data.unity3d`) borrow the Texture2D layout from another bundle of the same Unity major.minor version. Every object must then parse to exactly its stored size, or it's rejected. Texture data is found inline or in the bundle's `.resS` stream. ETC2 decoding covers all modes (individual, differential, T, H, planar). The encoder writes ETC1-compatible colour blocks, which are valid ETC2, plus an EAC alpha search. Mipmaps are box-filtered.
+
+**How it was checked**, on Life is Strange: Before the Storm's 1.8 GB OBB (493 bundles, Unity 2021.3):
+- All 2,953 textures were found, including 105 in the stripped `data.unity3d`.
+- Every decoded texture was pixel-identical to UnityPy + texture2ddecoder (independent tools).
+- Six edited textures (one per format, two in `data.unity3d`) were rebuilt into a new OBB. UnityPy read it back with every edit intact, all other textures unchanged, and the zip valid with only the patched bundles changed.
+- The CI test (`tests/run-unity-test.sh`) checks 1,200 random ETC1, ETC2 and ETC2+EAC blocks each against texture2ddecoder, encoder round trips with mip chains in every writable format, and a full extract → patch → rebuild on a synthetic OBB. The OBB has a type-tree bundle, a stripped one with its block table at the end, and stored and deflated extra files. It's built by `tests/fixtures/unity/gen_unity_fixture.py` and cross-checked with UnityPy. No game data is in the repo.
+
+**Not yet checked:** the rebuilt OBB hasn't been run in the game on a phone yet, and the new screens haven't been run on a device. Re-encoded ETC textures lose a little quality compared to the originals (typically 38–45 dB PSNR), as any ETC re-encode does.
+
 
 ## New in v0.15: custom PS3 trophies and trophy mods (for RPCS3)
 

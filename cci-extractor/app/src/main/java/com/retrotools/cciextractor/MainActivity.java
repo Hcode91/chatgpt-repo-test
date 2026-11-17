@@ -70,6 +70,9 @@ public class MainActivity extends Activity {
     private static final int PICK_RPA_FOLDER = 321;
     private static final int PICK_RPA_DATA = 322;
     private static final int PICK_TRP_FOLDER = 323;
+    private static final int PICK_UNITY_FOLDER = 324;
+    private static final int PICK_UNITY_EDITS = 325;
+    private static final int SAVE_UNITY = 326;
     private static final String DIR_MIME = DocumentsContract.Document.MIME_TYPE_DIR;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -84,6 +87,11 @@ public class MainActivity extends Activity {
     private MgsVox.Info voxInfo;
     private RenpyArchive.Info rpaInfo;
     private Ps3Trophy.Info trpInfo;
+    private UnityObb.Info unityInfo;
+    /** Index of the single Unity bundle to extract, or -1 for all. */
+    private int unityOnly = -1;
+    private Map<String, java.util.TreeMap<Long, byte[]>> unityPatches;
+    private int unityEditCount;
     private int trpOnly = -1;
     /** For RPA-1.0: the archive data file (the opened file is its .rpi index); otherwise the opened file. */
     private Uri rpaDataUri;
@@ -120,7 +128,7 @@ public class MainActivity extends Activity {
     private boolean busy = false;
     private TextView headline, summary, location, detail;
     private Button open, extractAll, extractHere, up, stop, pngToBtex, pngToNes, upscaleHd;
-    private Button pngToRetro, retroFormat, paletteButton;
+    private Button pngToRetro, retroFormat, paletteButton, pngToUnity;
     private ListView list;
     private ArrayAdapter<String> adapter;
     private ConvertTab convertTab;
@@ -181,13 +189,13 @@ public class MainActivity extends Activity {
         convertTab = new ConvertTab(this);
         outer.addView(convertTab.view, new LinearLayout.LayoutParams(-1, 0, 1));
         root = extractPanel;
-        summary = text("3DS · DS · NES · SNES · Mega Drive · Game Boy · GBA asset tools", 14, Color.DKGRAY);
+        summary = text("3DS · DS · NES · SNES · Mega Drive · Game Boy · GBA · Unity asset tools", 14, Color.DKGRAY);
         root.addView(summary);
         LinearLayout controls = new LinearLayout(this);
         controls.setOrientation(LinearLayout.HORIZONTAL);
         controls.setPadding(dp(6), 0, dp(6), 0);
         root.addView(controls);
-        open = button("Open ROM (3DS / DS / PS1 / NES / SNES / MD / GB / GBA), PAK, RPA or TRP");
+        open = button("Open ROM (3DS / DS / PS1 / NES / SNES / MD / GB / GBA), PAK, RPA, TRP or Unity OBB");
         extractAll = button("Extract all");
         controls.addView(open, new LinearLayout.LayoutParams(0, dp(54), 1));
         controls.addView(extractAll, new LinearLayout.LayoutParams(0, dp(54), 1));
@@ -213,6 +221,8 @@ public class MainActivity extends Activity {
         tileRow.addView(paletteButton, new LinearLayout.LayoutParams(0, dp(48), 1));
         pngToRetro = button("PNG → ROM (patch tile page + fix checksum)");
         root.addView(pngToRetro, new LinearLayout.LayoutParams(-1, dp(50)));
+        pngToUnity = button("Edited PNGs → rebuild Unity OBB / bundle");
+        root.addView(pngToUnity, new LinearLayout.LayoutParams(-1, dp(50)));
         upscaleHd = button("3DS HD PNG upscale (2× / 4×)");
         root.addView(upscaleHd, new LinearLayout.LayoutParams(-1, dp(50)));
         location = text("/", 14, Color.rgb(36, 49, 105));
@@ -237,8 +247,10 @@ public class MainActivity extends Activity {
         retroFormat.setOnClickListener(v -> chooseRetroFormat());
         paletteButton.setOnClickListener(v -> choosePalette());
         upscaleHd.setOnClickListener(v -> chooseHdUpscale());
+        pngToUnity.setOnClickListener(v -> startUnityRebuild());
         extractAll.setOnClickListener(v -> {
-            if (trpInfo != null) beginTrpExtract(-1);
+            if (unityInfo != null) beginUnityExtract(-1);
+            else if (trpInfo != null) beginTrpExtract(-1);
             else if (rpaInfo != null) beginRpaExtract(-1);
             else if (voxInfo != null) beginVoxExtract(-1);
             else if (ps1Info != null) beginPs1Extract(-1);
@@ -264,6 +276,26 @@ public class MainActivity extends Activity {
             if (busy || position < 0 || position >= displayed.size()) return;
             if (retroInfo != null || nesInfo != null) {
                 showTilePreview(position);
+                return;
+            }
+            if (unityInfo != null) {
+                if (position >= unityInfo.bundles.size()) return;
+                UnityObb.BundleInfo bundle = unityInfo.bundles.get(position);
+                if (bundle.error != null) {
+                    new AlertDialog.Builder(this).setTitle(bundle.entry).setMessage("Couldn't read this bundle:\n\n" + bundle.error)
+                            .setPositiveButton("OK", null).show();
+                    return;
+                }
+                if (bundle.textures.isEmpty()) {
+                    new AlertDialog.Builder(this).setTitle(bundle.entry).setMessage("No textures in this bundle.")
+                            .setPositiveButton("OK", null).show();
+                    return;
+                }
+                new AlertDialog.Builder(this).setTitle(bundle.entry)
+                        .setMessage(unityBundleSummary(bundle) + "\n\nExtract this bundle's textures?")
+                        .setNegativeButton("Cancel", null)
+                        .setPositiveButton("Extract", (d, w) -> beginUnityExtract(position))
+                        .show();
                 return;
             }
             if (trpInfo != null) {
@@ -398,6 +430,8 @@ public class MainActivity extends Activity {
             voxInfo = null;
             rpaInfo = null;
             trpInfo = null;
+            unityInfo = null;
+            unityPatches = null;
             retroMode = null;
             ndsNodes.clear();
             expandedNds.clear();
@@ -422,6 +456,14 @@ public class MainActivity extends Activity {
                                         "and VAG sounds as WAV; TIMs packed inside other files are found too.");
                                 render();
                             });
+                        } else if (UnityObb.isUnity(channel)) {
+                            UnityObb.Info parsedUnity = UnityObb.scan(channel, inputName, new UnityObb.Progress() {
+                                @Override public void step(int done, int total, String what) {
+                                    if (done % 10 == 0) runOnUiThread(() -> summary.setText("Scanning Unity bundles " + done + "/" + total + "..."));
+                                }
+                                @Override public boolean cancelled() { return cancelled.get(); }
+                            });
+                            runOnUiThread(() -> showUnity(parsedUnity));
                         } else if (Ps3Trophy.isTrophyPack(channel)) {
                             Ps3Trophy.Info parsedTrp = Ps3Trophy.parse(channel);
                             runOnUiThread(() -> {
@@ -538,7 +580,7 @@ public class MainActivity extends Activity {
                     }
                 } catch (Exception e) {
                     runOnUiThread(() -> {
-                        busy = false; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null; voxInfo = null; rpaInfo = null; trpInfo = null;
+                        busy = false; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null; voxInfo = null; rpaInfo = null; trpInfo = null; unityInfo = null;
                         summary.setText("Could not open game file");
                         detail.setText(message(e));
                         render();
@@ -583,6 +625,12 @@ public class MainActivity extends Activity {
             startActivityForResult(save, SAVE_NDS);
         } else if (request == SAVE_NDS && ndsImportNode != null && ndsPngUri != null) {
             rebuildNds(uri);
+        } else if (request == PICK_UNITY_FOLDER && unityInfo != null) {
+            extractUnity(uri);
+        } else if (request == PICK_UNITY_EDITS && unityInfo != null) {
+            scanUnityEdits(uri);
+        } else if (request == SAVE_UNITY && unityInfo != null && unityPatches != null) {
+            rebuildUnity(uri);
         } else if (request == PICK_TRP_FOLDER && trpInfo != null) {
             extractTrp(uri);
         } else if (request == PICK_RPA_DATA && pendingRpiUri != null) {
@@ -666,6 +714,9 @@ public class MainActivity extends Activity {
         if (voxInfo != null) displayed.addAll(voxLabels);
         if (rpaInfo != null) for (RenpyArchive.FileEntry f : rpaInfo.files) displayed.add("📄 " + f.path + " · " + human(f.size()));
         if (trpInfo != null) for (Ps3Trophy.FileEntry f : trpInfo.files) displayed.add("🏆 " + f.name + " · " + human(f.size));
+        if (unityInfo != null) for (UnityObb.BundleInfo b : unityInfo.bundles)
+            displayed.add(b.error != null ? "⚠ " + b.entry + " · can't read" :
+                    (b.textures.isEmpty() ? "📦 " : "🖼 ") + b.entry + " · " + b.textures.size() + " texture" + (b.textures.size() == 1 ? "" : "s"));
         if (ps1Info != null) {
             for (Ps1Disc.FileEntry f : ps1Info.files)
                 displayed.add("💿 " + f.path + " · " + human(f.exportSize()) + (f.form2 ? " · raw XA/STR sectors" : ""));
@@ -701,6 +752,7 @@ public class MainActivity extends Activity {
         if (pakInfo != null) location.setText("/PAK   (" + displayed.size() + " bundles)");
         if (voxInfo != null) location.setText("/VOX   (" + displayed.size() + " clips)");
         if (trpInfo != null) location.setText("/TROPHY.TRP   (" + displayed.size() + " files)");
+        if (unityInfo != null) location.setText("/Unity   (" + displayed.size() + " bundles, " + unityInfo.textures + " textures)");
         if (rpaInfo != null) location.setText("/RPA   (" + displayed.size() + " files, " + human(rpaInfo.totalBytes) + ")");
         if (ps1Info != null) location.setText("/" + ps1Info.title() + "   (" + displayed.size() + " files, " + human(ps1Info.totalBytes) + ")");
         open.setEnabled(!busy);
@@ -715,9 +767,11 @@ public class MainActivity extends Activity {
         paletteButton.setVisibility(retroInfo!=null || nesInfo!=null?View.VISIBLE:View.GONE);
         paletteButton.setText("Palette: "+viewPaletteName);
         pngToRetro.setVisibility(retroInfo!=null?View.VISIBLE:View.GONE);
+        pngToUnity.setVisibility(unityInfo != null ? View.VISIBLE : View.GONE);
+        pngToUnity.setEnabled(!busy && unityInfo != null);
         if(retroMode!=null)retroFormat.setText("Format: "+retroMode.slug);
-        extractAll.setText((nesInfo != null || retroInfo != null) ? "Export all tile PNGs" : "Extract all");
-        extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null || pakInfo != null || ps1Info != null || voxInfo != null || rpaInfo != null || trpInfo != null));
+        extractAll.setText((nesInfo != null || retroInfo != null) ? "Export all tile PNGs" : unityInfo != null ? "Extract all textures" : "Extract all");
+        extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null || pakInfo != null || ps1Info != null || voxInfo != null || rpaInfo != null || trpInfo != null || unityInfo != null));
         extractHere.setEnabled(!busy && (archive != null && !entriesIn(activePath).isEmpty() ||
                 ndsInfo != null && !ndsEntriesIn(activePath).isEmpty()));
         up.setEnabled(!busy && (archive != null || ndsInfo!=null) && !activePath.isEmpty());
@@ -2556,6 +2610,334 @@ public class MainActivity extends Activity {
                     busy = false; render(); summary.setText("HD upscale failed"); detail.setText(message(e));
                     new AlertDialog.Builder(this).setTitle("Upscale failed")
                             .setMessage(message(e)).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+    // ================================================================ Unity OBB / APK / bundle textures
+
+    private void showUnity(UnityObb.Info info) {
+        unityInfo = info;
+        archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null;
+        voxInfo = null; rpaInfo = null; trpInfo = null;
+        busy = false;
+        summary.setText(info.description());
+        detail.setText("Extract all textures as PNG, or tap a bundle. Edit the PNGs (keep their names), then use " +
+                "\"Edited PNGs → rebuild\" to write a new " + (info.single ? "bundle" : info.apk ? "APK" : "OBB") +
+                ". Textures go back in their original format, size and mipmaps.");
+        render();
+    }
+
+    private String unityBundleSummary(UnityObb.BundleInfo b) {
+        Map<String, Integer> formats = new java.util.TreeMap<>();
+        int unsupported = 0;
+        for (UnityBundle.Texture t : b.textures) {
+            formats.merge(UnityTextures.name(t.format), 1, Integer::sum);
+            if (!UnityTextures.supported(t.format)) unsupported++;
+        }
+        StringBuilder s = new StringBuilder(b.textures.size() + " textures · " + human(b.size));
+        for (Map.Entry<String, Integer> f : formats.entrySet()) s.append("\n• ").append(f.getKey()).append(": ").append(f.getValue());
+        if (unsupported > 0) s.append("\n\n").append(unsupported).append(" can't be converted yet and are saved as raw .bin data.");
+        return s.toString();
+    }
+
+    private void beginUnityExtract(int only) {
+        if (busy || unityInfo == null) return;
+        unityOnly = only;
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        startActivityForResult(intent, PICK_UNITY_FOLDER);
+    }
+
+    /** PNG bytes for straight (non-premultiplied) ARGB, so colour under transparent pixels survives. */
+    private byte[] pngBytes(int width, int height, int[] argb) throws IOException {
+        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        try {
+            bitmap.setPremultiplied(false);
+            bitmap.setPixels(argb, 0, width, 0, 0, width, height);
+            ByteArrayOutputStream out = new ByteArrayOutputStream(Math.max(1024, width * height));
+            if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)) throw new IOException("PNG encoding failed");
+            return out.toByteArray();
+        } finally { bitmap.recycle(); }
+    }
+
+    private void extractUnity(Uri tree) {
+        if (busy || unityInfo == null || imageUri == null) return;
+        final UnityObb.Info info = unityInfo;
+        final int only = unityOnly;
+        final String sourceName = getFilename(imageUri);
+        busy = true; cancelled.set(false); render();
+        summary.setText("Extracting Unity textures...");
+        worker.execute(() -> {
+            final int[] stats = new int[3]; // PNGs, raw (unsupported format), failed
+            final StringBuilder failures = new StringBuilder();
+            try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                if (descriptor == null) throw new IOException("Could not reopen the file");
+                try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
+                     FileChannel channel = stream.getChannel()) {
+                    String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+                    Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+                    Uri folder = DocumentsContract.createDocument(getContentResolver(), parent, DIR_MIME, "Unity_Textures_" + stamp);
+                    if (folder == null) throw new IOException("Cannot create output folder");
+                    Map<String, Uri> folders = new HashMap<>();
+                    folders.put("", folder);
+                    StringBuilder index = new StringBuilder(UnityObb.INDEX_HEADER);
+                    index.append("# source\t").append(sourceName.replace('\t', ' ')).append('\n');
+                    int total = 0, done = 0;
+                    for (int i = 0; i < info.bundles.size(); i++) if (only < 0 || i == only) total += info.bundles.get(i).textures.size();
+                    for (int i = 0; i < info.bundles.size(); i++) {
+                        if (only >= 0 && i != only) continue;
+                        if (cancelled.get()) break;
+                        UnityObb.BundleInfo b = info.bundles.get(i);
+                        if (b.textures.isEmpty()) continue;
+                        UnityBundle bundle = UnityBundle.open(UnityBundle.of(channel, b.offset, b.size));
+                        for (UnityBundle.Texture t : b.textures) {
+                            if (cancelled.get()) break;
+                            done++;
+                            if (done % 10 == 0 || done == total) {
+                                final int d = done, all = total;
+                                runOnUiThread(() -> summary.setText("Extracting Unity textures " + d + "/" + all + "..."));
+                            }
+                            if (t.width <= 0 || t.height <= 0 || t.dataSize <= 0) continue; // runtime-filled (e.g. font) textures
+                            String png = UnityObb.pngPath(b.entry, t);
+                            int slash = png.lastIndexOf('/');
+                            String dirPath = slash < 0 ? "" : png.substring(0, slash), file = png.substring(slash + 1);
+                            try {
+                                byte[] raw = bundle.read(t.dataPos, t.dataSize);
+                                Uri dir = ensureFolder(dirPath, folders);
+                                if (!UnityTextures.supported(t.format)) {
+                                    writeDoc(dir, file.substring(0, file.length() - 4) + "." + UnityTextures.name(t.format) + ".bin",
+                                            "application/octet-stream", raw);
+                                    stats[1]++;
+                                    continue;
+                                }
+                                int[] argb = UnityTextures.decode(raw, t.format, t.width, t.height);
+                                byte[] pngData = pngBytes(t.width, t.height, argb);
+                                writeDoc(dir, file, "image/png", pngData);
+                                index.append(UnityObb.row(b.entry, t, png, UnityObb.sha1(pngData)));
+                                stats[0]++;
+                            } catch (Exception | OutOfMemoryError e) {
+                                stats[2]++;
+                                if (failures.length() < 800) failures.append("\n• ").append(t.name).append(": ")
+                                        .append(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+                            }
+                        }
+                    }
+                    writeDoc(folder, UnityObb.INDEX_NAME, "application/octet-stream", index.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    writeDoc(folder, "README.txt", "text/plain", ("Unity textures from " + sourceName + "\n\n" +
+                            "One folder per asset bundle. Each PNG is named <texture name>__<path id>.png.\n" +
+                            "To mod: edit PNGs in place (same file name), then in Game Asset Extractor open the original file and\n" +
+                            "use \"Edited PNGs → rebuild\" and pick this folder. Only PNGs that changed are written back, each\n" +
+                            "re-encoded to its original format (ETC2/ETC1/RGBA32/...), size and mipmap count. A PNG with a\n" +
+                            "different size is scaled back to the original size.\n\n" +
+                            "Alpha8 / R8 textures are single-channel: they're shown as greyscale (white = full) and the\n" +
+                            "brightness is what gets written back.\n" +
+                            "unity_textures.tsv records where every texture came from; don't delete or edit it.\n" +
+                            "*.bin files: textures in formats this app can't convert yet (raw Unity pixel data).\n")
+                            .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                }
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    String result = stats[0] + " textures saved as PNG" +
+                            (stats[1] > 0 ? ", " + stats[1] + " saved raw (format not supported yet)" : "") +
+                            (stats[2] > 0 ? ", " + stats[2] + " failed:" + failures : "") + ".";
+                    summary.setText("Unity extraction " + (cancelled.get() ? "cancelled" : "complete"));
+                    detail.setText(result);
+                    new AlertDialog.Builder(this).setTitle(cancelled.get() ? "Extraction cancelled" : "Extraction complete")
+                            .setMessage(result + "\n\nEdit the PNGs in place, then come back and tap \"Edited PNGs → rebuild\".")
+                            .setPositiveButton("OK", null).show();
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Unity extraction failed"); detail.setText(message(e));
+                    new AlertDialog.Builder(this).setTitle("Unity extraction failed").setMessage(message(e)).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+    private void startUnityRebuild() {
+        if (busy || unityInfo == null) return;
+        new AlertDialog.Builder(this).setTitle("Rebuild with edited textures")
+                .setMessage("Pick the Unity_Textures_… folder you extracted from this file (the one containing " +
+                        UnityObb.INDEX_NAME + ").\n\nOnly PNGs you changed are used. Each goes back in its original format, " +
+                        "size and mipmaps; a PNG of a different size is scaled to the original size.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Pick folder", (d, w) -> {
+                    Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    startActivityForResult(intent, PICK_UNITY_EDITS);
+                }).show();
+    }
+
+    /** relative path → document Uri for every file under a picked folder. */
+    private void listTree(Uri tree, String docId, String prefix, Map<String, Uri> out, int depth) throws IOException {
+        if (depth > 32) return;
+        Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, docId);
+        try (Cursor c = getContentResolver().query(children, new String[]{
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE}, null, null, null)) {
+            if (c == null) throw new IOException("Can't list the folder");
+            List<String[]> dirs = new ArrayList<>();
+            while (c.moveToNext()) {
+                String id = c.getString(0), name = c.getString(1), mime = c.getString(2);
+                if (DIR_MIME.equals(mime)) dirs.add(new String[]{id, name});
+                else out.put(prefix + name, DocumentsContract.buildDocumentUriUsingTree(tree, id));
+            }
+            for (String[] d : dirs) listTree(tree, d[0], prefix + d[1] + "/", out, depth + 1);
+        }
+    }
+
+    private byte[] readUri(Uri uri) throws IOException {
+        try (InputStream in = getContentResolver().openInputStream(uri)) {
+            if (in == null) throw new IOException("Can't read " + uri.getLastPathSegment());
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[1 << 16];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            return out.toByteArray();
+        }
+    }
+
+    private void scanUnityEdits(Uri tree) {
+        if (busy || unityInfo == null) return;
+        final UnityObb.Info info = unityInfo;
+        busy = true; cancelled.set(false); render();
+        summary.setText("Looking for edited PNGs...");
+        worker.execute(() -> {
+            try {
+                Map<String, Uri> files = new HashMap<>();
+                listTree(tree, DocumentsContract.getTreeDocumentId(tree), "", files, 0);
+                String prefix = null;
+                if (files.containsKey(UnityObb.INDEX_NAME)) prefix = "";
+                else for (String k : files.keySet()) {
+                    if (k.endsWith("/" + UnityObb.INDEX_NAME) && k.indexOf('/') == k.length() - UnityObb.INDEX_NAME.length() - 1) {
+                        if (prefix != null) throw new IOException("This folder holds more than one extraction. Pick the Unity_Textures_… folder itself.");
+                        prefix = k.substring(0, k.length() - UnityObb.INDEX_NAME.length());
+                    }
+                }
+                if (prefix == null) throw new IOException("No " + UnityObb.INDEX_NAME + " here. Pick the Unity_Textures_… folder this app extracted.");
+                List<UnityObb.Row> rows = UnityObb.parseIndex(new String(readUri(files.get(prefix + UnityObb.INDEX_NAME)),
+                        java.nio.charset.StandardCharsets.UTF_8));
+                Map<String, java.util.TreeMap<Long, byte[]>> patches = new java.util.LinkedHashMap<>();
+                List<String> edited = new ArrayList<>(), problems = new ArrayList<>();
+                int resized = 0, checked = 0;
+                for (UnityObb.Row r : rows) {
+                    if (cancelled.get()) throw new IOException("Cancelled");
+                    Uri png = files.get(prefix + r.png);
+                    if (png == null) continue; // deleted PNGs simply aren't changed
+                    checked++;
+                    if (checked % 25 == 0) { final int n = checked; runOnUiThread(() -> summary.setText("Checking PNGs " + n + "/" + rows.size() + "...")); }
+                    byte[] data = readUri(png);
+                    if (UnityObb.sha1(data).equals(r.sha1)) continue;
+                    UnityObb.BundleInfo[] owner = new UnityObb.BundleInfo[1];
+                    UnityBundle.Texture t = UnityObb.find(info, r, owner);
+                    if (t == null || t.format != r.format || t.width != r.width || t.height != r.height || t.mips != r.mips) {
+                        problems.add(r.name + ": not found in the opened file (extracted from a different version?)");
+                        continue;
+                    }
+                    BitmapFactory.Options o = new BitmapFactory.Options();
+                    o.inScaled = false; o.inPremultiplied = false; o.inPreferredConfig = Bitmap.Config.ARGB_8888;
+                    Bitmap bmp = BitmapFactory.decodeByteArray(data, 0, data.length, o);
+                    if (bmp == null) { problems.add(r.name + ": not a readable PNG"); continue; }
+                    if (bmp.getWidth() != t.width || bmp.getHeight() != t.height) {
+                        Bitmap scaled = Bitmap.createScaledBitmap(bmp, t.width, t.height, true);
+                        if (scaled != bmp) bmp.recycle();
+                        bmp = scaled; resized++;
+                    }
+                    int[] argb = new int[t.width * t.height];
+                    bmp.getPixels(argb, 0, t.width, 0, 0, t.width, t.height);
+                    bmp.recycle();
+                    try {
+                        byte[] enc = UnityObb.encodeFor(t, argb, t.width, t.height);
+                        patches.computeIfAbsent(owner[0].entry, k -> new java.util.TreeMap<>()).put(t.dataPos, enc);
+                        edited.add(r.name + " (" + UnityTextures.name(t.format) + " " + t.width + "×" + t.height + ")");
+                    } catch (IOException e) { problems.add(e.getMessage()); }
+                }
+                final int scaledCount = resized;
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    StringBuilder msg = new StringBuilder();
+                    if (edited.isEmpty()) msg.append("No edited PNGs found — every PNG matches what was extracted.");
+                    else {
+                        msg.append(edited.size()).append(" edited texture(s) in ").append(patches.size()).append(" bundle(s):");
+                        for (int i = 0; i < Math.min(edited.size(), 15); i++) msg.append("\n• ").append(edited.get(i));
+                        if (edited.size() > 15) msg.append("\n… and ").append(edited.size() - 15).append(" more");
+                        if (scaledCount > 0) msg.append("\n\n").append(scaledCount).append(" PNG(s) were a different size and were scaled back.");
+                    }
+                    if (!problems.isEmpty()) {
+                        msg.append("\n\nSkipped:");
+                        for (int i = 0; i < Math.min(problems.size(), 8); i++) msg.append("\n• ").append(problems.get(i));
+                    }
+                    summary.setText(edited.isEmpty() ? "No edits found" : edited.size() + " edited texture(s) ready");
+                    AlertDialog.Builder dlg = new AlertDialog.Builder(this).setTitle("Edited textures").setMessage(msg.toString());
+                    if (edited.isEmpty()) dlg.setPositiveButton("OK", null);
+                    else dlg.setNegativeButton("Cancel", null).setPositiveButton("Save new file", (d, w) -> {
+                        unityPatches = patches; unityEditCount = edited.size();
+                        Intent save = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                        save.addCategory(Intent.CATEGORY_OPENABLE);
+                        save.setType("application/octet-stream");
+                        save.putExtra(Intent.EXTRA_TITLE, getFilename(imageUri));
+                        save.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                        startActivityForResult(save, SAVE_UNITY);
+                    });
+                    dlg.show();
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Couldn't read the edits"); detail.setText(why);
+                    new AlertDialog.Builder(this).setTitle("Couldn't read the edits").setMessage(why).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+    private void rebuildUnity(Uri dest) {
+        if (busy || unityInfo == null || unityPatches == null || imageUri == null) return;
+        final UnityObb.Info info = unityInfo;
+        final Map<String, java.util.TreeMap<Long, byte[]>> patches = unityPatches;
+        final int count = unityEditCount;
+        busy = true; cancelled.set(false); render();
+        summary.setText("Writing new file...");
+        worker.execute(() -> {
+            try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                if (descriptor == null) throw new IOException("Could not reopen the original file");
+                try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
+                     FileChannel channel = stream.getChannel();
+                     OutputStream raw = getContentResolver().openOutputStream(dest, "w")) {
+                    if (raw == null) throw new IOException("Can't write the output file");
+                    java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(raw, 1 << 20);
+                    UnityObb.rebuild(channel, info, patches, getCacheDir(), out, new UnityObb.Progress() {
+                        @Override public void step(int done, int total, String what) {
+                            runOnUiThread(() -> summary.setText(what.length() > 60 ? what.substring(0, 60) + "…" : what));
+                        }
+                        @Override public boolean cancelled() { return cancelled.get(); }
+                    });
+                    out.flush();
+                }
+                unityPatches = null;
+                String name = getFilename(dest);
+                String where = info.single ? "Put it back where the original bundle was (keep a backup of the original)." :
+                        info.apk ? "This is an APK, so Android needs it signed again before it will install (use an APK signer app). " +
+                                "You'll have to uninstall the original game first, which deletes its save data unless you back it up." :
+                        "Copy it over the original OBB in Android/obb/<package>/ (keep a backup). The file name must stay exactly " +
+                                "the same (main.<version>.<package>.obb). No re-signing is needed.";
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    summary.setText("Saved " + name);
+                    detail.setText(count + " texture(s) written. " + where);
+                    new AlertDialog.Builder(this).setTitle("New file saved")
+                            .setMessage(name + "\n\n" + count + " texture(s) replaced in " + patches.size() + " bundle(s); everything else is byte-for-byte the original.\n\n" + where)
+                            .setPositiveButton("OK", null).show();
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                try { DocumentsContract.deleteDocument(getContentResolver(), dest); } catch (Exception ignored) { }
+                String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Rebuild failed"); detail.setText(why);
+                    new AlertDialog.Builder(this).setTitle("Rebuild failed").setMessage(why).setPositiveButton("OK", null).show();
                 });
             }
         });
