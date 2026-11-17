@@ -1,4 +1,19 @@
-# Game Asset Extractor (Android v0.21.2)
+# Game Asset Extractor (Android v0.22.0)
+
+## New in v0.22: paint only one piece of a model (Area)
+
+In Paint view, tap **Area: all**, then tap the piece of clothing you want, e.g. Max's T-shirt. That piece stays lit up and the rest of the model is dimmed. Apply now only paints the lit-up piece, so a logo or a big pattern can overlap the hoodie or jeans in the preview without touching them. Tap **Area** again to pick a different piece or to paint anywhere again. Works for Unity and Unreal models.
+
+How it works:
+- Each part is split into connected pieces: triangles that share a corner position belong together. Corners are welded, so UV seams don't break a piece up.
+- Games usually model clothing layers as separate pieces. On Max, the T-shirt, hoodie, jeans and shoes are each their own piece, even though they share one texture.
+- The tap is matched to the front-most triangle under your finger.
+
+**How it was checked:**
+- On Max (Life is Strange), the T-shirt was picked from the Front view and a pattern wider than her chest was applied. Only the T-shirt changed (35,456 texels); without an area the hoodie sleeves got painted too (98,902 texels).
+- The CI test checks that pieces join across a UV seam but not across a gap, that taps pick the right piece or nothing, and that area painting leaves the other piece untouched.
+
+**Limits:** if two things are modelled as one piece (e.g. a print that's part of the shirt mesh), they can't be separated this way. Hair or a bag strap in front of the shirt is what a tap there picks, so turn the model or tap a clear spot.
 
 ## v0.21.2: search box for Unity and Unreal files
 

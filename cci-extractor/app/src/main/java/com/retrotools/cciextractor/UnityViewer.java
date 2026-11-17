@@ -260,6 +260,9 @@ final class UnityViewer {
         paintPanel.addView(pr1);
         LinearLayout pr2 = new LinearLayout(activity);
         pr2.setPadding(pad, 0, pad, 0);
+        Button areaButton = new Button(activity);
+        areaButton.setAllCaps(false); areaButton.setTextSize(12);
+        pr2.addView(areaButton, new LinearLayout.LayoutParams((int) (120 * density), (int) (42 * density)));
         TextView opLabel = new TextView(activity);
         opLabel.setTextColor(Color.WHITE); opLabel.setTextSize(13); opLabel.setText("Opacity 100%");
         SeekBar opacity = new SeekBar(activity);
@@ -280,6 +283,12 @@ final class UnityViewer {
         final boolean[] busy = {false};
         final ArrayDeque<Map<String, int[]>> undoStack = new ArrayDeque<>();
         final String[] status = {null};
+        // painting limited to one connected piece of the model (e.g. just the T-shirt)
+        final int[][][] pieces = {null};
+        final boolean[][][] area = {null};
+        final int[] areaPart = {-1};
+        final boolean[] picking = {false};
+        final int[][] areaTris = {null};
         Runnable refresh = () -> {
             int s = selected[0];
             int texPart = s >= 0 ? s : firstTextured(d);
@@ -288,7 +297,9 @@ final class UnityViewer {
                     : "Part " + (s + 1) + ": " + d.partNames[s] + " · " + (d.partTextureName[s] == null ? "no texture" : d.partTextureName[s]);
             if (screen[0] == 1 && texPart >= 0 && d.partTextureName[texPart] != null && s < 0)
                 line = "Texture: " + d.partTextureName[texPart] + ". Pick a part to see others.";
-            if (screen[0] == 2) line = (s < 0 ? "Painting onto every part under the design." : "Painting only part " + (s + 1) + ": " + d.partNames[s] + ".") +
+            if (screen[0] == 2) line = (picking[0] ? "Tap the piece of the model to paint on (e.g. the T-shirt)."
+                    : area[0] != null ? "Painting only the chosen area (lit up) of " + d.partNames[areaPart[0]] + "."
+                    : s < 0 ? "Painting onto every part under the design." : "Painting only part " + (s + 1) + ": " + d.partNames[s] + ".") +
                     (status[0] != null ? "\n" + status[0] : "");
             info.setText(line + (d.note == null || screen[0] == 2 ? "" : "\n" + d.note));
             hint.setText(screen[0] == 1 ? "UV view: the selected part's outline (bright) on its texture; other parts on the same texture are dim. Pinch to zoom, drag to move."
@@ -302,6 +313,8 @@ final class UnityViewer {
             apply.setEnabled(!busy[0] && decal.hasDesign());
             undo.setEnabled(!busy[0] && !undoStack.isEmpty());
             pick.setEnabled(!busy[0]);
+            areaButton.setText(picking[0] ? "Tap the model…" : area[0] != null ? "Area: chosen" : "Area: all");
+            areaButton.setEnabled(!busy[0]);
         };
 
         for (int i = 0; i < 4; i++) {
@@ -322,6 +335,8 @@ final class UnityViewer {
                     paintPanel.setVisibility(w == 2 ? View.VISIBLE : View.GONE);
                     views.setVisibility(w == 1 ? View.GONE : View.VISIBLE);
                     if (w == 2 && !decal.hasDesign()) pick.performClick();
+                    picking[0] = false; decal.pickTap = null;
+                    gl.setArea(w == 2 ? areaPart[0] : -1, w == 2 ? areaTris[0] : null);   // lit-up area only while painting
                     refresh.run();
                 }).show());
 
@@ -343,6 +358,45 @@ final class UnityViewer {
             refresh.run();
         }));
         target.setOnClickListener(v -> { decal.adjustDesign = !decal.adjustDesign; refresh.run(); });
+        Runnable startPicking = () -> {
+            picking[0] = true; status[0] = null;
+            decal.pickTap = (x, y) -> {
+                picking[0] = false; decal.pickTap = null;
+                UnityPaint.View3D view = gl.view();
+                busy[0] = true; status[0] = "Finding that piece…"; refresh.run();
+                work.execute(() -> {
+                    if (pieces[0] == null) pieces[0] = UnityPaint.pieces(d.geometry);
+                    int[] hit = UnityPaint.pick(d.geometry, view, x, y);
+                    activity.runOnUiThread(() -> {
+                        busy[0] = false;
+                        if (hit == null) status[0] = "That tap missed the model. Tap Area to try again.";
+                        else {
+                            area[0] = UnityPaint.areaOf(pieces[0], hit[0], hit[1]);
+                            areaPart[0] = hit[0];
+                            int count = 0;
+                            for (boolean b : area[0][hit[0]]) if (b) count++;
+                            int[] tris = new int[count];
+                            for (int t = 0, k = 0; t < area[0][hit[0]].length; t++) if (area[0][hit[0]][t]) tris[k++] = t;
+                            areaTris[0] = tris;
+                            gl.setArea(hit[0], tris);
+                            status[0] = "Area chosen (" + count + " triangles). Only the lit-up piece gets paint.";
+                        }
+                        refresh.run();
+                    });
+                });
+            };
+            refresh.run();
+        };
+        areaButton.setOnClickListener(v -> {
+            if (busy[0]) return;
+            if (picking[0]) { picking[0] = false; decal.pickTap = null; refresh.run(); return; }
+            if (area[0] == null) { startPicking.run(); return; }
+            new AlertDialog.Builder(activity).setTitle("Paint area")
+                    .setItems(new String[]{"Pick a different piece", "Paint anywhere again"}, (dd, w) -> {
+                        if (w == 0) startPicking.run();
+                        else { area[0] = null; areaPart[0] = -1; areaTris[0] = null; gl.setArea(-1, null); status[0] = null; refresh.run(); }
+                    }).show();
+        });
         opacity.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar sb, int p, boolean user) { opLabel.setText("Opacity " + p + "%"); decal.setOpacity(p / 100f); }
             @Override public void onStartTrackingTouch(SeekBar sb) { }
@@ -357,11 +411,12 @@ final class UnityViewer {
                 String k = d.partKey[p];
                 if (k == null) continue;
                 textureParts.computeIfAbsent(k, x -> new ArrayList<>()).add(p);
-                if (selected[0] < 0 || selected[0] == p) paintParts.computeIfAbsent(k, x -> new ArrayList<>()).add(p);
+                if (area[0] != null ? areaPart[0] == p : (selected[0] < 0 || selected[0] == p)) paintParts.computeIfAbsent(k, x -> new ArrayList<>()).add(p);
             }
             if (paintParts.isEmpty()) { status[0] = "Nothing to paint: this part has no texture."; refresh.run(); return; }
             UnityPaint.View3D view = gl.view();
             UnityPaint.Decal dc = decal.snapshot();
+            final boolean[][] limit = area[0];
             busy[0] = true; status[0] = "Painting…"; refresh.run();
             work.execute(() -> {
                 Map<String, int[]> before = new HashMap<>();
@@ -372,7 +427,7 @@ final class UnityViewer {
                         int[] px = d.pixels.get(e.getKey());
                         int[] size = d.texSize.get(e.getKey());
                         int[] copy = px.clone();
-                        UnityPaint.Result r = UnityPaint.stamp(d.geometry, view, depth, dc, px, size[0], size[1], e.getValue(), textureParts.get(e.getKey()));
+                        UnityPaint.Result r = UnityPaint.stamp(d.geometry, view, depth, dc, px, size[0], size[1], e.getValue(), textureParts.get(e.getKey()), limit);
                         if (r.painted > 0) before.put(e.getKey(), copy);
                         painted += r.painted; mirrored |= r.mirrored();
                     }
@@ -381,7 +436,8 @@ final class UnityViewer {
                 activity.runOnUiThread(() -> {
                     busy[0] = false;
                     if (ferr != null) status[0] = "Painting failed: " + ferr;
-                    else if (fp == 0) status[0] = "Nothing was painted: the design isn't over a textured surface facing you.";
+                    else if (fp == 0) status[0] = limit != null ? "Nothing was painted: the design isn't over the chosen area where it faces you."
+                            : "Nothing was painted: the design isn't over a textured surface facing you.";
                     else {
                         undoStack.push(before);
                         while (undoStack.size() > 8) undoStack.removeLast();
@@ -469,6 +525,10 @@ final class UnityViewer {
     // ================================================================== design overlay (paint mode)
     static final class DecalView extends View {
         boolean adjustDesign = true;
+        interface TapListener { void tap(float x, float y); }
+        /** While set, a tap (not a drag) on the view picks a point on the model instead of moving anything. */
+        TapListener pickTap;
+        private float downX, downY;
         private Bitmap shown;
         private int[] argb; private int w, h;
         private float cx, cy, size, angle, opacity = 1;
@@ -515,6 +575,15 @@ final class UnityViewer {
         }
 
         @Override public boolean onTouchEvent(MotionEvent e) {
+            if (pickTap != null) {
+                int a = e.getActionMasked();
+                if (a == MotionEvent.ACTION_DOWN) { downX = e.getX(); downY = e.getY(); }
+                else if (a == MotionEvent.ACTION_UP && Math.hypot(e.getX() - downX, e.getY() - downY) < 24 * getResources().getDisplayMetrics().density) {
+                    TapListener l = pickTap;
+                    l.tap(e.getX(), e.getY());
+                }
+                return true;
+            }
             if (!adjustDesign || shown == null) return false; // let the 3D view handle it
             int n = e.getPointerCount();
             if (n >= 2) {
@@ -568,6 +637,11 @@ final class UnityViewer {
         }
 
         void select(int part) { renderer.selected = part; requestRender(); }
+        /** Light up one piece (triangle indices within {@code part}); part &lt; 0 clears it. */
+        void setArea(int part, int[] triangles) {
+            queueEvent(() -> renderer.setArea(part, triangles));
+            requestRender();
+        }
         /** Snap to an exact angle (zoom is kept). */
         void setAngles(float yaw, float pitch) { renderer.yaw = yaw; renderer.pitch = pitch; requestRender(); }
         boolean cutout() { return renderer.cutout; }
@@ -601,6 +675,21 @@ final class UnityViewer {
         private int program, vbo, aspectW = 1, aspectH = 1;
         private int[] ibo, tex;
         private final Map<Bitmap, Integer> uploaded = new java.util.IdentityHashMap<>();
+        private int areaPart = -1, areaIbo, areaCount;
+
+        /** GL thread: index buffer of the chosen paint area, drawn bright over the dimmed model. */
+        void setArea(int part, int[] triangles) {
+            areaPart = -1;
+            if (part < 0 || triangles == null || ibo == null || part >= d.geometry.parts.length) return;
+            int[] idx = d.geometry.parts[part];
+            IntBuffer ib = ByteBuffer.allocateDirect(triangles.length * 12).order(ByteOrder.nativeOrder()).asIntBuffer();
+            for (int t : triangles) ib.put(idx[t * 3]).put(idx[t * 3 + 1]).put(idx[t * 3 + 2]);
+            ib.position(0);
+            if (areaIbo == 0) { int[] ids = new int[1]; GLES30.glGenBuffers(1, ids, 0); areaIbo = ids[0]; }
+            GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, areaIbo);
+            GLES30.glBufferData(GLES30.GL_ELEMENT_ARRAY_BUFFER, triangles.length * 12, ib, GLES30.GL_STATIC_DRAW);
+            areaPart = part; areaCount = triangles.length * 3;
+        }
 
         Renderer3D(Data d) { this.d = d; }
 
@@ -726,10 +815,21 @@ final class UnityViewer {
                 boolean has = tex[p] != 0;
                 if (has) GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, tex[p]);
                 GLES30.glUniform1i(uHas, has ? 1 : 0);
-                GLES30.glUniform1f(uDim, sel < 0 || sel == p ? 1f : 0.18f);
+                GLES30.glUniform1f(uDim, areaPart >= 0 ? 0.35f : sel < 0 || sel == p ? 1f : 0.18f);
                 GLES30.glUniform1f(uCut, cutout && (d.partCutout == null || d.partCutout[p]) ? 0.3f : -1f);
                 GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, ibo[p]);
                 GLES30.glDrawElements(GLES30.GL_TRIANGLES, d.geometry.parts[p].length, GLES30.GL_UNSIGNED_INT, 0);
+            }
+            if (areaPart >= 0 && areaPart < ibo.length) {   // the chosen paint area, full brightness on top
+                boolean has = tex[areaPart] != 0;
+                if (has) GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, tex[areaPart]);
+                GLES30.glUniform1i(uHas, has ? 1 : 0);
+                GLES30.glUniform1f(uDim, 1f);
+                GLES30.glUniform1f(uCut, cutout && (d.partCutout == null || d.partCutout[areaPart]) ? 0.3f : -1f);
+                GLES30.glDepthFunc(GLES30.GL_LEQUAL);
+                GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, areaIbo);
+                GLES30.glDrawElements(GLES30.GL_TRIANGLES, areaCount, GLES30.GL_UNSIGNED_INT, 0);
+                GLES30.glDepthFunc(GLES30.GL_LESS);
             }
         }
     }

@@ -128,6 +128,60 @@ public class UnrealTest {
         }
     }
 
+    /** Painting limited to one connected piece: three quads in one part, two of them joined across a UV seam. */
+    static void areas() {
+        UnityModels.Mesh m = new UnityModels.Mesh();
+        m.name = "areas"; m.vertexCount = 12;
+        // quads (x0, x1, u0, u1): A and C touch at x = -10 (separate vertices, as at a UV seam); B stands apart
+        float[][] q = {{-30, -10, 0.0f, 0.3f}, {10, 30, 0.6f, 0.9f}, {-10, 0, 0.3f, 0.45f}};
+        m.pos = new float[36]; m.normal = new float[36]; m.uv = new float[24];
+        int[] part = new int[18];
+        for (int k = 0; k < 3; k++) {
+            float[][] corners = {{q[k][0], 0, q[k][2], 0}, {q[k][1], 0, q[k][3], 0}, {q[k][1], 20, q[k][3], 1}, {q[k][0], 20, q[k][2], 1}};
+            for (int c = 0; c < 4; c++) {
+                int v = k * 4 + c;
+                m.pos[v * 3] = corners[c][0]; m.pos[v * 3 + 1] = corners[c][1]; m.pos[v * 3 + 2] = 0;
+                m.normal[v * 3 + 2] = 1;
+                m.uv[v * 2] = corners[c][2]; m.uv[v * 2 + 1] = corners[c][3];
+            }
+            int b = k * 4; int[] t = {b, b + 1, b + 2, b, b + 2, b + 3};
+            System.arraycopy(t, 0, part, k * 6, 6);
+        }
+        m.parts = new int[][]{part};
+        m.min = new float[]{-30, 0, 0}; m.max = new float[]{30, 20, 0};
+        UnityPaint.Geometry g = new UnityPaint.Geometry(m);
+        int[][] pieces = UnityPaint.pieces(g);
+        check(pieces[0].length == 6 && pieces[0][0] == pieces[0][1] && pieces[0][0] == pieces[0][4] && pieces[0][0] != pieces[0][2],
+                "pieces: A and C joined across the seam, B separate");
+        UnityPaint.View3D view = UnityPaint.camera(UnityPaint.YAW_FRONT, 0, 1, g.center, g.radius, 400, 400);
+        // drawn geometry mirrors x, so mesh quad A (x -30..-10) is drawn at +10..+30
+        float[] onA = UnityPaint.project(view, 20, 10, 0), onB = UnityPaint.project(view, -20, 10, 0);
+        int[] hitA = UnityPaint.pick(g, view, onA[0], onA[1]), hitB = UnityPaint.pick(g, view, onB[0], onB[1]);
+        check(hitA != null && hitA[1] / 2 == 0 && hitB != null && hitB[1] / 2 == 1, "tap picks the quad under it");
+        check(UnityPaint.pick(g, view, 2, 2) == null, "tap beside the model picks nothing");
+        boolean[][] area = UnityPaint.areaOf(pieces, hitA[0], hitA[1]);
+        int tw = 64, th = 16;
+        int[] px = new int[tw * th]; java.util.Arrays.fill(px, 0xFF000000);
+        UnityPaint.Decal dc = new UnityPaint.Decal();
+        dc.w = dc.h = 1; dc.argb = new int[]{0xFFFF0000};
+        float[] c = UnityPaint.project(view, 0, 10, 0);
+        dc.cx = c[0]; dc.cy = c[1]; dc.size = 2000;
+        UnityPaint.Depth depth = UnityPaint.depth(g, view, 400);
+        UnityPaint.Result r = UnityPaint.stamp(g, view, depth, dc, px, tw, th, java.util.Collections.singletonList(0), java.util.Collections.singletonList(0), area);
+        int redA = 0, redB = 0, redC = 0;
+        for (int y = 0; y < th; y++) for (int x = 0; x < tw; x++) {
+            if (px[y * tw + x] != 0xFFFF0000) continue;
+            float u = (x + 0.5f) / tw;
+            if (u > 0.02f && u < 0.28f) redA++; else if (u > 0.32f && u < 0.43f) redC++; else if (u > 0.62f && u < 0.88f) redB++;
+        }
+        check(r.painted > 0 && redA > 100 && redC > 50 && redB == 0, "area paint: A and its seam neighbour C painted, B untouched (" + redA + "/" + redC + "/" + redB + ")");
+        java.util.Arrays.fill(px, 0xFF000000);
+        UnityPaint.stamp(g, view, depth, dc, px, tw, th, java.util.Collections.singletonList(0), java.util.Collections.singletonList(0), null);
+        int any = 0;
+        for (int y = 0; y < th; y++) for (int x = (int) (0.62f * tw) + 1; x < (int) (0.88f * tw); x++) if (px[y * tw + x] == 0xFFFF0000) any++;
+        check(any > 50, "without an area, B is painted too");
+    }
+
     public static void main(String[] args) throws Exception {
         File dir = new File(args.length > 0 ? args[0] : "tests/fixtures/unreal");
         File obb = new File(dir, "unreal_fixture.obb");
@@ -302,6 +356,7 @@ public class UnrealTest {
             try { UnrealAssets.parse(junk); check(false, "junk package accepted"); } catch (java.io.IOException expectedFailure) { checks++; }
         }
         models(obb);
+        areas();
         System.out.println("UnrealTest OK (" + checks + " checks)");
     }
 }
