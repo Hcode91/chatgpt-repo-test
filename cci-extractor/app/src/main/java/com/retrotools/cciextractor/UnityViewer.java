@@ -130,6 +130,60 @@ final class UnityViewer {
         return d;
     }
 
+    /**
+     * Metal Gear Solid (PS1): a KMD model from STAGE.DIR, one part per texture. Keys are
+     * {@link MgsStage.Entry#key()}; texInfo is {texture entry, null}. {@code painted}: by key.
+     */
+    static Data loadMgs(java.nio.channels.FileChannel ch, MgsStage.Info info, MgsStage.Model model, Map<String, int[]> painted) throws Exception {
+        Data d = new Data();
+        UnityModels.Mesh mesh = new UnityModels.Mesh();
+        mesh.name = String.format(java.util.Locale.ROOT, "%04x", model.entry.id);
+        mesh.vertexCount = model.pos.length / 3;
+        mesh.pos = model.pos;
+        mesh.uv = model.uv;
+        mesh.parts = model.parts;
+        mesh.min = model.min.clone();
+        mesh.max = model.max.clone();
+        d.mesh = mesh;
+        d.geometry = new UnityPaint.Geometry(mesh);
+        int parts = model.parts.length, missing = 0;
+        d.partNames = new String[parts];
+        d.partKey = new String[parts];
+        d.partTextureName = new String[parts];
+        for (int p = 0; p < parts; p++) {
+            int id = model.partTexture[p];
+            d.partNames[p] = String.format(java.util.Locale.ROOT, "texture %04x", id);
+            MgsStage.Entry tex = MgsStage.findTexture(info, model.entry.folder, id);
+            if (tex == null) { missing++; continue; }
+            String k = tex.key();
+            if (!d.texInfo.containsKey(k)) {
+                try {
+                    MgsStage.Image img = MgsStage.decodePcx(MgsStage.read(ch, tex));
+                    int[] argb = painted != null && painted.containsKey(k) ? painted.get(k).clone() : img.argb;
+                    Bitmap bmp = Bitmap.createBitmap(img.width, img.height, Bitmap.Config.ARGB_8888);
+                    bmp.setPixels(argb, 0, img.width, 0, 0, img.width, img.height);
+                    d.texInfo.put(k, new Object[]{tex, null});
+                    d.texSize.put(k, new int[]{img.width, img.height});
+                    d.texFile.put(k, tex.path().replace('/', '_').replace(".pcx", ".png"));
+                    d.pixels.put(k, argb);
+                    d.bitmaps.put(k, bmp);
+                } catch (IOException | OutOfMemoryError e) {
+                    d.texInfo.put(k, null);
+                }
+            }
+            if (d.bitmaps.containsKey(k)) {
+                d.partKey[p] = k;
+                int[] size = d.texSize.get(k);
+                d.partTextureName[p] = tex.path() + " (" + size[0] + "×" + size[1] + ")";
+            } else {
+                missing++;
+            }
+        }
+        if (missing > 0) d.note = missing + " texture(s) of this model aren't in STAGE.DIR (they may be loaded from elsewhere); those parts are grey.";
+        else d.note = "Black is see-through in this game. Painted colours are matched to each texture's own palette when saving.";
+        return d;
+    }
+
     /** Unreal Engine 4: loads a mesh, its materials and textures for the viewer. {@code painted}: textures already painted, by key. */
     static Data loadUnreal(UnrealObb.Info info, UnrealModels.MeshRef ref, Map<String, int[]> painted) throws Exception {
         UnrealPak pak = info.paks.get(ref.pak).pak;

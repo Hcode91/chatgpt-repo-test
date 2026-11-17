@@ -50,7 +50,47 @@ public class MgsStageTest {
         }
     }
 
-    static int[] pal16() { int[] p = new int[16]; for (int i = 0; i < 16; i++) p[i] = (i * 17) << 16 | (255 - i * 17) << 8 | (i * 5); return p; }
+    /** Entry 15 is black, which the game (and the reader) treats as see-through. */
+    static int[] pal16() { int[] p = new int[16]; for (int i = 0; i < 15; i++) p[i] = (i * 17) << 16 | (255 - i * 17) << 8 | (i * 5); return p; }
+    static int shown16(int i) { int c = pal16()[i]; return c == 0 ? 0 : 0xff000000 | c; }
+
+    /** 256-colour, every pixel index 5: compresses to almost nothing. */
+    static byte[] pcxSolid(int w, int h) {
+        B b = pcxHeader(8, 1, w, h, w, null);
+        byte[] all = new byte[w * h];
+        java.util.Arrays.fill(all, (byte) 5);
+        rle(b, all);
+        b.u8(0x0c);
+        for (int i = 0; i < 256; i++) b.u8(i).u8(255 - i).u8(i / 2);
+        return b.pad(4).done();
+    }
+
+    /** Two parts, one quad each: the second sits at (100, 0, 0) from the first, which sits at (10, 20, 30). */
+    static byte[] kmd() {
+        B b = new B();
+        b.u32(2).u32(2);
+        for (int i = 0; i < 6; i++) b.u32(0);
+        int dataAt = 32 + 2 * 88, partData = 32 + 4 + 8 + 4;   // verts, indices, uvs, texture id + pad
+        int[][] origins = {{10, 20, 30}, {100, 0, 0}};
+        int[] parents = {-1, 0}, textures = {0x1111, 0xeeee};
+        for (int m = 0; m < 2; m++) {
+            int at = dataAt + m * partData;
+            b.u32(1).u32(1);
+            for (int i = 0; i < 6; i++) b.u32(0);
+            b.u32(origins[m][0]).u32(origins[m][1]).u32(origins[m][2]).u32(parents[m]).u32(0);
+            b.u32(4).u32(at).u32(at + 32);     // vertices, vertex indices
+            b.u32(0).u32(0).u32(0);            // normals (unused)
+            b.u32(at + 36).u32(at + 44).u32(0);  // uvs, texture ids
+        }
+        for (int m = 0; m < 2; m++) {
+            int[][] v = {{0, 0, 0}, {64, 0, 0}, {64, 64, 0}, {0, 64, 0}};
+            for (int[] p : v) b.u16(p[0]).u16(p[1]).u16(p[2]).u16(0);
+            b.u8(0).u8(1).u8(2).u8(3);
+            b.u8(0).u8(0).u8(128).u8(0).u8(128).u8(64).u8(0).u8(64);
+            b.u16(textures[m]).u16(0);
+        }
+        return b.done();
+    }
 
     /** 16-colour, 4 bit planes: pixel (x, y) = (x + y) & 15. Width 13 to test partial bytes. */
     static byte[] pcx16(int w, int h) {
@@ -84,7 +124,7 @@ public class MgsStageTest {
         B dar = new B();
         dar.u16(0x1111).u8('p').u8(0).u32(tex16.length).raw(tex16);
         dar.u16(0x2222).u8('p').u8(0).u32(tex256.length).raw(tex256);
-        byte[] kmd = {1, 2, 3, 4, 5, 6, 7}, lit = {9, 9, 9}, gcx = new byte[40], wvx = new byte[100];
+        byte[] kmd = kmd(), lit = {9, 9, 9}, gcx = new byte[40], wvx = new byte[100];
 
         B f = new B();
         // Directory: two areas at sectors 1 and 5
@@ -102,9 +142,11 @@ public class MgsStageTest {
         f.raw(dar.done()).pad(0x800);
         f.raw(wvx).pad(0x800);
         check(f.size() == 5 * 0x800, "fixture layout: second area at sector 5, got " + f.size());
-        // Area init: one resident texture outside any DAR
-        f.u16(1).u16(2).u32(name(0xeeee, 'r', 'p')).u32(tex16.length).u32(0).u32(0).padTo(6 * 0x800);
+        // Area init: two resident textures outside any DAR, the second a solid 64×64 that fills most of its sector
+        byte[] solid = pcxSolid(64, 64);
+        f.u16(1).u16(3).u32(name(0xeeee, 'r', 'p')).u32(tex16.length).u32(name(0xffff, 'r', 'p')).u32(solid.length).u32(0).u32(0).padTo(6 * 0x800);
         f.raw(tex16).pad(0x800);
+        f.raw(solid).pad(0x800);
         return f.done();
     }
 
@@ -147,6 +189,7 @@ public class MgsStageTest {
 
     public static void main(String[] args) throws Exception {
         Path dir = Files.createTempDirectory("mgsstage");
+        check(kmd().length < 0x700, "fixture model fits its sector");
         Path stage = dir.resolve("STAGE.DIR"), face = dir.resolve("FACE.DAT"), junk = dir.resolve("junk.bin");
         Files.write(stage, stageDir());
         Files.write(face, faceDat());
@@ -161,13 +204,14 @@ public class MgsStageTest {
             check(info.parts.size() == 2 && info.parts.get(0).name.equals("s00a") && info.parts.get(1).name.equals("init"), "areas");
             MgsStage.Part s00a = info.parts.get(0);
             check(s00a.entries.size() == 6, "s00a files: " + s00a.entries.size());
-            check(info.textures == 3 && info.files == 7, "counts " + info.textures + "/" + info.files);
+            check(info.textures == 4 && info.files == 8, "counts " + info.textures + "/" + info.files);
             // Packed run: kmd at the area's data start, lit and gcx straight after it (not sector-aligned)
             MgsStage.Entry kmd = s00a.entries.get(0), lit = s00a.entries.get(1), gcx = s00a.entries.get(2);
-            check(kmd.type == 'k' && kmd.size == 7 && kmd.offset == 0x1000, "kmd " + kmd.offset + "/" + kmd.size);
-            check(lit.type == 'l' && lit.size == 3 && lit.offset == 0x1007, "lit " + lit.offset + "/" + lit.size);
-            check(gcx.type == 'g' && gcx.size == 40 && gcx.offset == 0x100a, "gcx " + gcx.offset + "/" + gcx.size);
-            check(MgsStage.read(ch, kmd)[6] == 7 && MgsStage.read(ch, lit)[0] == 9, "packed data");
+            int kl = kmd().length;
+            check(kmd.type == 'k' && kmd.isModel() && kmd.size == kl && kmd.offset == 0x1000, "kmd " + kmd.offset + "/" + kmd.size);
+            check(lit.type == 'l' && lit.size == 3 && lit.offset == 0x1000 + kl, "lit " + lit.offset + "/" + lit.size);
+            check(gcx.type == 'g' && gcx.size == 40 && gcx.offset == 0x1000 + kl + 3, "gcx " + gcx.offset + "/" + gcx.size);
+            check(MgsStage.read(ch, lit)[0] == 9, "packed data");
             check(gcx.path().equals("s00a/cache/cccc.gcx"), "path " + gcx.path());
             // DAR contents and the aligned sound file after it
             MgsStage.Entry t16 = s00a.entries.get(3), t256 = s00a.entries.get(4), wvx = s00a.entries.get(5);
@@ -177,9 +221,9 @@ public class MgsStageTest {
 
             MgsStage.Image a = MgsStage.decodePcx(MgsStage.read(ch, t16));
             check(a.width == 13 && a.height == 5, "16-colour size");
-            int[] p16 = pal16();
             for (int y = 0; y < 5; y++) for (int x = 0; x < 13; x++)
-                check(a.argb[y * 13 + x] == (0xff000000 | p16[(x + y) & 15]), "16-colour pixel " + x + "," + y);
+                check(a.argb[y * 13 + x] == shown16((x + y) & 15), "16-colour pixel " + x + "," + y);
+            check(a.argb[4 * 13 + 11] == 0, "black is see-through");
             MgsStage.Image b = MgsStage.decodePcx(MgsStage.read(ch, t256));
             check(b.width == 20 && b.height == 6, "256-colour size");
             for (int y = 0; y < 6; y++) for (int x = 0; x < 20; x++) {
@@ -187,8 +231,74 @@ public class MgsStageTest {
                 check(b.argb[y * 20 + x] == (0xff000000 | i << 16 | (255 - i) << 8 | i / 2), "256-colour pixel " + x + "," + y);
             }
             MgsStage.Entry resident = info.parts.get(1).entries.get(0);
+            check(info.parts.get(1).entries.size() == 2, "init files");
             check(resident.group == 'r' && resident.offset == 6 * 0x800 && MgsStage.decodePcx(MgsStage.read(ch, resident)).width == 13, "resident texture");
-            check(info.label(0).contains("2 textures") && info.label(0).contains("4 other"), "label " + info.label(0));
+            check(info.label(0).contains("2 textures") && info.label(0).contains("1 models") && info.label(0).contains("3 other"), "label " + info.label(0));
+
+            // Model: parts by texture, child placed relative to its parent, y flipped, uv = coordinate / 256
+            MgsStage.Model m = MgsStage.readModel(kmd, MgsStage.read(ch, kmd));
+            check(m.faces == 2 && m.parts.length == 2 && m.partTexture[0] == 0x1111 && m.partTexture[1] == 0xeeee, "model parts");
+            check(java.util.Arrays.equals(m.parts[0], new int[]{0, 1, 2, 0, 2, 3}) && java.util.Arrays.equals(m.parts[1], new int[]{4, 5, 6, 4, 6, 7}), "triangles");
+            check(m.pos[0] == 10 && m.pos[1] == -20 && m.pos[2] == 30, "first part origin");
+            check(m.pos[4 * 3] == 110 && m.pos[4 * 3 + 1] == -20 && m.pos[4 * 3 + 2] == 30, "second part relative to first");
+            check(m.pos[2 * 3] == 74 && m.pos[2 * 3 + 1] == -84, "corner 2");
+            check(m.uv[2] == 0.5f && m.uv[3] == 1f && m.uv[4] == 0.5f && m.uv[5] == 0.75f, "uvs");
+            check(MgsStage.findTexture(info, "s00a", 0x1111) == t16, "texture in the same area");
+            check(MgsStage.findTexture(info, "s00a", 0xeeee) == resident, "shared texture from another area");
+            check(MgsStage.findTexture(info, "s00a", 0x4242) == null, "missing texture");
+
+            // Rebuild with no edits gives back the same file
+            java.io.ByteArrayOutputStream same = new java.io.ByteArrayOutputStream();
+            MgsStage.rebuild(ch, info, new java.util.HashMap<>(), same, null);
+            check(java.util.Arrays.equals(same.toByteArray(), Files.readAllBytes(stage)), "identity rebuild");
+
+            // Edit the 256-colour texture: palette colours stay exact, untouched pixels stay, black goes to a visible colour
+            byte[] orig256 = MgsStage.read(ch, t256);
+            int[] edited = b.argb.clone();
+            int c100 = 0xff000000 | 100 << 16 | 155 << 8 | 50;
+            edited[0] = c100; edited[21] = c100; edited[40] = 0xff000000;
+            java.util.Map<String, byte[]> edits = new java.util.HashMap<>();
+            edits.put(t256.key(), MgsStage.encodePcx(orig256, edited, 20, 6));
+            check(MgsStage.checkFit(ch, info, edits).isEmpty(), "small edit fits");
+            Path out = dir.resolve("STAGE_edited.DIR");
+            try (java.io.OutputStream os = Files.newOutputStream(out)) { MgsStage.rebuild(ch, info, edits, os, null); }
+            check(Files.size(out) == Files.size(stage), "same size after edit");
+            try (FileChannel e2 = FileChannel.open(out)) {
+                MgsStage.Info i2 = MgsStage.parseStageDir(e2);
+                MgsStage.Image back = MgsStage.decodePcx(MgsStage.read(e2, i2.parts.get(0).entries.get(4)));
+                check(back.argb[0] == c100 && back.argb[21] == c100, "edited pixels");
+                check((back.argb[40] >>> 24) == 0xff, "opaque black stays visible");
+                int changed = 0;
+                for (int i = 0; i < back.argb.length; i++) if (back.argb[i] != b.argb[i]) changed++;
+                check(changed == 3, "only the edited pixels changed: " + changed);
+                for (int pi = 0; pi < 2; pi++) for (int k = 0; k < info.parts.get(pi).entries.size(); k++) {
+                    MgsStage.Entry x = info.parts.get(pi).entries.get(k), y = i2.parts.get(pi).entries.get(k);
+                    if (x != t256) check(java.util.Arrays.equals(MgsStage.read(ch, x), MgsStage.read(e2, y)), "other file unchanged: " + x.path());
+                }
+            }
+            // See-through pixels need a black palette entry
+            int[] clear = a.argb.clone();
+            clear[0] = 0;
+            byte[] enc16 = MgsStage.encodePcx(MgsStage.read(ch, t16), clear, 13, 5);
+            check(MgsStage.decodePcx(enc16).argb[0] == 0, "see-through pixel encoded as black");
+            try { MgsStage.encodePcx(orig256, new int[120], 20, 6); check(false, "transparent pixels without a black entry accepted"); }
+            catch (java.io.IOException expected) { }
+            try { MgsStage.encodePcx(orig256, new int[121], 11, 11); check(false, "wrong size accepted"); }
+            catch (java.io.IOException expected) { }
+            // Noise in the solid 64×64 texture can't fit in its area
+            MgsStage.Entry solid = info.parts.get(1).entries.get(1);
+            int[] noise = new int[64 * 64];
+            Random r = new Random(9);
+            for (int i = 0; i < noise.length; i++) { int k = 1 + r.nextInt(150); noise[i] = 0xff000000 | k << 16 | (255 - k) << 8 | k / 2; }
+            java.util.Map<String, byte[]> big = new java.util.HashMap<>();
+            big.put(solid.key(), MgsStage.encodePcx(MgsStage.read(ch, solid), noise, 64, 64));
+            java.util.List<String> problems = MgsStage.checkFit(ch, info, big);
+            check(problems.size() == 1 && problems.get(0).contains("init") && problems.get(0).contains("too big"), "overflow reported: " + problems);
+            try { MgsStage.rebuild(ch, info, big, new java.io.ByteArrayOutputStream(), null); check(false, "overflow accepted"); }
+            catch (java.io.IOException expected) { }
+            // Extracted PNG names map back to textures
+            java.util.Map<String, String> names = MgsStage.extractedNames(info);
+            check(t256.key().equals(names.get("s00a/nocache/2222.png")) && solid.key().equals(names.get("init/resident/ffff.png")), "extracted names " + names.keySet());
         }
 
         try (FileChannel ch = FileChannel.open(face)) {

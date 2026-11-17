@@ -253,4 +253,134 @@ public final class Ps1Disc {
     private static long u32(byte[] d, int o) {
         return (d[o] & 255L) | (d[o + 1] & 255L) << 8 | (d[o + 2] & 255L) << 16 | (d[o + 3] & 255L) << 24;
     }
+
+    // ------------------------------------------------------------------ writing a file back
+
+    // EDC/ECC as in ECMA-130 (the tables and walk match Neill Corlett's ECM tools)
+    private static final int[] ECC_F = new int[256], ECC_B = new int[256], EDC = new int[256];
+    static {
+        for (int i = 0; i < 256; i++) {
+            int j = (i << 1) ^ ((i & 0x80) != 0 ? 0x11D : 0);
+            ECC_F[i] = j;
+            ECC_B[i ^ j] = i;
+            int edc = i;
+            for (int k = 0; k < 8; k++) edc = (edc >>> 1) ^ ((edc & 1) != 0 ? 0xD8018001 : 0);
+            EDC[i] = edc;
+        }
+    }
+
+    static int edc(byte[] b, int off, int len) {
+        int edc = 0;
+        for (int i = 0; i < len; i++) edc = (edc >>> 8) ^ EDC[(edc ^ b[off + i]) & 0xFF];
+        return edc;
+    }
+
+    /** One ECC block (P or Q) over the 4 address bytes (zeros if {@code zeroAddress}) and the data from 0x10. */
+    private static void eccBlock(byte[] s, boolean zeroAddress, int majorCount, int minorCount, int majorMult, int minorInc, int dest) {
+        int size = majorCount * minorCount;
+        for (int major = 0; major < majorCount; major++) {
+            int index = (major >> 1) * majorMult + (major & 1);
+            int a = 0, b = 0;
+            for (int minor = 0; minor < minorCount; minor++) {
+                int t = index < 4 ? (zeroAddress ? 0 : s[0x0C + index] & 0xFF) : s[0x10 + index - 4] & 0xFF;
+                index += minorInc;
+                if (index >= size) index -= size;
+                a ^= t;
+                b ^= t;
+                a = ECC_F[a];
+            }
+            a = ECC_B[ECC_F[a] ^ b];
+            s[dest + major] = (byte) a;
+            s[dest + major + majorCount] = (byte) (a ^ b);
+        }
+    }
+
+    private static void put32(byte[] b, int at, int v) {
+        b[at] = (byte) v; b[at + 1] = (byte) (v >> 8); b[at + 2] = (byte) (v >> 16); b[at + 3] = (byte) (v >>> 24);
+    }
+
+    /**
+     * Recomputes the EDC and ECC of a raw 2352-byte sector after its data changed: Mode 1, or
+     * Mode 2 Form 1 (Form 2 has no ECC, and its EDC is optional; neither is touched here).
+     */
+    static void fixSector(byte[] s) throws IOException {
+        int mode = s[15] & 0xFF;
+        if (mode == 1) {
+            put32(s, 0x810, edc(s, 0, 0x810));
+            for (int i = 0x814; i < 0x81C; i++) s[i] = 0;
+            eccBlock(s, false, 86, 24, 2, 86, 0x81C);
+            eccBlock(s, false, 52, 43, 86, 88, 0x81C + 0xAC);
+        } else if (mode == 2) {
+            if ((s[0x12] & 0x20) != 0) throw new IOException("Sector is Mode 2 Form 2; only Form 1 data can be replaced");
+            put32(s, 0x818, edc(s, 0x10, 0x808));
+            eccBlock(s, true, 86, 24, 2, 86, 0x81C);
+            eccBlock(s, true, 52, 43, 86, 88, 0x81C + 0xAC);
+        } else {
+            throw new IOException("Unknown sector mode " + mode);
+        }
+    }
+
+    /** Progress in bytes written. */
+    public interface Progress { void at(long written, long total); }
+
+    /**
+     * Writes a copy of the disc image to {@code out} with {@code f}'s contents replaced by
+     * {@code data}, which must be exactly the same size. Error codes of the changed sectors are
+     * recomputed; every other byte is copied unchanged.
+     */
+    public static void replaceFile(FileChannel disc, Layout layout, FileEntry f, FileChannel data, OutputStream out, Progress progress)
+            throws IOException {
+        if (f.form2) throw new IOException(f.path + " is stored as XA audio / video sectors and can't be replaced");
+        if (data.size() != f.size)
+            throw new IOException("The new " + f.path + " is " + data.size() + " bytes; it has to be exactly " + f.size + " bytes");
+        long total = disc.size();
+        long first = f.lba, last = f.lba + f.sectors();     // sectors [first, last)
+        if (last * layout.sectorSize > total) throw new IOException(f.path + " runs past the end of the disc image");
+        byte[] buffer = new byte[layout.sectorSize * 256];
+        long pos = 0, next = 0;
+        // Before the file
+        while (pos < first * layout.sectorSize) {
+            int n = (int) Math.min(buffer.length, first * layout.sectorSize - pos);
+            readFully(disc, pos, buffer, n);
+            out.write(buffer, 0, n);
+            pos += n;
+            if (progress != null && pos >= next) { progress.at(pos, total); next = pos + (16 << 20); }
+        }
+        // The file, sector by sector
+        byte[] raw = new byte[2352], user = new byte[2048];
+        byte[] sector = new byte[layout.sectorSize];
+        for (long lba = first; lba < last; lba++) {
+            readFully(disc, lba * layout.sectorSize, sector, layout.sectorSize);
+            long fileOffset = (lba - first) * 2048;
+            int n = (int) Math.min(2048, f.size - fileOffset);
+            readFully(data, fileOffset, user, n);
+            System.arraycopy(user, 0, sector, layout.dataOffset, n);
+            if (layout.sectorSize == 2352) {
+                fixSector(sector);
+            } else if (layout.sectorSize == 2336) {
+                // No sync/header in the image: rebuild them around it just to compute the codes
+                java.util.Arrays.fill(raw, 0, 16, (byte) 0);
+                raw[15] = 2;
+                System.arraycopy(sector, 0, raw, 16, 2336);
+                fixSector(raw);
+                System.arraycopy(raw, 16, sector, 0, 2336);
+            }
+            out.write(sector);
+            pos += layout.sectorSize;
+            if (progress != null && pos >= next) { progress.at(pos, total); next = pos + (16 << 20); }
+        }
+        // After the file
+        while (pos < total) {
+            int n = (int) Math.min(buffer.length, total - pos);
+            readFully(disc, pos, buffer, n);
+            out.write(buffer, 0, n);
+            pos += n;
+            if (progress != null && pos >= next) { progress.at(pos, total); next = pos + (16 << 20); }
+        }
+    }
+
+    private static void readFully(FileChannel ch, long at, byte[] into, int n) throws IOException {
+        ByteBuffer bb = ByteBuffer.wrap(into, 0, n);
+        while (bb.hasRemaining()) if (ch.read(bb, at + bb.position()) < 0) throw new IOException("Unexpected end of file");
+    }
 }

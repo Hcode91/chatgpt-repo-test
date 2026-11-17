@@ -1,4 +1,27 @@
-# Game Asset Extractor (Android v0.23.0)
+# Game Asset Extractor (Android v0.24.0)
+
+## New in v0.24: Metal Gear Solid 3D models, painting and putting textures back
+
+Open **STAGE.DIR**, tap an area, then **View 3D models**. Every model in the area is listed (biggest first) and opens in the same 3D viewer as Unity and Unreal games: rotate, zoom, see the texture layout, and paint designs onto the model. Edits show on the model straight away.
+
+To save edits, tap **Edited PNGs → rebuild STAGE.DIR**. Painted textures are included, and you can also pick the MGS_… folder you extracted and edited (only changed PNGs are used). The app then:
+1. Matches every pixel to the nearest colour that texture's own palette already has. PS1 textures have 16 or 256 colours each, so new colours can't be added; a colour the palette doesn't have becomes the closest one it does (painting bright red on a grey uniform comes out dark grey).
+2. Checks that each changed area still fits in its original space, and names any that don't before saving anything.
+3. Saves a new STAGE.DIR the same size as the original, with every area in its place.
+4. Optionally writes it into a copy of your disc image (.bin), recalculating the disc's error-check codes (EDC/ECC) for the changed sectors. Your original disc image is never changed.
+
+Textures keep their size. Black is see-through in this game (it's how the game itself loads palettes), so extracted PNGs now show black as transparent, and transparent pixels in edited PNGs become black.
+
+**How it was checked**, on the retail US STAGE.DIR:
+- Rebuilding all 94 areas with no edits gives back the original file byte for byte, which confirms the area layout (packed runs, DAR archives, alignment) is understood exactly.
+- All 1,830 models read; 99.3% of their texture references are found (the rest belong to textures loaded from elsewhere, shown grey). Model reading matches the open-source Codec browser, and texture coordinates follow the game's own code (`u × width ÷ 256`, from the decompiled `libdg/opack.c` in FoxdieTeam's mgs_reversing project). Rendered models looked right by eye.
+- Every texture re-encodes to identical pixels, slightly smaller than Konami's encoder (which leaves edits a little more room). Texture decoding follows the game's own PCX reader.
+- Painting two textures on a soldier model, rebuilding and reading the model back from the new file shows exactly the painted changes and nothing else.
+- The disc writer's EDC/ECC matches the reference implementation in Neill Corlett's ECM tools on 3,000 random sectors.
+- CI runs synthetic tests (`tests/MgsStageTest.java`, `tests/Ps1ReplaceTest.java`).
+
+**Not yet tested:** the edited game running in an emulator or on a console. Try it on a copy of your disc image first.
+
 
 ## New in v0.23: Metal Gear Solid textures and codec portraits (STAGE.DIR, FACE.DAT)
 
@@ -11,7 +34,7 @@ Both are recognised by their content, not their names.
 
 **How it was checked:** the format was worked out from retail files (US disc 1) and matches the open-source Codec asset browser (otac0n/Codec, MIT). On the real files every one of the 18,486 textures and 445 portraits/animations converts with no errors, and the directory walk ends inside the file with nothing out of range. Every texture was compared pixel for pixel against a separate decoder that itself matches Pillow (an independent image library), and samples were checked by eye. One MGS quirk matters: the 256-colour textures pad the file after the palette, so standard PCX readers miss the palette and show them in grey. This version reads them correctly. CI runs `tests/MgsStageTest.java` on synthetic files.
 
-**What's uncertain or left out:** textures are saved fully opaque, because the game decides transparency when it loads them, and which colour that is hasn't been confirmed. Files are named by their 16-bit name hash, because the original file names aren't stored. The handful of `.res`/`.img` files and the 3D models aren't converted.
+**What's uncertain or left out:** (since v0.24, black pixels are saved as see-through, as the game shows them.) Files are named by their 16-bit name hash, because the original file names aren't stored. The handful of `.res`/`.img` files and the 3D models aren't converted.
 
 
 ## New in v0.22: paint only one piece of a model (Area)
