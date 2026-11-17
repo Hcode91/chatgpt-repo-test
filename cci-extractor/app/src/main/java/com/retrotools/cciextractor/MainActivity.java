@@ -78,6 +78,9 @@ public class MainActivity extends Activity {
     private static final int PICK_MGS_FOLDER = 329;
     private static final int PICK_MGS_DISC = 330;
     private static final int SAVE_MGS_DISC = 331;
+    private static final int PICK_VT_FOLDER = 332;
+    private static final int PICK_VT_EDITS = 333;
+    private static final int SAVE_VT = 334;
     private Uri pendingMgsDisc;
     private static final String DIR_MIME = DocumentsContract.Document.MIME_TYPE_DIR;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
@@ -96,6 +99,8 @@ public class MainActivity extends Activity {
     /** Textures painted in the 3D viewer, by MgsStage.Entry key: {entry, null, argb}. */
     private final Map<String, Object[]> mgsPainted = new java.util.LinkedHashMap<>();
     private Map<String, byte[]> mgsEdits;          // encoded, ready to save
+    private boolean vtRom;                          // a VT1682 plug-and-play ROM is open
+    private byte[] vtPatched;                       // edited ROM waiting to be saved
     private Uri mgsRebuiltUri;                     // the last STAGE.DIR saved, for writing into a disc image
     private RenpyArchive.Info rpaInfo;
     private Ps3Trophy.Info trpInfo;
@@ -297,6 +302,7 @@ public class MainActivity extends Activity {
             else if (rpaInfo != null) beginRpaExtract(-1);
             else if (voxInfo != null) beginVoxExtract(-1);
             else if (mgsInfo != null) beginMgsExtract(-1);
+            else if (vtRom) beginVtExtract();
             else if (ps1Info != null) beginPs1Extract(-1);
             else if (pakInfo != null) beginPakExtract(-1);
             else if (retroInfo != null) beginRetroExport(-1);
@@ -510,7 +516,7 @@ public class MainActivity extends Activity {
             retroInfo = null;
             pakInfo = null;
             ps1Info = null;
-            voxInfo = null; mgsInfo = null;
+            voxInfo = null; mgsInfo = null; vtRom = false;
             rpaInfo = null;
             trpInfo = null;
             unityInfo = null;
@@ -567,7 +573,7 @@ public class MainActivity extends Activity {
                             runOnUiThread(() -> {
                                 trpInfo = parsedTrp;
                                 archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null;
-                                voxInfo = null; mgsInfo = null; rpaInfo = null;
+                                voxInfo = null; mgsInfo = null; vtRom = false; rpaInfo = null;
                                 busy = false;
                                 summary.setText(parsedTrp.description());
                                 detail.setText("Extract all, or tap a file. The .SFM files are XML (trophy list, names and " +
@@ -591,6 +597,19 @@ public class MainActivity extends Activity {
                                           "per expression (blinking, talking...). Animations are saved frame by frame."
                                         : "Extract all, or tap an area to extract just that one. Textures are saved as PNG; " +
                                           "models, scripts, sounds and other files are kept as they are.");
+                                render();
+                            });
+                        } else if (Vt1682.isVt1682(channel)) {
+                            final long romSize = channel.size();
+                            runOnUiThread(() -> {
+                                archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null;
+                                voxInfo = null; rpaInfo = null; trpInfo = null; unityInfo = null; unrealInfo = null; mgsInfo = null;
+                                vtRom = true;
+                                busy = false;
+                                summary.setText(String.format(Locale.ROOT, "VT1682 plug-and-play ROM (V.R. Technology), %d MB", romSize >> 20));
+                                detail.setText("Graphics are only found by playing: Extract all runs the game here for a few minutes of " +
+                                        "game time, pressing buttons, and saves every background layer and sprite sheet it shows as PNG " +
+                                        "(plus vt1682_map.txt). Edit the PNGs, then use Edited PNGs → rebuild ROM.");
                                 render();
                             });
                         } else if (MgsVox.isVox(channel)) {
@@ -694,7 +713,7 @@ public class MainActivity extends Activity {
                     }
                 } catch (Exception e) {
                     runOnUiThread(() -> {
-                        busy = false; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null; voxInfo = null; mgsInfo = null; rpaInfo = null; trpInfo = null; unityInfo = null; unrealInfo = null;
+                        busy = false; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null; voxInfo = null; mgsInfo = null; vtRom = false; rpaInfo = null; trpInfo = null; unityInfo = null; unrealInfo = null;
                         summary.setText("Could not open game file");
                         detail.setText(message(e));
                         render();
@@ -825,6 +844,12 @@ public class MainActivity extends Activity {
             extractRpa(uri);
         } else if (request == PICK_VOX_FOLDER && voxInfo != null) {
             extractVox(uri);
+        } else if (request == PICK_VT_FOLDER && vtRom) {
+            extractVt(uri);
+        } else if (request == PICK_VT_EDITS && vtRom) {
+            prepareVtEdits(uri);
+        } else if (request == SAVE_VT && vtRom && vtPatched != null) {
+            writeVtRom(uri);
         } else if (request == PICK_MGS_FOLDER && mgsInfo != null) {
             extractMgs(uri);
         } else if (request == PICK_UNITY_EDITS && mgsInfo != null) {
@@ -1023,13 +1048,13 @@ public class MainActivity extends Activity {
         paletteButton.setText("Palette: "+viewPaletteName);
         pngToRetro.setVisibility(retroInfo!=null?View.VISIBLE:View.GONE);
         boolean mgsStage = mgsInfo != null && !mgsInfo.face;
-        pngToUnity.setVisibility(unityInfo != null || unrealInfo != null || mgsStage ? View.VISIBLE : View.GONE);
-        pngToUnity.setEnabled(!busy && (unityInfo != null || unrealInfo != null || mgsStage));
-        pngToUnity.setText(mgsStage ? "Edited PNGs → rebuild STAGE.DIR" :
+        pngToUnity.setVisibility(unityInfo != null || unrealInfo != null || mgsStage || vtRom ? View.VISIBLE : View.GONE);
+        pngToUnity.setEnabled(!busy && (unityInfo != null || unrealInfo != null || mgsStage || vtRom));
+        pngToUnity.setText(vtRom ? "Edited PNGs → rebuild ROM" : mgsStage ? "Edited PNGs → rebuild STAGE.DIR" :
                 unrealInfo != null ? "Edited PNGs → rebuild Unreal OBB / pak" : "Edited PNGs → rebuild Unity OBB / bundle");
         if(retroMode!=null)retroFormat.setText("Format: "+retroMode.slug);
         extractAll.setText((nesInfo != null || retroInfo != null) ? "Export all tile PNGs" : (unityInfo != null || unrealInfo != null) ? "Extract all textures" : "Extract all");
-        extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null || pakInfo != null || ps1Info != null || voxInfo != null || mgsInfo != null || rpaInfo != null || trpInfo != null || unityInfo != null || unrealInfo != null));
+        extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null || pakInfo != null || ps1Info != null || voxInfo != null || mgsInfo != null || vtRom || rpaInfo != null || trpInfo != null || unityInfo != null || unrealInfo != null));
         extractHere.setEnabled(!busy && (archive != null && !entriesIn(activePath).isEmpty() ||
                 ndsInfo != null && !ndsEntriesIn(activePath).isEmpty()));
         up.setEnabled(!busy && (archive != null || ndsInfo!=null) && !activePath.isEmpty());
@@ -2004,7 +2029,7 @@ public class MainActivity extends Activity {
 
     private void showRpa(RenpyArchive.Info info, Uri dataUri) {
         rpaInfo = info; rpaDataUri = dataUri;
-        archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null; voxInfo = null; mgsInfo = null;
+        archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null; voxInfo = null; mgsInfo = null; vtRom = false;
         busy = false;
         summary.setText(info.description() + " · " + human(info.totalBytes));
         detail.setText("Extract all, or tap a file to extract just that one. To put edited files back, use Convert → " +
@@ -2110,6 +2135,208 @@ public class MainActivity extends Activity {
     private static String duration(double seconds) {
         long s = Math.round(seconds);
         return s / 60 + ":" + String.format(Locale.ROOT, "%02d", s % 60);
+    }
+
+    // ------------------------------------------------------------------ VT1682 plug-and-play ROMs
+
+    private void beginVtExtract() {
+        if (busy || !vtRom) return;
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        startActivityForResult(intent, PICK_VT_FOLDER);
+    }
+
+    private byte[] readVtRom() throws IOException {
+        try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+            if (descriptor == null) throw new IOException("Could not reopen the ROM");
+            try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor()); FileChannel channel = stream.getChannel()) {
+                if (channel.size() > Vt1682.MAX_ROM) throw new IOException("ROM too large");
+                byte[] rom = new byte[(int) channel.size()];
+                java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(rom);
+                while (buf.hasRemaining()) if (channel.read(buf) < 0) throw new IOException("ROM ended early");
+                return rom;
+            }
+        }
+    }
+
+    /** Plays the game with scripted presses and saves every background layer and sprite sheet it shows. */
+    private void extractVt(Uri tree) {
+        if (busy || !vtRom || imageUri == null) return;
+        busy = true; cancelled.set(false); render();
+        summary.setText("Playing the game to find its graphics...");
+        worker.execute(() -> {
+            try {
+                byte[] rom = readVtRom();
+                final int frames = 6000, passes = 3;
+                Vt1682.Capture cap = Vt1682.explore(rom, frames, passes, (done, total) -> {
+                    if (done % 600 == 0) runOnUiThread(() -> {
+                        summary.setText("Playing the game to find its graphics... " + (done * 100 / total) + "%");
+                        detail.setText("Frame " + done + " of " + total + " (each pass presses buttons differently)");
+                    });
+                    return !cancelled.get();
+                });
+                if (cap.layers.isEmpty() && cap.sprites.isEmpty()) throw new IOException("The game showed no graphics while it ran here.");
+                String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+                Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+                String base = getFilename(imageUri);
+                base = base.contains(".") ? base.substring(0, base.lastIndexOf('.')) : base;
+                Uri folder = DocumentsContract.createDocument(getContentResolver(), parent, DIR_MIME,
+                        "VT1682_" + TorusPak.safeName(base).replace(' ', '_') + "_" + stamp);
+                if (folder == null) throw new IOException("Cannot create output folder");
+                int total = cap.layers.size() + cap.sprites.size(), done = 0;
+                for (Vt1682.Layer l : cap.layers) {
+                    if (cancelled.get()) break;
+                    final int n = ++done;
+                    runOnUiThread(() -> summary.setText("Saving PNG " + n + "/" + total + "..."));
+                    writePng(folder, l.name + ".png", l.width(), l.height(), Vt1682.render(rom, l));
+                }
+                for (Vt1682.SpriteSheet sh : cap.sprites) {
+                    if (cancelled.get()) break;
+                    final int n = ++done;
+                    runOnUiThread(() -> summary.setText("Saving PNG " + n + "/" + total + "..."));
+                    writePng(folder, sh.name + ".png", sh.width(), sh.height(), Vt1682.render(rom, sh));
+                }
+                writeVtText(folder, "vt1682_map.txt", Vt1682.writeMap(cap));
+                final int saved = done;
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    summary.setText("Saved " + saved + " PNGs");
+                    detail.setText(cap.description() + ". layer_… are background planes (see-through where nothing is drawn); " +
+                            "sprites_… are sheets of every sprite tile seen, 16 per row. Keep the PNG names, sizes and vt1682_map.txt.");
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                runOnUiThread(() -> { busy = false; render(); summary.setText("Couldn't extract"); detail.setText(why); });
+            }
+        });
+    }
+
+    private void writeVtText(Uri dir, String name, String text) throws IOException {
+        Uri file = DocumentsContract.createDocument(getContentResolver(), dir, "text/plain", name);
+        if (file == null) throw new IOException("Cannot create " + name);
+        try (OutputStream out = getContentResolver().openOutputStream(file, "w")) {
+            if (out == null) throw new IOException("Cannot write " + name);
+            out.write(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    private void startVtRebuild() {
+        new AlertDialog.Builder(this).setTitle("Rebuild the ROM with edited PNGs")
+                .setMessage("Pick the VT1682_… folder you extracted from this ROM. Only tiles you changed are written; the ROM keeps " +
+                        "its size.\n\nEach tile can only use its own colours (16, 64 or 256 of the game's palette): other colours are " +
+                        "matched to the nearest. See-through stays see-through. Tiles are shared, so an edit can show up on other " +
+                        "screens too; if two PNGs change the same tile, the first one wins.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Pick folder", (d, w) -> {
+                    Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    startActivityForResult(intent, PICK_VT_EDITS);
+                }).show();
+    }
+
+    private void prepareVtEdits(Uri tree) {
+        if (busy || !vtRom || imageUri == null) return;
+        busy = true; cancelled.set(false); render();
+        summary.setText("Looking for edited PNGs...");
+        worker.execute(() -> {
+            try {
+                Map<String, Uri> files = new HashMap<>();
+                listTree(tree, DocumentsContract.getTreeDocumentId(tree), "", files, 0);
+                String mapKey = null;
+                for (String k : files.keySet()) if (k.equals("vt1682_map.txt") || k.endsWith("/vt1682_map.txt")) { mapKey = k; break; }
+                if (mapKey == null) throw new IOException("No vt1682_map.txt here. Pick the VT1682_… folder this app made from this ROM.");
+                String prefix = mapKey.substring(0, mapKey.length() - "vt1682_map.txt".length());
+                Vt1682.Capture cap = Vt1682.readMap(new String(readUri(files.get(mapKey)), java.nio.charset.StandardCharsets.UTF_8));
+                byte[] rom = readVtRom();
+                Vt1682.Patch patch = new Vt1682.Patch();
+                Map<Long, Integer> written = new HashMap<>();
+                List<String> changed = new ArrayList<>(), problems = new ArrayList<>();
+                int total = cap.layers.size() + cap.sprites.size(), done = 0;
+                for (Object item : concatVt(cap)) {
+                    if (cancelled.get()) throw new IOException("Cancelled");
+                    String name = item instanceof Vt1682.Layer ? ((Vt1682.Layer) item).name : ((Vt1682.SpriteSheet) item).name;
+                    final int n = ++done;
+                    if (n % 10 == 0) runOnUiThread(() -> summary.setText("Checking PNGs " + n + "/" + total + "..."));
+                    Uri png = files.get(prefix + name + ".png");
+                    if (png == null) continue;
+                    byte[] bytes = readUri(png);
+                    BitmapFactory.Options o = new BitmapFactory.Options();
+                    o.inScaled = false; o.inPremultiplied = false; o.inPreferredConfig = Bitmap.Config.ARGB_8888;
+                    Bitmap bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.length, o);
+                    if (bmp == null) { problems.add(name + ": not a readable PNG"); continue; }
+                    int w = bmp.getWidth(), h = bmp.getHeight();
+                    int[] argb = new int[w * h];
+                    bmp.getPixels(argb, 0, w, 0, 0, w, h);
+                    bmp.recycle();
+                    try {
+                        int tiles = item instanceof Vt1682.Layer
+                                ? Vt1682.applyEdit(rom, (Vt1682.Layer) item, argb, w, h, patch, written)
+                                : Vt1682.applyEdit(rom, (Vt1682.SpriteSheet) item, argb, w, h, patch, written);
+                        if (tiles > 0) changed.add(name + " (" + tiles + " tiles)");
+                    } catch (IllegalArgumentException bad) { problems.add(bad.getMessage()); }
+                }
+                if (changed.isEmpty()) throw new IOException(problems.isEmpty() ? "No PNG differs from the ROM."
+                        : "Nothing written:\n" + String.join("\n", problems));
+                StringBuilder msg = new StringBuilder();
+                msg.append(patch.tilesWritten).append(" tile(s) from ").append(changed.size()).append(" PNG(s):\n");
+                for (int i = 0; i < Math.min(10, changed.size()); i++) msg.append("• ").append(changed.get(i)).append('\n');
+                if (changed.size() > 10) msg.append("…and ").append(changed.size() - 10).append(" more.\n");
+                if (patch.offPalette > 0) msg.append("\n").append(patch.offPalette).append(" pixel(s) were not in the tile's colours and were matched to the nearest.\n");
+                if (patch.conflicts > 0) msg.append("\n").append(patch.conflicts).append(" shared tile(s) were edited differently in two PNGs; the first edit was kept.\n");
+                for (String pr : problems) msg.append("\n⚠ ").append(pr);
+                msg.append("\n\nChoose where to save the edited ROM; the original is unchanged.");
+                runOnUiThread(() -> {
+                    busy = false; vtPatched = rom; render();
+                    summary.setText("Ready to save the edited ROM");
+                    new AlertDialog.Builder(this).setTitle("Ready to rebuild").setMessage(msg.toString())
+                            .setNegativeButton("Cancel", (d, w) -> vtPatched = null)
+                            .setPositiveButton("Save", (d, w) -> {
+                                Intent save = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                                save.addCategory(Intent.CATEGORY_OPENABLE);
+                                save.setType("application/octet-stream");
+                                String base = getFilename(imageUri);
+                                String stem = base.contains(".") ? base.substring(0, base.lastIndexOf('.')) : base;
+                                String ext = base.contains(".") ? base.substring(base.lastIndexOf('.')) : ".bin";
+                                save.putExtra(Intent.EXTRA_TITLE, stem + "_edited" + ext);
+                                save.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                                startActivityForResult(save, SAVE_VT);
+                            }).show();
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Couldn't prepare the rebuild"); detail.setText(why);
+                    new AlertDialog.Builder(this).setTitle("Couldn't prepare the rebuild").setMessage(why).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+    private static List<Object> concatVt(Vt1682.Capture cap) {
+        List<Object> all = new ArrayList<>(cap.layers);
+        all.addAll(cap.sprites);
+        return all;
+    }
+
+    private void writeVtRom(Uri target) {
+        final byte[] rom = vtPatched;
+        if (busy || rom == null) return;
+        busy = true; render();
+        summary.setText("Writing the ROM...");
+        worker.execute(() -> {
+            try (OutputStream os = getContentResolver().openOutputStream(target, "wt")) {
+                if (os == null) throw new IOException("Cannot write the new file");
+                os.write(rom);
+                runOnUiThread(() -> {
+                    busy = false; vtPatched = null; render();
+                    summary.setText("Edited ROM saved");
+                    detail.setText("Same size as the original. Load it in an emulator that runs VT1682 games (MAME), or flash it back.");
+                });
+            } catch (Exception e) {
+                String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                runOnUiThread(() -> { busy = false; render(); summary.setText("Couldn't save"); detail.setText(why); });
+            }
+        });
     }
 
     private void beginMgsExtract(int onlyPart) {
@@ -3306,7 +3533,7 @@ public class MainActivity extends Activity {
     private void showUnreal(UnrealObb.Info info) {
         unrealInfo = info;
         unityInfo = null; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null;
-        voxInfo = null; mgsInfo = null; rpaInfo = null; trpInfo = null;
+        voxInfo = null; mgsInfo = null; vtRom = false; rpaInfo = null; trpInfo = null;
         busy = false;
         summary.setText(info.description());
         detail.setText("Extract all textures as PNG, or tap a package" + (info.meshes.isEmpty() ? "" : " (also to open the 3D models and paint on them)") +
@@ -3742,7 +3969,7 @@ public class MainActivity extends Activity {
         unityInfo = info;
         unrealInfo = null;
         archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null;
-        voxInfo = null; mgsInfo = null; rpaInfo = null; trpInfo = null;
+        voxInfo = null; mgsInfo = null; vtRom = false; rpaInfo = null; trpInfo = null;
         busy = false;
         summary.setText(info.description());
         detail.setText("Extract all textures as PNG, or tap a bundle (also to view its 3D models). Edit the PNGs (keep their names), then use " +
@@ -4034,6 +4261,7 @@ public class MainActivity extends Activity {
     private void startUnityRebuild() {
         if (busy) return;
         if (mgsInfo != null && !mgsInfo.face) { startMgsRebuild(); return; }
+        if (vtRom) { startVtRebuild(); return; }
         if (unrealInfo != null && (!unrealPainted.isEmpty() || !unrealMeshEdits.isEmpty())) {
             new AlertDialog.Builder(this).setTitle("Rebuild")
                     .setMessage((unrealPainted.size() + unrealMeshEdits.size()) + " change(s) from the 3D viewer (painted textures, edited models) will be included. Add edited PNGs from an " +
