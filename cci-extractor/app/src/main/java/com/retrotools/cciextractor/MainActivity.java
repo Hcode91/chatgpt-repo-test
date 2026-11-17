@@ -73,6 +73,7 @@ public class MainActivity extends Activity {
     private static final int PICK_UNITY_FOLDER = 324;
     private static final int PICK_UNITY_EDITS = 325;
     private static final int SAVE_UNITY = 326;
+    private static final int SAVE_VIEWER_FILE = 327;
     private static final String DIR_MIME = DocumentsContract.Document.MIME_TYPE_DIR;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -92,6 +93,7 @@ public class MainActivity extends Activity {
     private int unityOnly = -1;
     private Map<String, java.util.TreeMap<Long, byte[]>> unityPatches;
     private int unityEditCount;
+    private byte[] pendingViewerFile;
     private int trpOnly = -1;
     /** For RPA-1.0: the archive data file (the opened file is its .rpi index); otherwise the opened file. */
     private Uri rpaDataUri;
@@ -286,16 +288,19 @@ public class MainActivity extends Activity {
                             .setPositiveButton("OK", null).show();
                     return;
                 }
-                if (bundle.textures.isEmpty()) {
-                    new AlertDialog.Builder(this).setTitle(bundle.entry).setMessage("No textures in this bundle.")
+                if (bundle.textures.isEmpty() && bundle.meshes == 0) {
+                    new AlertDialog.Builder(this).setTitle(bundle.entry).setMessage("No textures or models in this bundle.")
                             .setPositiveButton("OK", null).show();
                     return;
                 }
-                new AlertDialog.Builder(this).setTitle(bundle.entry)
-                        .setMessage(unityBundleSummary(bundle) + "\n\nExtract this bundle's textures?")
-                        .setNegativeButton("Cancel", null)
-                        .setPositiveButton("Extract", (d, w) -> beginUnityExtract(position))
-                        .show();
+                AlertDialog.Builder dlg = new AlertDialog.Builder(this).setTitle(bundle.entry)
+                        .setMessage((bundle.textures.isEmpty() ? "No textures." : unityBundleSummary(bundle)) +
+                                (bundle.meshes > 0 ? "\n\n" + bundle.meshes + " 3D model(s): view them with their textures, " +
+                                        "and see which part of a texture goes where (UV view)." : ""))
+                        .setNegativeButton("Cancel", null);
+                if (!bundle.textures.isEmpty()) dlg.setPositiveButton("Extract textures", (d, w) -> beginUnityExtract(position));
+                if (bundle.meshes > 0) dlg.setNeutralButton("View 3D models", (d, w) -> openUnityModels(bundle));
+                dlg.show();
                 return;
             }
             if (trpInfo != null) {
@@ -631,6 +636,16 @@ public class MainActivity extends Activity {
             scanUnityEdits(uri);
         } else if (request == SAVE_UNITY && unityInfo != null && unityPatches != null) {
             rebuildUnity(uri);
+        } else if (request == SAVE_VIEWER_FILE && pendingViewerFile != null) {
+            byte[] bytes = pendingViewerFile;
+            pendingViewerFile = null;
+            try (OutputStream out = getContentResolver().openOutputStream(uri, "w")) {
+                if (out == null) throw new IOException("Can't write the file");
+                out.write(bytes);
+                android.widget.Toast.makeText(this, "Saved " + getFilename(uri), android.widget.Toast.LENGTH_SHORT).show();
+            } catch (IOException e) {
+                new AlertDialog.Builder(this).setTitle("Couldn't save").setMessage(message(e)).setPositiveButton("OK", null).show();
+            }
         } else if (request == PICK_TRP_FOLDER && trpInfo != null) {
             extractTrp(uri);
         } else if (request == PICK_RPA_DATA && pendingRpiUri != null) {
@@ -716,7 +731,8 @@ public class MainActivity extends Activity {
         if (trpInfo != null) for (Ps3Trophy.FileEntry f : trpInfo.files) displayed.add("🏆 " + f.name + " · " + human(f.size));
         if (unityInfo != null) for (UnityObb.BundleInfo b : unityInfo.bundles)
             displayed.add(b.error != null ? "⚠ " + b.entry + " · can't read" :
-                    (b.textures.isEmpty() ? "📦 " : "🖼 ") + b.entry + " · " + b.textures.size() + " texture" + (b.textures.size() == 1 ? "" : "s"));
+                    (b.textures.isEmpty() && b.meshes == 0 ? "📦 " : "🖼 ") + b.entry + " · " + b.textures.size() + " texture" + (b.textures.size() == 1 ? "" : "s") +
+                            (b.meshes > 0 ? " · " + b.meshes + " model" + (b.meshes == 1 ? "" : "s") : ""));
         if (ps1Info != null) {
             for (Ps1Disc.FileEntry f : ps1Info.files)
                 displayed.add("💿 " + f.path + " · " + human(f.exportSize()) + (f.form2 ? " · raw XA/STR sectors" : ""));
@@ -2623,7 +2639,7 @@ public class MainActivity extends Activity {
         voxInfo = null; rpaInfo = null; trpInfo = null;
         busy = false;
         summary.setText(info.description());
-        detail.setText("Extract all textures as PNG, or tap a bundle. Edit the PNGs (keep their names), then use " +
+        detail.setText("Extract all textures as PNG, or tap a bundle (also to view its 3D models). Edit the PNGs (keep their names), then use " +
                 "\"Edited PNGs → rebuild\" to write a new " + (info.single ? "bundle" : info.apk ? "APK" : "OBB") +
                 ". Textures go back in their original format, size and mipmaps.");
         render();
@@ -2752,6 +2768,78 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     busy = false; render(); summary.setText("Unity extraction failed"); detail.setText(message(e));
                     new AlertDialog.Builder(this).setTitle("Unity extraction failed").setMessage(message(e)).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+    /** Lists a bundle's meshes, then opens the 3D / UV viewer for the one picked. */
+    private void openUnityModels(UnityObb.BundleInfo bundle) {
+        if (busy || unityInfo == null || imageUri == null) return;
+        final UnityObb.Info info = unityInfo;
+        busy = true; cancelled.set(false); render();
+        summary.setText("Reading models in " + bundle.entry + "...");
+        worker.execute(() -> {
+            try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                if (descriptor == null) throw new IOException("Could not reopen the file");
+                List<UnityModels.Model> models;
+                try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
+                     FileChannel channel = stream.getChannel()) {
+                    models = UnityModels.models(channel, info, bundle);
+                }
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText(info.description());
+                    if (models.isEmpty()) {
+                        new AlertDialog.Builder(this).setTitle(bundle.entry).setMessage("No models could be read in this bundle.")
+                                .setPositiveButton("OK", null).show();
+                        return;
+                    }
+                    String[] labels = new String[models.size()];
+                    for (int i = 0; i < labels.length; i++) labels[i] = models.get(i).label();
+                    new AlertDialog.Builder(this).setTitle(models.size() + " model(s) · biggest first")
+                            .setItems(labels, (d, w) -> viewUnityModel(models.get(w)))
+                            .setNegativeButton("Close", null).show();
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Couldn't read models"); detail.setText(why);
+                    new AlertDialog.Builder(this).setTitle("Couldn't read models").setMessage(why).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+    private void viewUnityModel(UnityModels.Model model) {
+        if (busy || unityInfo == null || imageUri == null) return;
+        final UnityObb.Info info = unityInfo;
+        busy = true; render();
+        summary.setText("Loading " + model.name + "...");
+        worker.execute(() -> {
+            try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                if (descriptor == null) throw new IOException("Could not reopen the file");
+                UnityViewer.Data data;
+                try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
+                     FileChannel channel = stream.getChannel()) {
+                    data = UnityViewer.load(channel, info, model);
+                }
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText(info.description());
+                    UnityViewer.show(this, data, (name, mime, bytes) -> {
+                        pendingViewerFile = bytes;
+                        Intent save = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                        save.addCategory(Intent.CATEGORY_OPENABLE);
+                        save.setType(mime);
+                        save.putExtra(Intent.EXTRA_TITLE, name);
+                        save.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                        startActivityForResult(save, SAVE_VIEWER_FILE);
+                    });
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Couldn't open the model"); detail.setText(why);
+                    new AlertDialog.Builder(this).setTitle("Couldn't open " + model.name).setMessage(why).setPositiveButton("OK", null).show();
                 });
             }
         });

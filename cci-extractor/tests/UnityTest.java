@@ -22,7 +22,9 @@ import java.util.zip.ZipFile;
  *  - ETC1 / ETC2 RGB (all modes) / ETC2 RGBA8+EAC decoding against texture2ddecoder on random blocks,
  *  - encoder round trips for every writable format, with odd sizes and full mip chains,
  *  - a synthetic OBB (fixtures/unity, built by gen_unity_fixture.py and cross-checked with UnityPy):
- *    scan, decode, patch three textures (one in a type-tree-stripped data.unity3d), rebuild, re-read.
+ *    scan, decode, patch three textures (one in a type-tree-stripped data.unity3d), rebuild, re-read,
+ *  - a 2-part mesh (two vertex streams, half-float UVs, baseVertex) with its renderer's materials, one pointing
+ *    at a texture in another bundle, against UnityPy's decoding.
  */
 public class UnityTest {
     static int checks = 0;
@@ -37,6 +39,7 @@ public class UnityTest {
         roundTrips();
         eacConstant();
         obb(dir);
+        models(dir);
         System.out.println("UnityTest OK (" + checks + " checks)");
     }
 
@@ -266,5 +269,53 @@ public class UnityTest {
         System.arraycopy("UnityFS\0".getBytes("ISO-8859-1"), 0, junk, 0, 8);
         try { UnityBundle.open(UnityBundle.of(junk)).textures(); check(false, "junk bundle should fail"); }
         catch (java.io.IOException expectedFailure) { checks++; }
+    }
+
+    // ------------------------------------------------------------------ meshes, materials, renderers
+    static void models(File dir) throws Exception {
+        Map<String, String> exp = new HashMap<>();
+        List<String> materials = new ArrayList<>();
+        for (String line : new String(Files.readAllBytes(new File(dir, "expected_mesh.txt").toPath()), "UTF-8").split("\n")) {
+            String[] f = line.split("\t");
+            if (f[0].equals("part")) exp.put("part" + f[1], f[2]);
+            else if (f[0].equals("material")) materials.add(f[1]);
+            else if (f.length > 1) exp.put(f[0], line.substring(f[0].length() + 1));
+        }
+        File zip = new File(dir, "unity_fixture.zip");
+        try (FileInputStream in = new FileInputStream(zip); FileChannel ch = in.getChannel()) {
+            UnityObb.Info info = UnityObb.scan(ch, zip.getName(), null);
+            UnityObb.BundleInfo a = info.bundle("assets/Bundles/a.bytes");
+            check(a != null && a.meshes == 1 && info.meshes() == 1, "one mesh counted");
+            List<UnityModels.Model> models = UnityModels.models(ch, info, a);
+            check(models.size() == 1, "one model listed");
+            UnityModels.Model m = models.get(0);
+            String[] head = exp.get("mesh").split("\t");
+            check(m.name.equals(head[0]) && m.vertexCount == Integer.parseInt(head[1]) && m.parts == Integer.parseInt(head[2]), "model " + m.label());
+            check(m.materials.size() == 2 && m.materials.get(0) != null && m.materials.get(1) != null, "renderer materials resolved");
+
+            UnityModels.Material q = UnityModels.material(ch, info, m.materials.get(0));
+            UnityModels.Material t = UnityModels.material(ch, info, m.materials.get(1));
+            check(q.name.equals(materials.get(0)) && t.name.equals(materials.get(1)), "material names");
+            check("_MainTex".equals(q.textureSlot), "main texture slot preferred over _BumpMap");
+            Object[] qt = UnityObb.texture(info, q.texture), tt = UnityObb.texture(info, t.texture);
+            check(qt != null && ((UnityBundle.Texture) qt[1]).name.equals("Inline"), "QuadMat → Inline");
+            check(tt != null && ((UnityBundle.Texture) tt[1]).name.equals("Builtin") &&
+                    ((UnityObb.BundleInfo) tt[0]).entry.equals("assets/bin/Data/data.unity3d"), "TriMat → Builtin in another bundle");
+
+            UnityModels.Mesh mesh = UnityModels.mesh(ch, info, m.mesh);
+            String[] pos = exp.get("pos").split(" "), uv = exp.get("uv").split(" ");
+            for (int i = 0; i < pos.length; i++) check(Math.abs(mesh.pos[i] - Float.parseFloat(pos[i])) < 1e-6, "position " + i);
+            for (int i = 0; i < uv.length; i++) check(Math.abs(mesh.uv[i] - Float.parseFloat(uv[i])) < 1e-3, "half-float uv " + i);
+            check(mesh.normal != null && mesh.normal[2] == 1f, "normals");
+            for (int p = 0; p < mesh.parts.length; p++) {
+                StringBuilder sb = new StringBuilder();
+                for (int x : mesh.parts[p]) sb.append(sb.length() == 0 ? "" : " ").append(x);
+                check(sb.toString().equals(exp.get("part" + p)), "part " + p + " indices " + sb + " (with baseVertex)");
+            }
+            check(mesh.max[0] == 2f && mesh.min[1] == 0f, "bounds");
+            String obj = UnityModels.toObj(mesh);
+            check(obj.contains("v -1.000000 0.000000 0.000000") && obj.contains("g part2") && obj.contains("vt 0.500000 0.750000"), "OBJ export");
+            check(UnityModels.half(0x3C00) == 1f && UnityModels.half(0xC000) == -2f && UnityModels.half(0x3800) == 0.5f, "half floats");
+        }
     }
 }

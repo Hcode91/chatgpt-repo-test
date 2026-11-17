@@ -35,6 +35,9 @@ final class UnityObb {
     static final class BundleInfo {
         String entry; long offset, size;
         final List<UnityBundle.Texture> textures = new ArrayList<>();
+        /** Files inside the bundle (CAB-…, CAB-….resS), used to follow references between bundles. */
+        final java.util.Set<String> files = new java.util.HashSet<>();
+        int meshes;
         String error;
     }
 
@@ -46,6 +49,10 @@ final class UnityObb {
         final List<BundleInfo> bundles = new ArrayList<>();
         int textures, unsupported, broken;
         Map<String, UnityBundle.TypeNode> fallbackTrees = new java.util.HashMap<>();
+        /** Lazily built by {@link UnityModels#classTrees}. */
+        Map<String, UnityBundle.TypeNode> classTrees;
+        BundleInfo bundle(String entry) { for (BundleInfo b : bundles) if (b.entry.equals(entry)) return b; return null; }
+        int meshes() { int n = 0; for (BundleInfo b : bundles) n += b.meshes; return n; }
         String description() {
             return (single ? "Unity asset bundle" : apk ? "Unity APK" : "Unity OBB") + " · " + bundles.size() +
                     " bundle(s) · " + textures + " textures" + (unsupported > 0 ? " (" + unsupported + " in formats not supported yet)" : "") +
@@ -181,6 +188,14 @@ final class UnityObb {
             BundleInfo b = todo.get(i);
             try {
                 UnityBundle ub = UnityBundle.open(UnityBundle.of(ch, b.offset, b.size));
+                for (UnityBundle.Node n : ub.nodes) {
+                    b.files.add(n.path);
+                    if (n.path.endsWith(".resS") || n.path.endsWith(".resource")) continue;
+                    try {
+                        UnityBundle.SerializedFile sf = ub.serializedFile(n);
+                        if (sf != null) for (UnityBundle.ObjectInfo o : sf.objects) if (o.classId == UnityModels.CLASS_MESH) b.meshes++;
+                    } catch (IOException ignored) { }
+                }
                 String[] v = new String[1];
                 UnityBundle.TypeNode tree = ub.textureTypeTree(v);
                 if (tree != null && !trees.containsKey(v[0])) trees.put(v[0], tree);
@@ -215,6 +230,15 @@ final class UnityObb {
     private static boolean looksDeflatedBundle(Entry e) {
         String n = e.name.toLowerCase(Locale.ROOT);
         return n.endsWith(".bundle") || n.endsWith(".unity3d") || n.endsWith(".bytes") || n.endsWith(".ab") || n.endsWith(".assets");
+    }
+
+    /** The texture a reference points at, with its bundle. */
+    static Object[] texture(Info info, UnityModels.Ref ref) {
+        if (ref == null) return null;
+        BundleInfo b = info.bundle(ref.bundle);
+        if (b == null) return null;
+        for (UnityBundle.Texture t : b.textures) if (t.pathId == ref.pathId && t.file.equals(ref.file)) return new Object[]{b, t};
+        return null;
     }
 
     static byte[] readTexture(FileChannel ch, BundleInfo b, UnityBundle.Texture t) throws IOException {
