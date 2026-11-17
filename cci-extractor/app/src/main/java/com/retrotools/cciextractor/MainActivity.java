@@ -103,6 +103,9 @@ public class MainActivity extends Activity {
     private final Map<String, Object[]> unityPainted = new java.util.LinkedHashMap<>();
     /** Unreal textures painted in the 3D viewer: key → {PackageInfo, Texture, int[] straight ARGB, top-down}. */
     private final Map<String, Object[]> unrealPainted = new java.util.LinkedHashMap<>();
+    /** Search box for Unity / Unreal lists; rowIndex maps a shown row to its bundle / package index. */
+    private android.widget.EditText search;
+    private final List<Integer> rowIndex = new ArrayList<>();
     private int trpOnly = -1;
     /** For RPA-1.0: the archive data file (the opened file is its .rpi index); otherwise the opened file. */
     private Uri rpaDataUri;
@@ -239,6 +242,18 @@ public class MainActivity extends Activity {
         location = text("/", 14, Color.rgb(36, 49, 105));
         location.setBackgroundColor(Color.rgb(225, 231, 248));
         root.addView(location);
+        search = new android.widget.EditText(this);
+        search.setHint("Search textures and files (e.g. Max01_Body, Chloe)");
+        search.setSingleLine(true);
+        search.setTextSize(14);
+        search.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH);
+        search.setVisibility(View.GONE);
+        search.addTextChangedListener(new android.text.TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence c, int a, int b, int d) { }
+            @Override public void onTextChanged(CharSequence c, int a, int b, int d) { render(); }
+            @Override public void afterTextChanged(android.text.Editable e) { }
+        });
+        root.addView(search, new LinearLayout.LayoutParams(-1, -2));
         list = new ListView(this);
         list.setDividerHeight(dp(1));
         adapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, displayed);
@@ -290,9 +305,10 @@ public class MainActivity extends Activity {
                 showTilePreview(position);
                 return;
             }
+            final int listRow = (unrealInfo != null || unityInfo != null) && position < rowIndex.size() ? rowIndex.get(position) : position;
             if (unrealInfo != null) {
-                if (position >= unrealInfo.packages.size()) return;
-                UnrealObb.PackageInfo pkgInfo = unrealInfo.packages.get(position);
+                if (listRow >= unrealInfo.packages.size()) return;
+                UnrealObb.PackageInfo pkgInfo = unrealInfo.packages.get(listRow);
                 StringBuilder m = new StringBuilder();
                 for (UnrealAssets.Texture t : pkgInfo.textures)
                     m.append("• ").append(t.name).append(" — ").append(t.pixelFormat).append(" ").append(t.width).append("×").append(t.height)
@@ -300,14 +316,14 @@ public class MainActivity extends Activity {
                 AlertDialog.Builder dlg = new AlertDialog.Builder(this).setTitle(pkgInfo.path)
                         .setMessage(m + "\nExtract as PNG?")
                         .setNegativeButton("Cancel", null)
-                        .setPositiveButton("Extract", (d, w) -> beginUnrealExtract(position));
+                        .setPositiveButton("Extract", (d, w) -> beginUnrealExtract(listRow));
                 if (!unrealInfo.meshes.isEmpty()) dlg.setNeutralButton("3D models…", (d, w) -> openUnrealModels());
                 dlg.show();
                 return;
             }
             if (unityInfo != null) {
-                if (position >= unityInfo.bundles.size()) return;
-                UnityObb.BundleInfo bundle = unityInfo.bundles.get(position);
+                if (listRow >= unityInfo.bundles.size()) return;
+                UnityObb.BundleInfo bundle = unityInfo.bundles.get(listRow);
                 if (bundle.error != null) {
                     new AlertDialog.Builder(this).setTitle(bundle.entry).setMessage("Couldn't read this bundle:\n\n" + bundle.error)
                             .setPositiveButton("OK", null).show();
@@ -323,7 +339,7 @@ public class MainActivity extends Activity {
                                 (bundle.meshes > 0 ? "\n\n" + bundle.meshes + " 3D model(s): view them with their textures, " +
                                         "and see which part of a texture goes where (UV view)." : ""))
                         .setNegativeButton("Cancel", null);
-                if (!bundle.textures.isEmpty()) dlg.setPositiveButton("Extract textures", (d, w) -> beginUnityExtract(position));
+                if (!bundle.textures.isEmpty()) dlg.setPositiveButton("Extract textures", (d, w) -> beginUnityExtract(listRow));
                 if (bundle.meshes > 0) dlg.setNeutralButton("View 3D models", (d, w) -> openUnityModels(bundle));
                 dlg.show();
                 return;
@@ -466,6 +482,7 @@ public class MainActivity extends Activity {
             unityPatches = null;
             unityPainted.clear();
             unrealPainted.clear();
+            if (search.length() > 0) search.setText("");
             retroMode = null;
             ndsNodes.clear();
             expandedNds.clear();
@@ -784,6 +801,29 @@ public class MainActivity extends Activity {
         startActivityForResult(intent, PICK_DIRECTORY);
     }
 
+    /**
+     * Search match for a bundle / package: null if it doesn't match every term (in its path or a texture name),
+     * otherwise "" or, when only texture names matched, " · matches: …" naming them.
+     */
+    private static String searchHit(String[] terms, String path, List<String> textureNames) {
+        if (terms.length == 0) return "";
+        String p = path.toLowerCase(Locale.ROOT);
+        List<String> matched = new ArrayList<>();
+        boolean all = true;
+        for (String term : terms) {
+            if (p.contains(term)) continue;
+            boolean found = false;
+            for (String n : textureNames) if (n.toLowerCase(Locale.ROOT).contains(term)) { found = true; if (!matched.contains(n)) matched.add(n); }
+            if (!found) { all = false; break; }
+        }
+        if (!all) return null;
+        if (matched.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder("\n   matches: ");
+        for (int i = 0; i < Math.min(4, matched.size()); i++) sb.append(i > 0 ? ", " : "").append(matched.get(i));
+        if (matched.size() > 4) sb.append(" +").append(matched.size() - 4);
+        return sb.toString();
+    }
+
     private void render() {
         displayed.clear();
         if (nesInfo != null) {
@@ -801,12 +841,30 @@ public class MainActivity extends Activity {
         if (voxInfo != null) displayed.addAll(voxLabels);
         if (rpaInfo != null) for (RenpyArchive.FileEntry f : rpaInfo.files) displayed.add("📄 " + f.path + " · " + human(f.size()));
         if (trpInfo != null) for (Ps3Trophy.FileEntry f : trpInfo.files) displayed.add("🏆 " + f.name + " · " + human(f.size));
-        if (unrealInfo != null) for (UnrealObb.PackageInfo pk : unrealInfo.packages)
-            displayed.add("🖼 " + pk.path + " · " + pk.textures.size() + " texture" + (pk.textures.size() == 1 ? "" : "s"));
-        if (unityInfo != null) for (UnityObb.BundleInfo b : unityInfo.bundles)
+        rowIndex.clear();
+        String[] terms = search == null ? new String[0] : search.getText().toString().trim().toLowerCase(Locale.ROOT).split("\\s+");
+        if (terms.length == 1 && terms[0].isEmpty()) terms = new String[0];
+        if (unrealInfo != null) for (int i = 0; i < unrealInfo.packages.size(); i++) {
+            UnrealObb.PackageInfo pk = unrealInfo.packages.get(i);
+            List<String> names = new ArrayList<>();
+            for (UnrealAssets.Texture t : pk.textures) names.add(t.name);
+            String hit = searchHit(terms, pk.path, names);
+            if (hit == null) continue;
+            rowIndex.add(i);
+            displayed.add("🖼 " + pk.path + " · " + pk.textures.size() + " texture" + (pk.textures.size() == 1 ? "" : "s") + hit);
+        }
+        if (unityInfo != null) for (int i = 0; i < unityInfo.bundles.size(); i++) {
+            UnityObb.BundleInfo b = unityInfo.bundles.get(i);
+            List<String> names = new ArrayList<>();
+            for (UnityBundle.Texture t : b.textures) names.add(t.name);
+            String hit = searchHit(terms, b.entry, names);
+            if (hit == null) continue;
+            rowIndex.add(i);
             displayed.add(b.error != null ? "⚠ " + b.entry + " · can't read" :
                     (b.textures.isEmpty() && b.meshes == 0 ? "📦 " : "🖼 ") + b.entry + " · " + b.textures.size() + " texture" + (b.textures.size() == 1 ? "" : "s") +
-                            (b.meshes > 0 ? " · " + b.meshes + " model" + (b.meshes == 1 ? "" : "s") : ""));
+                            (b.meshes > 0 ? " · " + b.meshes + " model" + (b.meshes == 1 ? "" : "s") : "") + hit);
+        }
+        if (search != null) search.setVisibility(unrealInfo != null || unityInfo != null ? View.VISIBLE : View.GONE);
         if (ps1Info != null) {
             for (Ps1Disc.FileEntry f : ps1Info.files)
                 displayed.add("💿 " + f.path + " · " + human(f.exportSize()) + (f.form2 ? " · raw XA/STR sectors" : ""));
