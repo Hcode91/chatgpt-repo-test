@@ -1,4 +1,28 @@
-# Game Asset Extractor (Android v0.25.1)
+# Game Asset Extractor (Android v0.26.0)
+
+## New in v0.26: VT1682 plug-and-play ROMs (dance mats, N-in-1 TV games)
+
+V.R. Technology VT1682 games are recognised by their boot code (vectors and VT1682 register writes in the
+boot bank), whatever the file is called.
+
+- **Why it plays the game:** VT1682 graphics are plain uncompressed tiles (4, 6 or 8 bits per pixel, 8×8 or
+  16×16) read straight from ROM, but which tiles, palette and graphics "segment" make up a screen is decided
+  by game code. So **Extract all** runs the game's own 6502 code here (main CPU, banking, DMA, video and sprite
+  RAM, following MAME's `vt1682.cpp`) for 3 × 6000 frames, pressing buttons, and records what it shows.
+- **Output:** `layer_…png` for every background plane seen (see-through where nothing is drawn; fades keep the
+  brightest colours), `sprites_…png` sheets of every sprite tile seen (16 per row), and `vt1682_map.txt`, which
+  records where every tile came from.
+- **Putting edits back:** edit the PNGs (keep names and sizes), then **Edited PNGs → rebuild ROM** and pick the
+  folder. Only tiles that changed are written; each tile keeps to its own 16/64/256 colours (other colours go
+  to the nearest). The ROM stays the same size. Tiles are shared between screens and animation frames, so an
+  edit can show elsewhere too; if two PNGs change one tile differently, the first wins.
+- **Checked:** on a 32 MB 110-song dance mat ROM: title, menus, mini-game and dance stage screens come out in
+  the right colours; a painted edit re-renders pixel-exact from the patched ROM with only the edited tiles'
+  bytes changed. The CI test assembles a small 6502 program (palette, tilemap, sprite, DMA, sound-CPU wait) and
+  checks detection, capture, rendering, the map file and re-import.
+- **Not covered:** screens the automatic play never reaches (they aren't exported), line-mode layers, the sound
+  CPU (its handshakes are released automatically), and the 0x8000 "cut-through" palette bit. Not tested on
+  hardware or in MAME yet.
 
 ## v0.25.1: older OBJ exports can be imported too
 
