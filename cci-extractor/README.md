@@ -1,4 +1,23 @@
-# Game Asset Extractor (Android v0.19.0)
+# Game Asset Extractor (Android v0.20.0)
+
+## New in v0.20: Unreal Engine 4 games (OBB with .pak inside, or a loose .pak)
+
+Open an Unreal OBB (e.g. `main.<version>.<package>.obb` holding `…/Content/Paks/pakchunk0-Android_ETC2.pak`) or a `.pak` with **Open ROM**. Every package with textures is listed. **Extract all textures** (or tap a package) writes `Unreal_Textures_<time>/`, mirroring the game's folders, with one PNG per texture and `unreal_textures.tsv`. Edit the PNGs, open the original again, then **Edited PNGs → rebuild Unreal OBB / pak** and pick the folder. Each changed texture is re-encoded in its original format, with every stored mip regenerated at its size. A PNG of another size is scaled back. Then copy the new OBB over the original in `Android/obb/<package>/` with the same name. No signing is needed. For OBBs that live inside an APK, the done screen offers **Put into APK…**.
+
+How it works:
+- **Paks:** versions 3–7 with an unencrypted index (UE 4.13–4.19 era); files stored or zlib-compressed in blocks, read with random access. An encrypted index is reported, not guessed at.
+- **Packages:** cooked, unversioned UE 4.14/4.15 layout. Every step is checked: the summary must end where the name table starts, and each texture must parse to exactly its stored size.
+- **Textures:** cooked platform data with inline mips, in PF_ETC2_RGB, PF_ETC2_RGBA, PF_ETC1, PF_G8, PF_A8, PF_B8G8R8A8 and PF_R8G8B8A8. Unreal stores rows top-down.
+- **Rebuilding:** the edited package is patched in place (every mip re-encoded to exactly its old size). Its new copy is appended to the pak with a fresh index and footer, which also carry the SHA-1s Unreal checks. Every original byte before the old index is kept as is, and in the OBB only the pak entry changes.
+
+**How it was checked**, on Life is Strange (original) for Android (`main.100153.com.squareenix.lis.obb`, pak v3, 27,835 files):
+- All 20,765 packages parse.
+- All 6,168 textures were found and decode pixel-identically to texture2ddecoder.
+- Four edited textures (one per format) were rebuilt into a new OBB. **repak**, an independent Rust pak library, read all 27,835 files from it, and exactly those 4 packages differed. Their textures decoded with texture2ddecoder exactly as the app intended. G8 and BGRA came out lossless; ETC2 re-encodes the way any ETC2 encoder does (43 dB on Max's hair).
+- The CI test (`tests/run-unreal-test.sh`) runs the same on a synthetic OBB built by `tests/fixtures/unreal/gen_unreal_fixture.py`: stored and multi-block zlib packages, a map holding two textures, all four formats, a loose pak, and checks that damaged files are rejected. That pak is also re-read by repak.
+
+**Not yet checked:** the rebuilt OBB hasn't been run in the game on a phone yet. Unreal 3D model viewing and painting aren't supported (Unity only). Newer Unreal versions (4.16+ split `.uexp` files, IoStore) and encrypted paks aren't supported yet.
+
 
 ## New in v0.19: put a modified file back into an APK and sign it
 

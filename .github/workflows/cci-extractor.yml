@@ -47,6 +47,8 @@ jobs:
         run: bash cci-extractor/tests/run-ps3-trophy-test.sh
       - name: Test Unity OBB/bundles (UnityFS, type trees, ETC2/EAC codecs, texture patch + rebuild, meshes + materials, projection painting)
         run: bash cci-extractor/tests/run-unity-test.sh
+      - name: Test Unreal Engine 4 OBB/pak (pak v3, cooked packages, textures, patch + rebuild)
+        run: bash cci-extractor/tests/run-unreal-test.sh
       - name: Test APK repack + signing (apksig v1/v2/v3, checked with ApkVerifier)
         run: bash cci-extractor/tests/run-apk-repack-test.sh
       - name: Test native CIA engine on synthetic titles (CIA -> CCI, DLC refusal)
@@ -73,6 +75,6 @@ jobs:
         run: gradle --no-daemon -p cci-extractor :app:assembleDebug
       - uses: actions/upload-artifact@v4
         with:
-          name: game-asset-extractor-v0.19-debug-apk
+          name: game-asset-extractor-v0.20-debug-apk
           path: cci-extractor/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error

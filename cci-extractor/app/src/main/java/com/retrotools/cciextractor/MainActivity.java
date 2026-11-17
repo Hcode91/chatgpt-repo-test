@@ -90,6 +90,9 @@ public class MainActivity extends Activity {
     private RenpyArchive.Info rpaInfo;
     private Ps3Trophy.Info trpInfo;
     private UnityObb.Info unityInfo;
+    private UnrealObb.Info unrealInfo;
+    private int unrealOnly = -1;
+    private Map<Integer, Map<String, byte[]>> unrealChanged;
     /** Index of the single Unity bundle to extract, or -1 for all. */
     private int unityOnly = -1;
     private Map<String, java.util.TreeMap<Long, byte[]>> unityPatches;
@@ -255,7 +258,8 @@ public class MainActivity extends Activity {
         upscaleHd.setOnClickListener(v -> chooseHdUpscale());
         pngToUnity.setOnClickListener(v -> startUnityRebuild());
         extractAll.setOnClickListener(v -> {
-            if (unityInfo != null) beginUnityExtract(-1);
+            if (unrealInfo != null) beginUnrealExtract(-1);
+            else if (unityInfo != null) beginUnityExtract(-1);
             else if (trpInfo != null) beginTrpExtract(-1);
             else if (rpaInfo != null) beginRpaExtract(-1);
             else if (voxInfo != null) beginVoxExtract(-1);
@@ -282,6 +286,19 @@ public class MainActivity extends Activity {
             if (busy || position < 0 || position >= displayed.size()) return;
             if (retroInfo != null || nesInfo != null) {
                 showTilePreview(position);
+                return;
+            }
+            if (unrealInfo != null) {
+                if (position >= unrealInfo.packages.size()) return;
+                UnrealObb.PackageInfo pkgInfo = unrealInfo.packages.get(position);
+                StringBuilder m = new StringBuilder();
+                for (UnrealAssets.Texture t : pkgInfo.textures)
+                    m.append("• ").append(t.name).append(" — ").append(t.pixelFormat).append(" ").append(t.width).append("×").append(t.height)
+                            .append(", ").append(t.mips.size()).append(" mips").append(t.format < 0 ? " (not supported yet)" : "").append('\n');
+                new AlertDialog.Builder(this).setTitle(pkgInfo.path)
+                        .setMessage(m + "\nExtract as PNG?")
+                        .setNegativeButton("Cancel", null)
+                        .setPositiveButton("Extract", (d, w) -> beginUnrealExtract(position)).show();
                 return;
             }
             if (unityInfo != null) {
@@ -440,6 +457,8 @@ public class MainActivity extends Activity {
             rpaInfo = null;
             trpInfo = null;
             unityInfo = null;
+            unrealInfo = null;
+            unrealChanged = null;
             unityPatches = null;
             unityPainted.clear();
             retroMode = null;
@@ -466,6 +485,14 @@ public class MainActivity extends Activity {
                                         "and VAG sounds as WAV; TIMs packed inside other files are found too.");
                                 render();
                             });
+                        } else if (UnrealObb.isUnreal(channel)) {
+                            UnrealObb.Info parsedUnreal = UnrealObb.scan(channel, inputName, new UnityObb.Progress() {
+                                @Override public void step(int done, int total, String what) {
+                                    runOnUiThread(() -> summary.setText("Scanning Unreal pak " + done + "/" + total + "..."));
+                                }
+                                @Override public boolean cancelled() { return cancelled.get(); }
+                            });
+                            runOnUiThread(() -> showUnreal(parsedUnreal));
                         } else if (UnityObb.isUnity(channel)) {
                             UnityObb.Info parsedUnity = UnityObb.scan(channel, inputName, new UnityObb.Progress() {
                                 @Override public void step(int done, int total, String what) {
@@ -590,7 +617,7 @@ public class MainActivity extends Activity {
                     }
                 } catch (Exception e) {
                     runOnUiThread(() -> {
-                        busy = false; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null; voxInfo = null; rpaInfo = null; trpInfo = null; unityInfo = null;
+                        busy = false; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null; voxInfo = null; rpaInfo = null; trpInfo = null; unityInfo = null; unrealInfo = null;
                         summary.setText("Could not open game file");
                         detail.setText(message(e));
                         render();
@@ -635,6 +662,12 @@ public class MainActivity extends Activity {
             startActivityForResult(save, SAVE_NDS);
         } else if (request == SAVE_NDS && ndsImportNode != null && ndsPngUri != null) {
             rebuildNds(uri);
+        } else if (request == PICK_UNITY_FOLDER && unrealInfo != null) {
+            extractUnreal(uri);
+        } else if (request == PICK_UNITY_EDITS && unrealInfo != null) {
+            scanUnrealEdits(uri);
+        } else if (request == SAVE_UNITY && unrealInfo != null && unrealChanged != null) {
+            rebuildUnreal(uri);
         } else if (request == PICK_UNITY_FOLDER && unityInfo != null) {
             extractUnity(uri);
         } else if (request == PICK_UNITY_EDITS && unityInfo != null) {
@@ -763,6 +796,8 @@ public class MainActivity extends Activity {
         if (voxInfo != null) displayed.addAll(voxLabels);
         if (rpaInfo != null) for (RenpyArchive.FileEntry f : rpaInfo.files) displayed.add("📄 " + f.path + " · " + human(f.size()));
         if (trpInfo != null) for (Ps3Trophy.FileEntry f : trpInfo.files) displayed.add("🏆 " + f.name + " · " + human(f.size));
+        if (unrealInfo != null) for (UnrealObb.PackageInfo pk : unrealInfo.packages)
+            displayed.add("🖼 " + pk.path + " · " + pk.textures.size() + " texture" + (pk.textures.size() == 1 ? "" : "s"));
         if (unityInfo != null) for (UnityObb.BundleInfo b : unityInfo.bundles)
             displayed.add(b.error != null ? "⚠ " + b.entry + " · can't read" :
                     (b.textures.isEmpty() && b.meshes == 0 ? "📦 " : "🖼 ") + b.entry + " · " + b.textures.size() + " texture" + (b.textures.size() == 1 ? "" : "s") +
@@ -802,6 +837,7 @@ public class MainActivity extends Activity {
         if (pakInfo != null) location.setText("/PAK   (" + displayed.size() + " bundles)");
         if (voxInfo != null) location.setText("/VOX   (" + displayed.size() + " clips)");
         if (trpInfo != null) location.setText("/TROPHY.TRP   (" + displayed.size() + " files)");
+        if (unrealInfo != null) location.setText("/Unreal   (" + displayed.size() + " packages, " + unrealInfo.textures + " textures)");
         if (unityInfo != null) location.setText("/Unity   (" + displayed.size() + " bundles, " + unityInfo.textures + " textures" +
                 (unityPainted.isEmpty() ? ")" : ", " + unityPainted.size() + " painted — tap rebuild to save)"));
         if (rpaInfo != null) location.setText("/RPA   (" + displayed.size() + " files, " + human(rpaInfo.totalBytes) + ")");
@@ -818,11 +854,12 @@ public class MainActivity extends Activity {
         paletteButton.setVisibility(retroInfo!=null || nesInfo!=null?View.VISIBLE:View.GONE);
         paletteButton.setText("Palette: "+viewPaletteName);
         pngToRetro.setVisibility(retroInfo!=null?View.VISIBLE:View.GONE);
-        pngToUnity.setVisibility(unityInfo != null ? View.VISIBLE : View.GONE);
-        pngToUnity.setEnabled(!busy && unityInfo != null);
+        pngToUnity.setVisibility(unityInfo != null || unrealInfo != null ? View.VISIBLE : View.GONE);
+        pngToUnity.setEnabled(!busy && (unityInfo != null || unrealInfo != null));
+        pngToUnity.setText(unrealInfo != null ? "Edited PNGs → rebuild Unreal OBB / pak" : "Edited PNGs → rebuild Unity OBB / bundle");
         if(retroMode!=null)retroFormat.setText("Format: "+retroMode.slug);
-        extractAll.setText((nesInfo != null || retroInfo != null) ? "Export all tile PNGs" : unityInfo != null ? "Extract all textures" : "Extract all");
-        extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null || pakInfo != null || ps1Info != null || voxInfo != null || rpaInfo != null || trpInfo != null || unityInfo != null));
+        extractAll.setText((nesInfo != null || retroInfo != null) ? "Export all tile PNGs" : (unityInfo != null || unrealInfo != null) ? "Extract all textures" : "Extract all");
+        extractAll.setEnabled(!busy && (archive != null || ndsInfo != null || nesInfo != null || retroInfo!=null || pakInfo != null || ps1Info != null || voxInfo != null || rpaInfo != null || trpInfo != null || unityInfo != null || unrealInfo != null));
         extractHere.setEnabled(!busy && (archive != null && !entriesIn(activePath).isEmpty() ||
                 ndsInfo != null && !ndsEntriesIn(activePath).isEmpty()));
         up.setEnabled(!busy && (archive != null || ndsInfo!=null) && !activePath.isEmpty());
@@ -2666,10 +2703,293 @@ public class MainActivity extends Activity {
         });
     }
 
+    // ================================================================ Unreal Engine 4 OBB / pak textures
+
+    private void showUnreal(UnrealObb.Info info) {
+        unrealInfo = info;
+        unityInfo = null; archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null;
+        voxInfo = null; rpaInfo = null; trpInfo = null;
+        busy = false;
+        summary.setText(info.description());
+        detail.setText("Extract all textures as PNG, or tap a package. Edit the PNGs (keep their names), then use " +
+                "\"Edited PNGs → rebuild\" to write a new " + (info.single ? "pak" : "OBB") + ". Each texture goes back in its " +
+                "original format with all its mipmaps.");
+        render();
+    }
+
+    private void beginUnrealExtract(int only) {
+        if (busy || unrealInfo == null) return;
+        unrealOnly = only;
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        startActivityForResult(intent, PICK_UNITY_FOLDER);
+    }
+
+    private void extractUnreal(Uri tree) {
+        if (busy || unrealInfo == null || imageUri == null) return;
+        final UnrealObb.Info info = unrealInfo;
+        final int only = unrealOnly;
+        final String sourceName = getFilename(imageUri);
+        busy = true; cancelled.set(false); render();
+        summary.setText("Extracting Unreal textures...");
+        worker.execute(() -> {
+            final int[] stats = new int[2]; // PNGs, failed/unsupported
+            final StringBuilder failures = new StringBuilder();
+            try {
+                String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+                Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+                Uri folder = DocumentsContract.createDocument(getContentResolver(), parent, DIR_MIME, "Unreal_Textures_" + stamp);
+                if (folder == null) throw new IOException("Cannot create output folder");
+                Map<String, Uri> folders = new HashMap<>();
+                folders.put("", folder);
+                StringBuilder index = new StringBuilder(UnrealObb.INDEX_HEADER);
+                index.append("# source\t").append(sourceName.replace('\t', ' ')).append('\n');
+                int total = 0, done = 0;
+                for (int i = 0; i < info.packages.size(); i++) if (only < 0 || i == only) total += info.packages.get(i).textures.size();
+                // the paks were opened on a channel that is closed now; reopen them on a fresh one
+                try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                    if (descriptor == null) throw new IOException("Could not reopen the file");
+                    try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor()); FileChannel channel = stream.getChannel()) {
+                        UnrealObb.Info live = reopenUnreal(channel, info);
+                        for (int i = 0; i < info.packages.size(); i++) {
+                            if (only >= 0 && i != only) continue;
+                            if (cancelled.get()) break;
+                            UnrealObb.PackageInfo p = info.packages.get(i);
+                            for (UnrealAssets.Texture t : p.textures) {
+                                if (cancelled.get()) break;
+                                done++;
+                                if (done % 10 == 0 || done == total) {
+                                    final int d = done, all = total;
+                                    runOnUiThread(() -> summary.setText("Extracting Unreal textures " + d + "/" + all + "..."));
+                                }
+                                String png = UnrealObb.pngPath(p, t);
+                                int slash = png.lastIndexOf('/');
+                                String dirPath = slash < 0 ? "" : png.substring(0, slash), file = png.substring(slash + 1);
+                                try {
+                                    int[] argb = UnrealObb.decode(live, p, t);
+                                    byte[] pngData = pngBytes(t.width, t.height, argb);
+                                    writeDoc(ensureFolder(dirPath, folders), file, "image/png", pngData);
+                                    index.append(UnrealObb.row(info, p, t, png, UnityObb.sha1(pngData)));
+                                    stats[0]++;
+                                } catch (Exception | OutOfMemoryError e) {
+                                    stats[1]++;
+                                    if (failures.length() < 800) failures.append("\n• ").append(t.name).append(": ")
+                                            .append(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+                                }
+                            }
+                        }
+                    }
+                }
+                writeDoc(folder, UnrealObb.INDEX_NAME, "application/octet-stream", index.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                writeDoc(folder, "README.txt", "text/plain", ("Unreal textures from " + sourceName + "\n\n" +
+                        "Folders follow the game's own content folders. Edit PNGs in place (same file name), then in Game Asset\n" +
+                        "Extractor open the original file and use \"Edited PNGs → rebuild\" and pick this folder. Only PNGs that\n" +
+                        "changed are written back, each re-encoded to its original format (ETC2 / G8 / BGRA8 ...) with all its mips.\n" +
+                        "A PNG with a different size is scaled back to the original size.\n\n" +
+                        "G8 textures are single-channel: shown as greyscale, and the brightness is what gets written back.\n" +
+                        "Note: textures cooked with a LOD bias are stored without their top mip, so the PNG is the largest size\n" +
+                        "the game actually has (e.g. 512×512 for a 1024×1024 source).\n" +
+                        UnrealObb.INDEX_NAME + " records where every texture came from; don't delete or edit it.\n")
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    String result = stats[0] + " textures saved as PNG" + (stats[1] > 0 ? ", " + stats[1] + " skipped:" + failures : "") + ".";
+                    summary.setText("Unreal extraction " + (cancelled.get() ? "cancelled" : "complete"));
+                    detail.setText(result);
+                    new AlertDialog.Builder(this).setTitle(cancelled.get() ? "Extraction cancelled" : "Extraction complete")
+                            .setMessage(result + "\n\nEdit the PNGs in place, then come back and tap \"Edited PNGs → rebuild\".")
+                            .setPositiveButton("OK", null).show();
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Unreal extraction failed"); detail.setText(message(e));
+                    new AlertDialog.Builder(this).setTitle("Unreal extraction failed").setMessage(message(e)).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+    /** Reopens the paks of a scanned file on a new channel (the scan's channel is closed once scanning finishes). */
+    private static UnrealObb.Info reopenUnreal(FileChannel channel, UnrealObb.Info scanned) throws IOException {
+        UnrealObb.Info live = new UnrealObb.Info();
+        live.single = scanned.single; live.fileName = scanned.fileName;
+        live.zipEntries.addAll(scanned.zipEntries);
+        for (UnrealObb.PakInfo p : scanned.paks) {
+            UnrealObb.PakInfo q = new UnrealObb.PakInfo();
+            q.entry = p.entry; q.offset = p.offset; q.size = p.size;
+            q.pak = UnrealPak.open(UnityBundle.of(channel, p.offset, p.size));
+            live.paks.add(q);
+        }
+        live.packages.addAll(scanned.packages);
+        live.textures = scanned.textures;
+        return live;
+    }
+
+    private void scanUnrealEdits(Uri tree) {
+        if (busy || unrealInfo == null || imageUri == null) return;
+        final UnrealObb.Info info = unrealInfo;
+        busy = true; cancelled.set(false); render();
+        summary.setText("Looking for edited PNGs...");
+        worker.execute(() -> {
+            try {
+                Map<String, Uri> files = new HashMap<>();
+                listTree(tree, DocumentsContract.getTreeDocumentId(tree), "", files, 0);
+                String prefix = null;
+                if (files.containsKey(UnrealObb.INDEX_NAME)) prefix = "";
+                else for (String k : files.keySet()) {
+                    if (k.endsWith("/" + UnrealObb.INDEX_NAME) && k.indexOf('/') == k.length() - UnrealObb.INDEX_NAME.length() - 1) {
+                        if (prefix != null) throw new IOException("This folder holds more than one extraction. Pick the Unreal_Textures_… folder itself.");
+                        prefix = k.substring(0, k.length() - UnrealObb.INDEX_NAME.length());
+                    }
+                }
+                if (prefix == null) throw new IOException("No " + UnrealObb.INDEX_NAME + " here. Pick the Unreal_Textures_… folder this app extracted.");
+                List<UnrealObb.Row> rows = UnrealObb.parseIndex(new String(readUri(files.get(prefix + UnrealObb.INDEX_NAME)),
+                        java.nio.charset.StandardCharsets.UTF_8));
+                Map<Integer, Map<String, byte[]>> changed = new java.util.LinkedHashMap<>();
+                List<String> edited = new ArrayList<>(), problems = new ArrayList<>();
+                int resized = 0, checked = 0;
+                try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                    if (descriptor == null) throw new IOException("Could not reopen the file");
+                    try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor()); FileChannel channel = stream.getChannel()) {
+                        UnrealObb.Info live = reopenUnreal(channel, info);
+                        for (UnrealObb.Row r : rows) {
+                            if (cancelled.get()) throw new IOException("Cancelled");
+                            Uri png = files.get(prefix + r.png);
+                            if (png == null) continue;
+                            checked++;
+                            if (checked % 25 == 0) { final int n = checked; runOnUiThread(() -> summary.setText("Checking PNGs " + n + "/" + rows.size() + "...")); }
+                            byte[] data = readUri(png);
+                            if (UnityObb.sha1(data).equals(r.sha1)) continue;
+                            Object[] found = UnrealObb.find(info, r);
+                            if (found == null) { problems.add(r.name + ": not found in the opened file (extracted from a different version?)"); continue; }
+                            UnrealObb.PackageInfo p = (UnrealObb.PackageInfo) found[0];
+                            UnrealAssets.Texture t = (UnrealAssets.Texture) found[1];
+                            if (t.width != r.width || t.height != r.height || t.mips.size() != r.mips) {
+                                problems.add(r.name + ": doesn't match the opened file (different game version?)"); continue;
+                            }
+                            BitmapFactory.Options o = new BitmapFactory.Options();
+                            o.inScaled = false; o.inPremultiplied = false; o.inPreferredConfig = Bitmap.Config.ARGB_8888;
+                            Bitmap bmp = BitmapFactory.decodeByteArray(data, 0, data.length, o);
+                            if (bmp == null) { problems.add(r.name + ": not a readable PNG"); continue; }
+                            if (bmp.getWidth() != t.width || bmp.getHeight() != t.height) {
+                                Bitmap scaled = Bitmap.createScaledBitmap(bmp, t.width, t.height, true);
+                                if (scaled != bmp) bmp.recycle();
+                                bmp = scaled; resized++;
+                            }
+                            int[] argb = new int[t.width * t.height];
+                            bmp.getPixels(argb, 0, t.width, 0, 0, t.width, t.height);
+                            bmp.recycle();
+                            try {
+                                Map<String, byte[]> pkgs = changed.computeIfAbsent(p.pak, k -> new java.util.LinkedHashMap<>());
+                                byte[] pkgBytes = pkgs.get(p.path);
+                                if (pkgBytes == null) { pkgBytes = live.paks.get(p.pak).pak.read(UnrealObb.entry(live, p)); pkgs.put(p.path, pkgBytes); }
+                                UnrealObb.patch(pkgBytes, t, argb, t.width, t.height);
+                                edited.add(r.name + " (" + t.pixelFormat + " " + t.width + "×" + t.height + ")");
+                            } catch (IOException e) { problems.add(e.getMessage()); }
+                        }
+                    }
+                }
+                final int scaledCount = resized;
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    StringBuilder msg = new StringBuilder();
+                    if (edited.isEmpty()) msg.append("No edited PNGs found — every PNG matches what was extracted.");
+                    else {
+                        msg.append(edited.size()).append(" edited texture(s):");
+                        for (int i = 0; i < Math.min(edited.size(), 15); i++) msg.append("\n• ").append(edited.get(i));
+                        if (edited.size() > 15) msg.append("\n… and ").append(edited.size() - 15).append(" more");
+                        if (scaledCount > 0) msg.append("\n\n").append(scaledCount).append(" PNG(s) were a different size and were scaled back.");
+                    }
+                    if (!problems.isEmpty()) {
+                        msg.append("\n\nSkipped:");
+                        for (int i = 0; i < Math.min(problems.size(), 8); i++) msg.append("\n• ").append(problems.get(i));
+                    }
+                    summary.setText(edited.isEmpty() ? "No edits found" : edited.size() + " edited texture(s) ready");
+                    AlertDialog.Builder dlg = new AlertDialog.Builder(this).setTitle("Edited textures").setMessage(msg.toString());
+                    if (edited.isEmpty()) dlg.setPositiveButton("OK", null);
+                    else dlg.setNegativeButton("Cancel", null).setPositiveButton("Save new file", (d, w) -> {
+                        unrealChanged = changed; unityEditCount = edited.size();
+                        Intent save = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                        save.addCategory(Intent.CATEGORY_OPENABLE);
+                        save.setType("application/octet-stream");
+                        save.putExtra(Intent.EXTRA_TITLE, getFilename(imageUri));
+                        save.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                        startActivityForResult(save, SAVE_UNITY);
+                    });
+                    dlg.show();
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Couldn't read the edits"); detail.setText(why);
+                    new AlertDialog.Builder(this).setTitle("Couldn't read the edits").setMessage(why).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
+    private void rebuildUnreal(Uri dest) {
+        if (busy || unrealInfo == null || unrealChanged == null || imageUri == null) return;
+        final UnrealObb.Info info = unrealInfo;
+        final Map<Integer, Map<String, byte[]>> changed = unrealChanged;
+        final int count = unityEditCount;
+        busy = true; cancelled.set(false); render();
+        summary.setText("Writing new file...");
+        worker.execute(() -> {
+            try (ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(imageUri, "r")) {
+                if (descriptor == null) throw new IOException("Could not reopen the original file");
+                try (FileInputStream stream = new FileInputStream(descriptor.getFileDescriptor());
+                     FileChannel channel = stream.getChannel();
+                     OutputStream raw = getContentResolver().openOutputStream(dest, "w")) {
+                    if (raw == null) throw new IOException("Can't write the output file");
+                    java.io.BufferedOutputStream out = new java.io.BufferedOutputStream(raw, 1 << 20);
+                    UnrealObb.rebuild(channel, reopenUnreal(channel, info), changed, out, new UnityObb.Progress() {
+                        @Override public void step(int done, int total, String what) {
+                            runOnUiThread(() -> summary.setText(what.length() > 60 ? what.substring(0, 60) + "…" : what));
+                        }
+                        @Override public boolean cancelled() { return cancelled.get(); }
+                    });
+                    out.flush();
+                }
+                // check what was written: it must open as a pak/OBB again with the same textures
+                try (ParcelFileDescriptor check = getContentResolver().openFileDescriptor(dest, "r");
+                     FileInputStream ci = new FileInputStream(check.getFileDescriptor()); FileChannel cc = ci.getChannel()) {
+                    UnrealObb.Info again = UnrealObb.scan(cc, "check", null);
+                    if (again.textures != info.textures) throw new IOException("The new file didn't read back correctly");
+                }
+                unrealChanged = null;
+                String name = getFilename(dest);
+                String where = info.single ? "Put it back where the original .pak was (keep a backup of the original)." :
+                        "Copy it over the original OBB in Android/obb/<package>/ (keep a backup). The file name must stay exactly " +
+                                "the same (main.<version>.<package>.obb). No re-signing is needed.";
+                runOnUiThread(() -> {
+                    busy = false; render();
+                    summary.setText("Saved " + name);
+                    detail.setText(count + " texture(s) written. " + where);
+                    AlertDialog.Builder done = new AlertDialog.Builder(this).setTitle("New file saved")
+                            .setMessage(name + "\n\n" + count + " texture(s) replaced; every other file in the pak is byte-for-byte the original, " +
+                                    "and the new file was read back and checked.\n\n" + where +
+                                    (info.single ? "" : "\n\nIf this file came from inside the game's APK, tap \"Put into APK…\" to put it back and sign the APK."))
+                            .setPositiveButton("OK", null);
+                    if (!info.single) done.setNeutralButton("Put into APK…", (d, w) -> { showTab(true); convertTab.startApkRepack(dest); });
+                    done.show();
+                });
+            } catch (Exception | OutOfMemoryError e) {
+                try { DocumentsContract.deleteDocument(getContentResolver(), dest); } catch (Exception ignored) { }
+                String why = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                runOnUiThread(() -> {
+                    busy = false; render(); summary.setText("Rebuild failed"); detail.setText(why);
+                    new AlertDialog.Builder(this).setTitle("Rebuild failed").setMessage(why).setPositiveButton("OK", null).show();
+                });
+            }
+        });
+    }
+
     // ================================================================ Unity OBB / APK / bundle textures
 
     private void showUnity(UnityObb.Info info) {
         unityInfo = info;
+        unrealInfo = null;
         archive = null; nesInfo = null; ndsInfo = null; retroInfo = null; pakInfo = null; ps1Info = null;
         voxInfo = null; rpaInfo = null; trpInfo = null;
         busy = false;
@@ -2945,7 +3265,21 @@ public class MainActivity extends Activity {
     }
 
     private void startUnityRebuild() {
-        if (busy || unityInfo == null) return;
+        if (busy) return;
+        if (unrealInfo != null) {
+            new AlertDialog.Builder(this).setTitle("Rebuild with edited textures")
+                    .setMessage("Pick the Unreal_Textures_… folder you extracted from this file (the one containing " + UnrealObb.INDEX_NAME +
+                            ").\n\nOnly PNGs you changed are used. Each goes back in its original format with all its mips; a PNG of a different " +
+                            "size is scaled to the original size.")
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Pick folder", (d, w) -> {
+                        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                        startActivityForResult(intent, PICK_UNITY_EDITS);
+                    }).show();
+            return;
+        }
+        if (unityInfo == null) return;
         if (!unityPainted.isEmpty()) {
             new AlertDialog.Builder(this).setTitle("Rebuild")
                     .setMessage(unityPainted.size() + " texture(s) painted in the 3D viewer will be included. Add edited PNGs from an " +

@@ -1,0 +1,5 @@
+Game/Content/Tex/T_Grey.uasset	0	T_Grey	PF_G8	8	4	2	5bf2df963c806c08500deae7b620e91097272c52
+Game/Content/Tex/T_Etc.uasset	0	T_Etc	PF_ETC2_RGB	16	8	3	c9d79ce8066668b443cf5834e52e1449cc958ed4
+Game/Content/Tex/T_Bgra.uasset	0	T_Bgra	PF_B8G8R8A8	4	4	1	e38ba3d37dd8862757bc4872088674af8e491597
+Game/Content/Maps/Level.umap	0	T_LevelA	PF_ETC2_RGBA	8	8	2	aa9c5619bf4128d455396684bab2f9aa5167eac6
+Game/Content/Maps/Level.umap	1	T_LevelB	PF_G8	4	4	1	b9b1bf4b1cb0964243b94ae9103db2530f1be797
