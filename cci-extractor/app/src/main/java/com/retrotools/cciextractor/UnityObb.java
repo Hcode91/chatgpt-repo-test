@@ -29,6 +29,7 @@ final class UnityObb {
 
     static final class Entry {
         String name; int method, flags, time, date, extAttr; long crc, csize, usize, localOffset, dataOffset;
+        long directoryRecord;   // offset of this entry's central directory record in the file
         boolean dir() { return name.endsWith("/"); }
     }
 
@@ -106,6 +107,7 @@ final class UnityObb {
             e.crc = le32(cd, p + 16); e.csize = le32(cd, p + 20); e.usize = le32(cd, p + 24);
             int nl = le16(cd, p + 28), xl = le16(cd, p + 30), cl = le16(cd, p + 32);
             e.extAttr = (int) le32(cd, p + 38); e.localOffset = le32(cd, p + 42);
+            e.directoryRecord = cdOffset + p;
             if (p + 46 + nl + xl + cl > cd.length) throw new IOException("Broken zip directory");
             e.name = new String(cd, p + 46, nl, (e.flags & 0x800) != 0 ? StandardCharsets.UTF_8 : StandardCharsets.ISO_8859_1);
             int x = p + 46 + nl, xe = x + xl;

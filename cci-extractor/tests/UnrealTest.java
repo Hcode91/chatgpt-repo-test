@@ -183,7 +183,8 @@ public class UnrealTest {
                 UnrealObb.Info again = UnrealObb.scan(c2, "again", null);
                 check(again.textures == expected.size() && again.failed == 0, "rebuilt OBB scans: " + again.description());
                 UnrealPak np = again.paks.get(0).pak, op = info.paks.get(0).pak;
-                check(np.indexOffset > op.indexOffset, "new data appended after the old index position");
+                check(outObb.length() == obb.length(), "rebuilt OBB is exactly the original size (Android checks it)");
+                check(np.indexOffset == op.indexOffset && np.indexSize == op.indexSize && again.paks.get(0).size == info.paks.get(0).size, "pak size and index position kept");
                 for (UnrealPak.Entry e : op.entries) {
                     UnrealPak.Entry ne = np.byName.get(e.name);
                     byte[] stored = new byte[(int) ne.size];
@@ -191,7 +192,7 @@ public class UnrealTest {
                     check(java.util.Arrays.equals(UnrealPak.sha1(stored, 0, stored.length), ne.hash), "entry hash of " + e.name);
                     boolean edited = changed.get(0).containsKey(e.name);
                     if (!edited) {
-                        check(ne.offset == e.offset && java.util.Arrays.equals(np.read(ne), op.read(e)), "unchanged " + e.name);
+                        check(java.util.Arrays.equals(np.read(ne), op.read(e)), "unchanged " + e.name);
                     } else check(java.util.Arrays.equals(np.read(ne), changed.get(0).get(e.name)), "new content of " + e.name);
                 }
                 for (UnrealObb.PackageInfo p : again.packages) for (UnrealAssets.Texture t : p.textures) {
@@ -215,6 +216,64 @@ public class UnrealTest {
                 }
             }
 
+            // byte level: outside the pak only its CRC-32 differs (local header + central directory), and the CRC is right
+            {
+                byte[] a = Files.readAllBytes(obb.toPath()), b2 = Files.readAllBytes(outObb.toPath());
+                UnityObb.Entry z = null;
+                for (UnityObb.Entry ze : info.zipEntries) if (ze.name.endsWith(".pak")) z = ze;
+                int diffOutside = 0;
+                for (int i = 0; i < a.length; i++) {
+                    boolean inPak = i >= z.dataOffset && i < z.dataOffset + z.csize;
+                    boolean crcField = (i >= z.localOffset + 14 && i < z.localOffset + 18) || (i >= z.directoryRecord + 16 && i < z.directoryRecord + 20);
+                    if (!inPak && !crcField && a[i] != b2[i]) diffOutside++;
+                }
+                check(diffOutside == 0, "zip headers byte-identical (" + diffOutside + " bytes differ)");
+                java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+                crc.update(b2, (int) z.dataOffset, (int) z.csize);
+                long cd = (b2[(int) z.directoryRecord + 16] & 255L) | (b2[(int) z.directoryRecord + 17] & 255L) << 8 | (b2[(int) z.directoryRecord + 18] & 255L) << 16 | (b2[(int) z.directoryRecord + 19] & 255L) << 24;
+                long lh = (b2[(int) z.localOffset + 14] & 255L) | (b2[(int) z.localOffset + 15] & 255L) << 8 | (b2[(int) z.localOffset + 16] & 255L) << 16 | (b2[(int) z.localOffset + 17] & 255L) << 24;
+                check(crc.getValue() == cd && cd == lh, "pak CRC-32 updated in both zip headers");
+                try (java.util.zip.ZipInputStream zi = new java.util.zip.ZipInputStream(new FileInputStream(outObb))) {   // verifies every CRC
+                    byte[] sink = new byte[65536];
+                    while (zi.getNextEntry() != null) while (zi.read(sink) > 0) { }
+                }
+                checks++;
+            }
+
+            // a change that compresses worse than the original: the files after it are recompressed and moved up
+            {
+                UnrealPak op = info.paks.get(0).pak;
+                Map<String, byte[]> worse = new LinkedHashMap<>();
+                byte[] noise = op.read(op.byName.get("Game/Content/Tex/T_Bgra.uasset"));
+                byte[] rnd = new byte[96]; new java.util.Random(11).nextBytes(rnd);
+                System.arraycopy(rnd, 0, noise, noise.length / 2, rnd.length);
+                worse.put("Game/Content/Tex/T_Bgra.uasset", noise);
+                List<UnrealPak.Patch> patches = op.buildInPlace(worse);
+                UnityObb.Content c = op.patched(patches);
+                ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                try (java.io.InputStream is = c.open()) { byte[] buf = new byte[4096]; int n; while ((n = is.read(buf)) > 0) bo.write(buf, 0, n); }
+                byte[] np = bo.toByteArray();
+                check(np.length == info.paks.get(0).size, "same pak size after a worse-compressing change");
+                UnrealPak rp = UnrealPak.open(UnityBundle.of(np));
+                check(java.util.Arrays.equals(rp.read(rp.byName.get("Game/Content/Tex/T_Bgra.uasset")), noise), "incompressible change stored");
+                int moved = 0;
+                for (UnrealPak.Entry e : op.entries) {
+                    UnrealPak.Entry ne = rp.byName.get(e.name);
+                    check(java.util.Arrays.equals(rp.read(ne), op.read(e)) || e.name.endsWith("T_Bgra.uasset"), "content kept: " + e.name);
+                    byte[] st = new byte[(int) ne.size]; UnityBundle.of(np).read(ne.dataStart, st, 0, st.length);
+                    check(java.util.Arrays.equals(UnrealPak.sha1(st, 0, st.length), ne.hash), "hash of moved/kept " + e.name);
+                    if (ne.offset != e.offset) moved++;
+                }
+                check(moved >= 1, "following files moved up (" + moved + ")");
+                // the last file can't borrow room from anything: clear error, nothing written
+                Map<String, byte[]> tooBig = new LinkedHashMap<>();
+                byte[] junk2 = new byte[(int) op.byName.get("Game/Config/Game.ini").usize];
+                new java.util.Random(12).nextBytes(junk2);
+                tooBig.put("Game/Config/Game.ini", junk2);
+                try { op.buildInPlace(tooBig); check(false, "impossible change accepted"); }
+                catch (java.io.IOException expectedFailure) { check(expectedFailure.getMessage().contains("doesn't compress as small"), "clear message when it can't fit"); }
+            }
+
             // a loose pak works too
             File loose = File.createTempFile("loose", ".pak"); loose.deleteOnExit();
             UnrealObb.PakInfo pi = info.paks.get(0);
@@ -228,8 +287,7 @@ public class UnrealTest {
                 ByteArrayOutputStream bo = new ByteArrayOutputStream();
                 UnrealObb.rebuild(lc, single, changed, bo, null);
                 byte[] rebuilt = bo.toByteArray();
-                check(java.util.Arrays.equals(java.util.Arrays.copyOf(rebuilt, (int) single.paks.get(0).pak.indexOffset),
-                        java.util.Arrays.copyOf(pakBytes, (int) single.paks.get(0).pak.indexOffset)), "original bytes before the index kept");
+                check(rebuilt.length == pakBytes.length, "loose pak keeps its size");
                 UnrealPak rp = UnrealPak.open(UnityBundle.of(rebuilt));
                 check(java.util.Arrays.equals(rp.read(rp.byName.get("Game/Content/Tex/T_Etc.uasset")), changed.get(0).get("Game/Content/Tex/T_Etc.uasset")), "loose pak rebuilt");
             }

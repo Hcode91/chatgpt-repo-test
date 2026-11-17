@@ -1,4 +1,19 @@
-# Game Asset Extractor (Android v0.21.0)
+# Game Asset Extractor (Android v0.21.1)
+
+## v0.21.1: Unreal OBBs now keep their exact size
+
+The game wouldn't start with an OBB rebuilt by v0.20/v0.21 ("data could not be loaded"), while the original was fine. Android games check the OBB's file size against the one they shipped with (the Play Store expansion-file check), and the old rebuild made the file bigger by appending the changed files to the pak.
+
+Rebuilds are now done **in place** and the new OBB is byte-for-byte the same size:
+- A changed file is recompressed at the highest zlib level back into its own slot. Painted and edited textures usually compress smaller than the original.
+- If a change compresses worse than the original, the files right after it are recompressed and moved up until there's room. If even that isn't enough, the rebuild stops with a clear message and nothing is written.
+- The pak index is rewritten in the same place with the same length, along with the footer's SHA-1.
+- Every zip header stays as it was (the old rebuild dropped their extra fields). Only the pak's CRC-32 is updated, in both places it appears.
+
+**How it was checked:** Chloe's painted top was rebuilt into the real `main.100153.com.squareenix.lis.obb`, and the new file is exactly 1,026,655,583 bytes like the original.
+- Python's zipfile finds the same 328 entries at the same offsets, and every CRC checks out.
+- repak reads all 27,835 files, and only the painted texture differs.
+- The CI test now checks the size, that zip headers are byte-identical outside the pak, the CRCs, a change that forces later files to move, and the error when there's no room.
 
 ## New in v0.21: 3D models and painting for Unreal Engine 4 games
 
@@ -31,7 +46,7 @@ How it works:
 - **Paks:** versions 3–7 with an unencrypted index (UE 4.13–4.19 era); files stored or zlib-compressed in blocks, read with random access. An encrypted index is reported, not guessed at.
 - **Packages:** cooked, unversioned UE 4.14/4.15 layout. Every step is checked: the summary must end where the name table starts, and each texture must parse to exactly its stored size.
 - **Textures:** cooked platform data with inline mips, in PF_ETC2_RGB, PF_ETC2_RGBA, PF_ETC1, PF_G8, PF_A8, PF_B8G8R8A8 and PF_R8G8B8A8. Unreal stores rows top-down.
-- **Rebuilding:** the edited package is patched in place (every mip re-encoded to exactly its old size). Its new copy is appended to the pak with a fresh index and footer, which also carry the SHA-1s Unreal checks. Every original byte before the old index is kept as is, and in the OBB only the pak entry changes.
+- **Rebuilding:** the edited package is patched in place (every mip re-encoded to exactly its old size), then written back into the pak in place so the OBB keeps its exact size (see v0.21.1).
 
 **How it was checked**, on Life is Strange (original) for Android (`main.100153.com.squareenix.lis.obb`, pak v3, 27,835 files):
 - All 20,765 packages parse.

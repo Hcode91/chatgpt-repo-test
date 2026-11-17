@@ -3110,8 +3110,8 @@ public class MainActivity extends Activity {
                     summary.setText("Saved " + name);
                     detail.setText(count + " texture(s) written. " + where);
                     AlertDialog.Builder done = new AlertDialog.Builder(this).setTitle("New file saved")
-                            .setMessage(name + "\n\n" + count + " texture(s) replaced; every other file in the pak is byte-for-byte the original, " +
-                                    "and the new file was read back and checked.\n\n" + where +
+                            .setMessage(name + "\n\n" + count + " texture(s) replaced. The new file is exactly the same size as the original " +
+                                    "(the game checks this) and every other file in it reads back unchanged.\n\n" + where +
                                     (info.single ? "" : "\n\nIf this file came from inside the game's APK, tap \"Put into APK…\" to put it back and sign the APK."))
                             .setPositiveButton("OK", null);
                     if (!info.single) done.setNeutralButton("Put into APK…", (d, w) -> { showTab(true); convertTab.startApkRepack(dest); });
