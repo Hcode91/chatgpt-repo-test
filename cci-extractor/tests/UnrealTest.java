@@ -182,6 +182,78 @@ public class UnrealTest {
         check(any > 50, "without an area, B is painted too");
     }
 
+    /** Export → edit the OBJ text like a 3D program would → import → write into the package → read back. */
+    static void objRoundTrip(File obb) throws Exception {
+        try (FileInputStream in = new FileInputStream(obb); FileChannel ch = in.getChannel()) {
+            UnrealObb.Info info = UnrealObb.scan(ch, obb.getName(), null);
+            UnrealModels.MeshRef sk = info.meshes.get(0);
+            UnrealPak pak = info.paks.get(0).pak;
+            byte[] b = pak.read(pak.byName.get(sk.path));
+            UnrealAssets.Package pk = UnrealAssets.parse(b);
+            UnrealAssets.Export x = pk.exports.get(sk.export);
+            UnityModels.Mesh base = UnrealModels.mesh(b, pk, x).mesh;
+            int[] weld = UnityModels.weld(base);
+            String obj = UnityModels.toObj(base, weld);
+            check(obj.split("\n(?=v )").length - 1 == 8 && obj.contains("f 1/1 3/3 2/2"), "editable OBJ: one point per position, UV per vertex");
+
+            // move point 3 (Unreal (50, 10, 100)) up by 20, change vertex 1's UV, delete the back quad's 2nd triangle
+            List<String> lines = new ArrayList<>(java.util.Arrays.asList(obj.split("\n")));
+            int vSeen = 0, vtSeen = 0, fSeen = 0;
+            for (int i = 0; i < lines.size(); i++) {
+                String l = lines.get(i);
+                if (l.startsWith("v ") && ++vSeen == 3) { String[] t = l.split(" "); lines.set(i, "v " + t[1] + " " + (Float.parseFloat(t[2]) + 20) + " " + t[3]); }
+                if (l.startsWith("vt ") && ++vtSeen == 2) lines.set(i, "vt 0.750000 0.250000");
+                if (l.startsWith("f ") && ++fSeen == 4) { lines.remove(i); i--; }
+            }
+            ObjEdit.Edit e = ObjEdit.read(base, weld, String.join("\n", lines));
+            check(e.moved == 1 && e.hiddenCount == 1 && e.hidden[1][1] && !e.hidden[1][0] && !e.hidden[0][0], "edit: 1 point moved, 1 face removed");
+            check(near(e.pos[2 * 3 + 1], base.pos[2 * 3 + 1] + 20) && near(e.uv[2], 0.75f) && near(e.uv[3], 0.25f), "moved point and changed UV read back");
+            check(e.pos[0] == base.pos[0] && e.pos[4] == base.pos[4], "untouched points keep their exact values");
+
+            byte[] edited = b.clone();
+            UnrealModels.writeEdit(edited, pk, x, e);
+            check(edited.length == b.length, "package keeps its size");
+            UnityModels.Mesh back = UnrealModels.mesh(edited, UnrealAssets.parse(edited), x).mesh;
+            boolean same = true;
+            for (int i = 0; i < back.vertexCount * 3; i++) same &= Math.abs(back.pos[i] - e.pos[i]) < 1e-4f;
+            for (int i = 0; i < back.vertexCount * 2; i++) same &= Math.abs(back.uv[i] - e.uv[i]) < 1e-3f;
+            check(same, "edited positions and UVs read back from the package");
+            int[] p1 = back.parts[1];
+            check(p1[3] == p1[4] && p1[4] == p1[5] && p1[0] != p1[1], "removed face is zero-area, the other stays");
+            check(back.normal[2 * 3 + 2] > 0.5f, "moved point's normal recomputed facing the same way");
+            UnityModels.Mesh shown = ObjEdit.apply(base, e);
+            check(shown.parts[1].length == 3 && shown.parts[0].length == 6 && near(shown.max[1], 120), "viewer mesh: face left out, bounds grow");
+            // bounds widened in the package (origin.z + extent.z covers the new top at z = 120)
+            int bAt = x.serialOffset + 8 + 4 + 2;
+            float oz = Float.intBitsToFloat(UnrealAssets.i32At(edited, bAt + 8)), ez = Float.intBitsToFloat(UnrealAssets.i32At(edited, bAt + 20));
+            check(oz + ez >= 120 - 1e-3f, "bounds widened for the taller model");
+            check(UnrealModels.toHalf(0.75f) == 0x3A00 && UnrealModels.toHalf(1f) == 0x3C00 && UnrealModels.toHalf(0f) == 0 &&
+                    UnrealModels.toHalf(-2f) == 0xC000 && Math.abs(UnityModels.half(UnrealModels.toHalf(0.123f)) - 0.123f) < 1e-3f, "float → half");
+
+            // what can't go into the game is refused with a reason
+            try { ObjEdit.read(base, weld, obj + "\nv 1 2 3\n"); check(false, "extra point accepted"); }
+            catch (java.io.IOException ex) { check(ex.getMessage().contains("points but this model has"), "extra point refused"); }
+            try { ObjEdit.read(base, weld, obj + "\nf 1 2 5\n"); check(false, "new face accepted"); }
+            catch (java.io.IOException ex) { check(ex.getMessage().contains("aren't in the original model"), "new face refused"); }
+            // quads (a program that joined triangles) are split back; Blender-style "v/vt/vn" corners work
+            ObjEdit.Edit same2 = ObjEdit.read(base, weld, obj.replace("/", "/").replaceAll("f (\\d+)/(\\d+) (\\d+)/(\\d+) (\\d+)/(\\d+)", "f $1/$2/1 $3/$4/1 $5/$6/1") + "\nvn 0 0 1\n");
+            check(same2.moved == 0 && same2.hiddenCount == 0, "unchanged OBJ with normals: nothing moved or removed");
+        }
+        // double-sided faces (same three points twice) count as one face in a 3D program
+        UnityModels.Mesh m = new UnityModels.Mesh();
+        m.name = "twosided"; m.vertexCount = 6;
+        m.pos = new float[]{0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0};
+        m.normal = new float[]{0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, -1, 0, 0, -1, 0, 0, -1};
+        m.uv = new float[]{0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+        m.parts = new int[][]{{0, 1, 2, 3, 5, 4}};
+        m.min = new float[]{0, 0, 0}; m.max = new float[]{1, 1, 0};
+        int[] w = UnityModels.weld(m);
+        check(w[3] == w[0] && w[4] == w[1], "weld joins the two sides");
+        String one = "v 0 0 0\nv -1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 3/3 2/2\n";   // Blender kept one face
+        ObjEdit.Edit e2 = ObjEdit.read(m, w, one);
+        check(e2.hiddenCount == 0, "one face in the OBJ keeps both sides of a double-sided face");
+    }
+
     public static void main(String[] args) throws Exception {
         File dir = new File(args.length > 0 ? args[0] : "tests/fixtures/unreal");
         File obb = new File(dir, "unreal_fixture.obb");
@@ -357,6 +429,7 @@ public class UnrealTest {
         }
         models(obb);
         areas();
+        objRoundTrip(obb);
         System.out.println("UnrealTest OK (" + checks + " checks)");
     }
 }

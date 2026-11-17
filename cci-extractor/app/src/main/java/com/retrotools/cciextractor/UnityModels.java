@@ -339,6 +339,60 @@ final class UnityModels {
     }
 
     /** Wavefront OBJ of a mesh (one group per part), handy for checking and for other tools. */
+    /**
+     * Welds vertices that sit at exactly the same position (the copies a model has along UV and normal seams).
+     * Returns the welded id per vertex; the count is {@code max + 1}.
+     */
+    static int[] weld(Mesh m) {
+        int[] out = new int[m.vertexCount];
+        java.util.HashMap<String, Integer> ids = new java.util.HashMap<>();
+        for (int i = 0; i < m.vertexCount; i++) {
+            String k = Float.floatToIntBits(m.pos[i * 3]) + "," + Float.floatToIntBits(m.pos[i * 3 + 1]) + "," + Float.floatToIntBits(m.pos[i * 3 + 2]);
+            Integer id = ids.get(k);
+            if (id == null) { id = ids.size(); ids.put(k, id); }
+            out[i] = id;
+        }
+        return out;
+    }
+
+    /**
+     * OBJ for editing in a 3D program: one point per welded position (so sculpting doesn't tear seams open) and one
+     * UV per original vertex, so "Import edited OBJ" can map every corner back. {@code weld} comes from the
+     * unedited model so ids stay stable across edits; positions come from {@code m}.
+     */
+    static String toObj(Mesh m, int[] weld) {
+        int count = 0;
+        for (int w : weld) count = Math.max(count, w + 1);
+        float[] wp = new float[count * 3];
+        boolean[] set = new boolean[count];
+        for (int i = 0; i < m.vertexCount; i++) if (!set[weld[i]]) {
+            set[weld[i]] = true;
+            System.arraycopy(m.pos, i * 3, wp, weld[i] * 3, 3);
+        }
+        StringBuilder s = new StringBuilder("# " + m.name + "\n# Game Asset Extractor editable OBJ: keep the point count; move, sculpt or delete faces only\n");
+        s.append("o ").append(m.name.replaceAll("\\s+", "_")).append('\n');
+        for (int i = 0; i < count; i++)
+            s.append(String.format(Locale.ROOT, "v %.6f %.6f %.6f\n", -wp[i * 3], wp[i * 3 + 1], wp[i * 3 + 2]));
+        boolean uv = m.uv != null;
+        if (uv) for (int i = 0; i < m.vertexCount; i++)
+            s.append(String.format(Locale.ROOT, "vt %.6f %.6f\n", m.uv[i * 2], m.uv[i * 2 + 1]));
+        s.append("s 1\n");
+        for (int p = 0; p < m.parts.length; p++) {
+            s.append("g part").append(p + 1).append('\n').append("usemtl part").append(p + 1).append('\n');
+            int[] t = m.parts[p];
+            for (int i = 0; i + 2 < t.length; i += 3) {
+                int[] c = {t[i], t[i + 2], t[i + 1]};    // x is mirrored, so flip the winding too
+                s.append('f');
+                for (int v : c) {
+                    s.append(' ').append(weld[v] + 1);
+                    if (uv) s.append('/').append(v + 1);
+                }
+                s.append('\n');
+            }
+        }
+        return s.toString();
+    }
+
     static String toObj(Mesh m) {
         StringBuilder s = new StringBuilder("# " + m.name + "\n");
         for (int i = 0; i < m.vertexCount; i++)
