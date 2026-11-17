@@ -1,4 +1,22 @@
-# Game Asset Extractor (Android v0.16.0)
+# Game Asset Extractor (Android v0.17.0)
+
+## New in v0.17: Unity 3D model viewer, with UV view
+
+Open a Unity OBB, APK or bundle, then tap a bundle that lists models → **View 3D models** → pick one (biggest first).
+- **3D view:** the model with each part in its material's main texture. Drag to rotate, pinch to zoom, double-tap to reset. **Part** highlights one part and dims the rest. The same menu turns off see-through texture areas (on by default, for hair and eyelashes) if a texture's alpha holds something else and leaves holes.
+- **UV view:** the selected part's texture, with that part's triangles outlined in colour and other parts sharing the texture outlined dimly. This shows exactly which area of a texture lands on which part of the model, and which areas the model doesn't use at all. Pinch and drag to move around.
+- **Save…:** the model as OBJ (with UVs, one group per part), the UV layout as a PNG (texture + outlines), or the outlines alone as a transparent PNG to use as a guide layer while editing.
+
+How it works: meshes are decoded from their vertex streams in every Unity vertex format (float, half, normalised and integer types), with 16/32-bit indices and per-part baseVertex. Each mesh is matched to its SkinnedMeshRenderer, or to the MeshFilter + MeshRenderer on the same GameObject. Material references are followed through each file's externals table, including into other bundles of the same OBB. The main texture is `_MainTex`, or the nearest equivalent (`_BaseMap`, `_Albedo`…; normal/mask/spec maps are skipped). Not supported yet: compressed meshes (Unity's Mesh Compression setting) and blend shapes / skinning (models show in their bind pose).
+
+**How it was checked**, on Life is Strange: Before the Storm:
+- All 3,112 meshes in the OBB were decoded, and every vertex position, UV and triangle index matched UnityPy's decoding exactly.
+- Chloe's 6-part model resolved to the same materials and textures UnityPy reports.
+- A software render made from the app's decoded data (not the app's own screen) shows her correctly textured, which confirms the UV orientation and the left-handed → right-handed mirror the viewer uses.
+- The CI test adds a synthetic 2-part mesh (two vertex streams, half-float UVs, baseVertex) with a SkinnedMeshRenderer whose two materials point at a texture in the same bundle and one in another bundle. It's built by `gen_unity_fixture.py` from Unity 2021.3's type-tree layouts and cross-checked with UnityPy. UnityPy ignores baseVertex, so the expected values add it, as Unity does.
+
+**Not yet checked:** the viewer screens (OpenGL ES 3 and the UV view) type-check against the Android 14 framework but haven't been run on a device.
+
 
 ## New in v0.16: Unity games: extract textures, edit, rebuild (OBB / APK / asset bundles)
 

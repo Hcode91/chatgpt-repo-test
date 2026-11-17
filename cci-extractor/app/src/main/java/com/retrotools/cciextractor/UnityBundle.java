@@ -361,6 +361,9 @@ final class UnityBundle {
     static final class SerializedFile {
         Node node; int version; boolean little; String unityVersion; boolean typeTrees;
         final List<ObjectInfo> objects = new ArrayList<>();
+        /** External file paths, for PPtr fileIDs 1..n (e.g. "archive:/CAB-…/CAB-…"). */
+        final List<String> externals = new ArrayList<>();
+        ObjectInfo object(long pathId) { for (ObjectInfo o : objects) if (o.pathId == pathId) return o; return null; }
     }
 
     /** Unity's built-in type-tree string table (offsets with the top bit set point here). */
@@ -476,6 +479,23 @@ final class UnityBundle {
             if (o.start < 0 || o.size < 0 || o.start + o.size > node.size) throw new IOException("Object outside its file");
             sf.objects.add(o);
         }
+        // script types, then the externals table (needed to follow references into other files)
+        try {
+            if (version >= 11) {
+                int scripts = m.i32();
+                if (scripts < 0 || scripts > 1_000_000) throw new IOException("bad script count");
+                for (int i = 0; i < scripts; i++) { m.i32(); if (version < 14) m.i32(); else { m.align4(); m.i64(); } }
+            }
+            int ext = m.i32();
+            if (ext < 0 || ext > 100_000) throw new IOException("bad externals count");
+            for (int i = 0; i < ext; i++) {
+                if (version >= 6) m.cstr();
+                if (version >= 5) { m.skip(16); m.i32(); }
+                sf.externals.add(m.cstr());
+            }
+        } catch (IOException e) {
+            sf.externals.clear(); // textures don't need it; references to other files just won't resolve
+        }
         return sf;
     }
 
@@ -516,6 +536,91 @@ final class UnityBundle {
         int e = off;
         while (e < strings.length && strings[e] != 0) e++;
         return off >= strings.length ? "?" : new String(strings, off, e - off, StandardCharsets.UTF_8);
+    }
+
+    // ================================================================== generic object values
+
+    /** A run of fixed-size array elements, left in the object's bytes (offset into the object data). */
+    static final class Blob {
+        final int offset, count, elemSize; final String type;
+        Blob(int offset, int count, int elemSize, String type) { this.offset = offset; this.count = count; this.elemSize = elemSize; this.type = type; }
+        int bytes() { return count * elemSize; }
+    }
+
+    /**
+     * Reads a whole object through its type tree: structs become maps (field name → value), arrays of structs
+     * become lists, strings become String, numbers Long/Double, byte runs and big fixed-size arrays {@link Blob}s.
+     * The object must parse to exactly its stored size.
+     */
+    static Map<String, Object> readObject(byte[] data, boolean little, TypeNode root) throws IOException {
+        Cur c = new Cur(data, 0, little);
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (TypeNode k : root.kids) out.put(k.name, value(c, k));
+        if ((root.meta & 0x4000) != 0) c.align4();
+        if (c.p != data.length) throw new IOException(root.type + " layout doesn't match: parsed " + c.p + " of " + data.length + " bytes");
+        return out;
+    }
+
+    private static Object value(Cur c, TypeNode n) throws IOException {
+        boolean align = (n.meta & 0x4000) != 0;
+        Object v;
+        if (n.type.equals("string")) {
+            int len = c.i32();
+            if (len < 0) throw new IOException("Bad string length");
+            c.need(len);
+            v = new String(c.b, c.p, len, StandardCharsets.UTF_8);
+            c.skip(len);
+            if (!n.kids.isEmpty() && (n.kids.get(0).meta & 0x4000) != 0) align = true;
+        } else if (n.type.equals("TypelessData")) {
+            int len = c.i32();
+            if (len < 0) throw new IOException("Bad data length");
+            v = new Blob(c.p, len, 1, "UInt8");
+            c.skip(len);
+        } else if (isArrayNode(n)) {
+            TypeNode arr = n.kids.get(0);
+            if ((arr.meta & 0x4000) != 0) align = true;
+            int count = c.i32();
+            if (count < 0) throw new IOException("Bad array length");
+            TypeNode elem = arr.kids.size() > 1 ? arr.kids.get(1) : null;
+            if (elem == null) throw new IOException("Array without element type");
+            long fixed = fixedSize(elem);
+            if (fixed > 0 && (elem.kids.isEmpty() || count > 65536)) {
+                if (fixed * count > c.b.length - c.p) throw new IOException("Array runs past the object");
+                v = new Blob(c.p, count, (int) fixed, elem.type);
+                c.skip(fixed * count);
+            } else {
+                List<Object> list = new ArrayList<>(Math.min(count, 4096));
+                for (int i = 0; i < count; i++) list.add(value(c, elem));
+                v = list;
+            }
+        } else if (n.kids.isEmpty()) {
+            switch (n.byteSize) {
+                case 1: v = (long) (n.type.equals("SInt8") ? (byte) c.u8() : c.u8()); break;
+                case 2: { int x = c.u16(); v = (long) (n.type.startsWith("U") || n.type.startsWith("unsigned") ? x : (short) x); break; }
+                case 4: { int x = c.i32();
+                    if (n.type.equals("float")) v = (double) Float.intBitsToFloat(x);
+                    else v = n.type.startsWith("U") || n.type.startsWith("unsigned") ? x & 0xffffffffL : (long) x;
+                    break; }
+                case 8: { long x = c.i64(); v = n.type.equals("double") ? Double.longBitsToDouble(x) : (Object) x; break; }
+                default: throw new IOException("Unknown field size for " + n.type);
+            }
+        } else {
+            Map<String, Object> map = new LinkedHashMap<>();
+            for (TypeNode k : n.kids) map.put(k.name, value(c, k));
+            v = map;
+        }
+        if (align) c.align4();
+        return v;
+    }
+
+    /** Reads one object of a SerializedFile in this bundle (type tree, or a fallback for stripped files). */
+    Map<String, Object> readObject(SerializedFile sf, ObjectInfo o, Map<String, TypeNode> fallback, byte[][] bytesOut) throws IOException {
+        TypeNode tree = o.tree;
+        if (tree == null && fallback != null) tree = fallback.get(majorMinor(sf.unityVersion) + "#" + o.classId);
+        if (tree == null) throw new IOException("No type tree for class " + o.classId + " in " + sf.node.path);
+        byte[] obj = read(sf.node.offset + o.start, o.size);
+        if (bytesOut != null) bytesOut[0] = obj;
+        return readObject(obj, sf.little, tree);
     }
 
     /** Values collected while walking an object: numbers, strings, and (offset, length) of byte blobs. */
