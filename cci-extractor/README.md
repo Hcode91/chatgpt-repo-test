@@ -1,4 +1,13 @@
-# Game Asset Extractor (Android v0.25.0)
+# Game Asset Extractor (Android v0.25.1)
+
+## v0.25.1: older OBJ exports can be imported too
+
+OBJs exported before v0.25 have one point per vertex, so seams have two copies of each point. They're now accepted:
+- The importer recognises them by their point count and maps each point to its vertex.
+- If sculpting moved the two copies of a seam point apart, the importer joins them at their average, so the model doesn't split open in the game.
+- UVs go back exactly, including both sides of double-sided faces.
+
+Checked with Blender 5.3: the same edit (bag deleted, shoes 40% bigger) made on an old-style export gives a byte-identical model to the one made from a v0.25 export.
 
 ## New in v0.25: edit Unreal models in Blender and put them back
 

@@ -53,12 +53,39 @@ final class ObjEdit {
                     int[][] c = new int[t.length][];
                     for (int i = 0; i < t.length; i++) c[i] = corner(t[i], vs.size(), vts.size(), lineNo);
                     for (int i = 1; i + 1 < t.length; i++)        // fan-triangulate polygons
-                        faces.add(new int[]{c[0][0], c[0][1], c[i][0], c[i][1], c[i + 1][0], c[i + 1][1]});
+                        faces.add(new int[]{c[0][0], c[0][1], c[i][0], c[i][1], c[i + 1][0], c[i + 1][1], -1, -1, -1});
                 }
             }
         }
+        // OBJs from app versions before 0.25 have one point per vertex (seam copies included): map them onto the welded
+        // points. Where a 3D program moved the copies of one point apart (a torn seam), join them at their average.
+        boolean legacy = vs.size() == base.vertexCount && vs.size() != welded;
+        if (legacy) {
+            float[] sum = new float[welded * 3];
+            int[] cnt = new int[welded];
+            for (int i = 0; i < base.vertexCount; i++) {
+                float[] v = vs.get(i);
+                for (int k = 0; k < 3; k++) sum[weld[i] * 3 + k] += v[k];
+                cnt[weld[i]]++;
+            }
+            int[] firstOf = new int[welded];
+            java.util.Arrays.fill(firstOf, -1);
+            for (int i = 0; i < base.vertexCount; i++) if (firstOf[weld[i]] < 0) firstOf[weld[i]] = i;
+            List<float[]> joined = new ArrayList<>(welded);
+            for (int w = 0; w < welded; w++) {
+                // if the copies weren't moved apart, take the first exactly (no averaging noise)
+                float[] first = vs.get(firstOf[w]); boolean apart = false;
+                float[] avg = {sum[w * 3] / cnt[w], sum[w * 3 + 1] / cnt[w], sum[w * 3 + 2] / cnt[w]};
+                for (int k = 0; k < 3; k++) if (Math.abs(avg[k] - first[k]) > 1e-4f) apart = true;
+                joined.add(apart ? avg : first);
+            }
+            vs = joined;
+            // remember which original vertex each corner is (exact UV target), then switch to welded points
+            for (int[] f : faces) for (int c = 0; c < 3; c++) { f[6 + c] = f[c * 2]; f[c * 2] = weld[f[c * 2]]; }
+        }
         if (vs.size() != welded)
-            throw new IOException("The OBJ has " + vs.size() + " points but this model has " + welded + ". Only moving points, " +
+            throw new IOException("The OBJ has " + vs.size() + " points but this model has " + welded + " (or " + base.vertexCount +
+                    " in OBJs from app versions before 0.25). Only moving points, " +
                     "changing UVs and deleting faces can go back into the game: adding or removing points (subdivide, remesh, " +
                     "merge by distance, dyntopo sculpting) can't. Export the model again from the app and start from that file.");
 
@@ -96,6 +123,11 @@ final class ObjEdit {
                 int vt = f[c * 2 + 1];
                 if (vt < 0) continue;
                 float[] t = vts.get(vt);
+                if (f[6 + c] >= 0) {                     // old-style OBJ: the corner is exactly this vertex
+                    int ov = f[6 + c];
+                    if (Math.abs(base.uv[ov * 2] - t[0]) > 2e-6f || Math.abs(base.uv[ov * 2 + 1] - t[1]) > 2e-6f) { e.uv[ov * 2] = t[0]; e.uv[ov * 2 + 1] = t[1]; }
+                    continue;
+                }
                 int of = vertexAt(base, weld, first, f[c * 2]);
                 // the first copy takes the OBJ's UV; other copies only if the UV was actually changed
                 boolean changed = of >= 0 && (Math.abs(base.uv[of * 2] - t[0]) > 1e-5f || Math.abs(base.uv[of * 2 + 1] - t[1]) > 1e-5f);
