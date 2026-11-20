@@ -49,7 +49,7 @@ class MainActivity : Activity() {
         scroll.addView(root)
         root.addView(label("IPSW TOOLKIT", 27))
         root.addView(label("Offline iPhone & iPod firmware explorer", 14))
-        root.addView(button("1. Select IPSW firmware", root) { selectIpsw() })
+        button("1. Select IPSW firmware", root) { selectIpsw() }
         info = label("No firmware selected", 14)
         root.addView(info)
         root.addView(label("COMPONENTS (tap to select)", 15))
