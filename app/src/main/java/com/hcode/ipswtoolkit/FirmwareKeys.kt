@@ -61,7 +61,7 @@ iPod4,1|4.1|8B117|018-7062-093.dmg|e7de54b25167afc66e381ade1d5e25c6392757497cfd9
 iPod4,1|4.2.1|8C148|038-0017-002.dmg|982437b30d334c744c94b9a73ab70e0fc6ed94c181b2a8b0fde6ee03f2546cc9b2c5b01c|Jasper
     """.trimIndent()
 
-    val builtIn: List<Record> = rows.lineSequence().map(String::trim).filter(String::isNotEmpty).map { line ->
+    val builtIn: List<Record> = rows.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.map { line ->
         val fields = line.split("|")
         require(fields.size == 6) { "Malformed firmware catalogue record" }
         require(fields[4].length == 72 && fields[4].all { it in "0123456789abcdefABCDEF" }) {
