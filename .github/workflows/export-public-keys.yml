@@ -1,6 +1,11 @@
 name: Export all published IPSW decryption keys
 
 on:
+  push:
+    branches: [feature/ipsw-toolkit]
+    paths:
+      - 'tools/export_public_ipsw_keys.py'
+      - '.github/workflows/export-public-keys.yml'
   workflow_dispatch:
 permissions:
   contents: read
