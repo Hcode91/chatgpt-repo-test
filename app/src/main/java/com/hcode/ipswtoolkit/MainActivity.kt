@@ -41,45 +41,61 @@ class MainActivity : Activity() {
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val scroll = ScrollView(this)
-        scroll.setBackgroundColor(Color.rgb(245, 247, 252))
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setPadding(24, 32, 24, 24)
-        scroll.addView(root)
-        root.addView(label("IPSW TOOLKIT", 27))
-        root.addView(label("Offline iPhone & iPod firmware explorer", 14))
-        button("1. Select IPSW firmware", root) { selectIpsw() }
-        info = label("No firmware selected", 14)
-        root.addView(info)
-        root.addView(label("COMPONENTS (tap to select)", 15))
-        adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, entries)
-        list = ListView(this)
-        list.adapter = adapter
-        list.layoutParams = LinearLayout.LayoutParams(-1, 260 * resources.displayMetrics.density.toInt().coerceAtLeast(1))
-        list.setBackgroundColor(Color.WHITE)
-        root.addView(list)
-        list.setOnItemClickListener { _, _, position, _ ->
-            current = entries[position]
-            updateControls()
-            setStatus("Selected: " + entries[position].name)
+
+        // Use ONE scrollable container. A ListView nested inside a ScrollView
+        // traps touch scrolling and can make parts of the archive inaccessible.
+        list = ListView(this).apply {
+            setBackgroundColor(Color.rgb(245, 247, 252))
+            dividerHeight = 1
+            isVerticalScrollBarEnabled = true
         }
-        root.addView(label("VFDECRYPT FILESYSTEM KEY (72 HEX CHARACTERS)", 14))
-        key = EditText(this)
-        key.hint = "Paste public key or your matching firmware key"
-        key.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-        key.minLines = 2
-        root.addView(key)
-        keyButton = button("Use published key for iPod 1.1.5", root) {
+
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 32, 24, 12)
+        }
+        header.addView(label("IPSW TOOLKIT", 27))
+        header.addView(label("Offline iPhone & iPod firmware explorer", 14))
+        button("1. Select IPSW firmware", header) { selectIpsw() }
+        info = label("No firmware selected", 14)
+        header.addView(info)
+        header.addView(label("COMPONENTS (tap to select)", 15))
+        // Headers and footers must be registered BEFORE setting the adapter.
+        list.addHeaderView(header, null, false)
+
+        val footer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 12, 24, 32)
+        }
+        footer.addView(label("VFDECRYPT FILESYSTEM KEY (72 HEX CHARACTERS)", 14))
+        key = EditText(this).apply {
+            hint = "Paste public key or your matching firmware key"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            minLines = 2
+        }
+        footer.addView(key)
+        keyButton = button("Use published key for iPod 1.1.5", footer) {
             key.setText(DEMO_KEY)
             setStatus("Published key loaded locally")
         }
-        decryptButton = button("2. Decrypt selected filesystem DMG", root) { chooseOutput(true) }
-        exportButton = button("Export selected component unchanged", root) { chooseOutput(false) }
+        decryptButton = button("2. Decrypt selected filesystem DMG", footer) { chooseOutput(true) }
+        exportButton = button("Export selected component unchanged", footer) { chooseOutput(false) }
         status = label("Ready. No network access required.", 14)
-        root.addView(status)
-        root.addView(label("Supports encrypted encrcdsa v2 root DMGs and raw ZIP export. IMG2/IMG3/IMG4, modern AEA, and HFS+ directory browsing are not supported yet.", 12))
-        setContentView(scroll)
+        footer.addView(status)
+        footer.addView(label("Supports encrypted encrcdsa v2 root DMGs and raw ZIP export. IMG2/IMG3/IMG4, modern AEA, and HFS+ directory browsing are not supported yet.", 12))
+        list.addFooterView(footer, null, false)
+
+        adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, entries)
+        list.adapter = adapter
+        list.setOnItemClickListener { _, _, position, _ ->
+            val selected = adapter.getItem(position - list.headerViewsCount) ?: return@setOnItemClickListener
+            current = selected
+            updateControls()
+            setStatus("Selected: " + selected.name)
+            Toast.makeText(this, "Selected: " + selected.name.substringAfterLast('/'), Toast.LENGTH_SHORT).show()
+        }
+
+        setContentView(list)
         updateControls()
     }
     private fun label(value: String, size: Int) = TextView(this).apply {
