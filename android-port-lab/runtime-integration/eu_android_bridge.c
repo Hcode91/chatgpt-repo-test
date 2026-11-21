@@ -740,6 +740,7 @@ volatile int g_eu_live_off;
 #define EU_LIVE_PPU_INLINE 2048
 #define EU_LIVE_SPU_CHAIN 4096   /* reserved (chained SPU chunks, not in any build) */
 #define EU_LIVE_N218 8192
+#define EU_LIVE_PRIME_MAIN 16384
 static int s_main_nice;   /* 0 = main thread not boosted */
 static void eu_prime_sweep(void)
 {
@@ -786,6 +787,32 @@ static void eu_prime_sweep(void)
         }
     }
     if (!on || !have_prime || !&g_eu_prime_n || g_eu_prime_n <= 0) return;
+    /* EU_PRIME_MAIN=1: the fastest core is the game main thread's instead (boot-20261121-175145: the main thread
+     * ready but waiting for a core 16-23% of the time, the FIFO thread using under half of its own core). The
+     * FIFO thread then shares the other fast cores. Switchable during a run (EU_AB=EU_PRIME_MAIN). */
+    static int prime_main = -1;
+    if (prime_main < 0) {
+        const char* pm = getenv("EU_PRIME_MAIN");
+        prime_main = (pm && *pm == '1') ? 1 : 0;
+        fprintf(stderr, "[boost] fastest core for the game main thread instead of the RSX FIFO thread: %s (EU_PRIME_MAIN)\n",
+                prime_main ? "on" : "off");
+    }
+    const int main_on_prime = prime_main && !(g_eu_live_off & EU_LIVE_PRIME_MAIN);
+    static int last_mode = -1;
+    if (main_on_prime != last_mode) {
+        cpu_set_t all, rest;
+        CPU_ZERO(&all);
+        for (int c = 0; c < 32 && c < (int)sysconf(_SC_NPROCESSORS_CONF); c++) CPU_SET(c, &all);
+        rest = all;
+        for (int c = 0; c < 32; c++) if (CPU_ISSET(c, &prime)) CPU_CLR(c, &rest);
+        const int mt = (int)getpid();
+        sched_setaffinity(mt, sizeof prime, main_on_prime ? &prime : &rest);
+        for (int k = 0; k < g_eu_prime_n && k < 4; k++)
+            sched_setaffinity(g_eu_prime_tid[k], sizeof prime, main_on_prime ? &rest : &prime);
+        if (last_mode >= 0 || main_on_prime)
+            fprintf(stderr, "[boost] fastest core now: %s\n", main_on_prime ? "game main thread" : "RSX FIFO thread");
+        last_mode = main_on_prime;
+    }
     DIR* d = opendir("/proc/self/task");
     if (!d) return;
     struct dirent* e;
@@ -794,7 +821,8 @@ static void eu_prime_sweep(void)
         if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
         const int tid = atoi(e->d_name);
         int is_prime = 0;
-        for (int k = 0; k < g_eu_prime_n && k < 4; k++) if (g_eu_prime_tid[k] == tid) is_prime = 1;
+        if (main_on_prime) is_prime = tid == (int)getpid();
+        else for (int k = 0; k < g_eu_prime_n && k < 4; k++) if (g_eu_prime_tid[k] == tid) is_prime = 1;
         if (is_prime) continue;
         cpu_set_t set;
         CPU_ZERO(&set);
@@ -1362,7 +1390,7 @@ static struct { const char* name; int bit; } s_ab_known[] = {
     {"EU_INDEX_FAST", EU_LIVE_INDEX_FAST}, {"EU_VK_CB_USED", EU_LIVE_CB_USED}, {"EU_LL_YIELD", EU_LIVE_LL_YIELD},
     {"EU_SPU_NICE", EU_LIVE_SPU_NICE}, {"EU_PERF_HINT", EU_LIVE_PERF_HINT},
     {"EU_SPU_SERIAL", EU_LIVE_SPU_SERIAL}, {"EU_SHORT_SPIN", EU_LIVE_SHORT_SPIN},
-    {"EU_N205", EU_LIVE_N205}, {"EU_PPU_INLINE", EU_LIVE_PPU_INLINE}, {"EU_N218", EU_LIVE_N218},
+    {"EU_N205", EU_LIVE_N205}, {"EU_PRIME_MAIN", EU_LIVE_PRIME_MAIN}, {"EU_PPU_INLINE", EU_LIVE_PPU_INLINE}, {"EU_N218", EU_LIVE_N218},
 };
 extern volatile long long g_eu_job_watch_ns __attribute__((weak));
 extern volatile long g_eu_job_watch_runs __attribute__((weak));
