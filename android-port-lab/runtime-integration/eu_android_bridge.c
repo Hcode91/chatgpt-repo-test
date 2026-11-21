@@ -1254,15 +1254,30 @@ static void eu_perf_hint_tick(void)
     const int want = !(g_eu_live_off & EU_LIVE_PERF_HINT);
     if (!want) { if (session) { close_s(session); session = NULL; } return; }
     if (!session) {
+        /* The threads a frame waits for: the main thread, the RSX FIFO thread(s), the frame encoder, and the
+         * SPU threads that run the game's job code (instance 0 kernels and lanes), busiest first. Not the audio
+         * kernel (instance 1): it mostly spins while idle, and boosting that only adds heat. */
         static eu_tsample cur[EU_MAX_THREADS];
-        int32_t tids[8];
+        int32_t tids[16];
         size_t n = 0;
         tids[n++] = (int32_t)getpid();
         if (&g_eu_prime_n) for (int j = 0; j < g_eu_prime_n && j < 2; j++) tids[n++] = g_eu_prime_tid[j];
         const int nc = eu_sample(cur, EU_MAX_THREADS);
-        for (int i = 0; i < nc && n < 8; i++)
-            if (!strncmp(cur[i].name, "vk encode", 9) || !strncmp(cur[i].name, "spurs i1 k0", 11)) tids[n++] = cur[i].tid;
+        for (int i = 0; i < nc && n < 16; i++)
+            if (!strncmp(cur[i].name, "vk encode", 9)) tids[n++] = cur[i].tid;
+        for (int pick = 0; pick < 10 && n < 16; pick++) {   /* busiest SPU job threads (ticks since start) */
+            int best = -1;
+            for (int i = 0; i < nc; i++) {
+                if (strncmp(cur[i].name, "spurs i0", 8) && strncmp(cur[i].name, "spu w", 5)) continue;
+                int dup = 0;
+                for (size_t k = 0; k < n; k++) if (tids[k] == cur[i].tid) dup = 1;
+                if (!dup && (best < 0 || cur[i].ticks > cur[best].ticks)) best = i;
+            }
+            if (best < 0 || !cur[best].ticks) break;
+            tids[n++] = cur[best].tid;
+        }
         session = create(mgr, tids, n, 33333333LL);
+        if (!session && n > 8) session = create(mgr, tids, n = 8, 33333333LL);   /* some phones cap a session */
         static int told;
         if (!told) {
             told = 1;
