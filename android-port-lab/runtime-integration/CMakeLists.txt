@@ -59,6 +59,13 @@ add_subdirectory("${UP_SOURCE}" "${CMAKE_BINARY_DIR}/ps3recomp")
 target_include_directories(ps3recomp_runtime PRIVATE
     "${UCTX_ROOT}/include" "${UCTX_ROOT}/arch/aarch64/include")
 target_link_libraries(ps3recomp_runtime PUBLIC ps3recomp_ucontext)
+# Link-time optimisation (ThinLTO) for the runtime and the SPU job code, so calls from translated SPU code
+# into the runtime (channels, transfers, dispatch) can be inlined. The huge translated PPU sources stay
+# out of it: they would not fit the build machine's memory. EU_LTO=OFF builds as before.
+option(EU_LTO "ThinLTO for the runtime and the SPU code" ON)
+if(EU_LTO)
+    target_compile_options(ps3recomp_runtime PRIVATE -flto=thin)
+endif()
 # The upstream boot-smoke executable intentionally omits the title's own host
 # runner. Supply only the runner-owned services and explicitly disabled
 # optional title-specific plugin hooks, never impersonate full gameplay.
@@ -221,6 +228,9 @@ if(INFAMOUS_EU_UPSTREAM_TITLE)
                 INCLUDE_DIRECTORIES "${UP_SOURCE}/runtime/spu"
                 COMPILE_DEFINITIONS SPU_USE_DISPATCH_MT
                 COMPILE_OPTIONS "-O2;-w;-ferror-limit=0;-include;${UP_SOURCE}/runtime/platform/win32_compat.h")
+            if(EU_LTO)
+                set_property(SOURCE ${EU_SPU_SOURCES} APPEND PROPERTY COMPILE_OPTIONS "-flto=thin")
+            endif()
         endif()
     endif()
     add_executable(infamous_eu_upstream_title
@@ -299,6 +309,10 @@ if(INFAMOUS_EU_UPSTREAM_TITLE)
     endif()
     target_link_options(infamous_eu_upstream_title PRIVATE
         "-Wl,-z,max-page-size=16384")
+    if(EU_LTO)
+        target_link_options(infamous_eu_upstream_title PRIVATE "-flto=thin" "-Wl,--thinlto-jobs=2"
+            "-Wl,--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache")
+    endif()
     set_target_properties(infamous_eu_upstream_title PROPERTIES
         OUTPUT_NAME "libps3eu_title" SUFFIX ".so" LINKER_LANGUAGE CXX)
     message(STATUS "Upstream European game-specific ARM64 runner enabled")

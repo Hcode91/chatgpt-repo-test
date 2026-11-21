@@ -19,6 +19,9 @@
 #define SPU_HELPERS_VEC_ARM64_H
 #include <stdint.h>
 #include <string.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 typedef uint32_t spu__v4u __attribute__((vector_size(16)));
 typedef int32_t  spu__v4s __attribute__((vector_size(16)));
@@ -165,6 +168,71 @@ static inline u128 spu__v_fsm(u128 a_) {
     return spu__vo(SPU__M(v == bits));
 }
 
+/* More compares and multiplies (byte/halfword lanes: per-lane operations, so the within-word byte order
+ * does not matter). */
+SPU__V2(cgtb,  SPU__S16V(A) > SPU__S16V(B))
+SPU__V2(clgtb, SPU__U16(A) > SPU__U16(B))
+SPU__V2(cgth,  SPU__S8V(A) > SPU__S8V(B))
+SPU__V2(mpyhhu,(A >> 16) * (B >> 16))
+
+/* count leading zeros per word, ones per byte */
+static inline u128 spu__v_clz(u128 a_) {
+#if defined(__aarch64__)
+    uint32x4_t x; memcpy(&x, &a_, 16); x = vclzq_u32(x); u128 r; memcpy(&r, &x, 16); return r;
+#else
+    u128 r; for (int i = 0; i < 4; i++) r._u32[i] = a_._u32[i] ? (uint32_t)__builtin_clz(a_._u32[i]) : 32u; return r;
+#endif
+}
+static inline u128 spu__v_cntb(u128 a_) {
+#if defined(__aarch64__)
+    uint8x16_t x; memcpy(&x, &a_, 16); x = vcntq_u8(x); u128 r; memcpy(&r, &x, 16); return r;
+#else
+    u128 r; for (int i = 0; i < 16; i++) r._u8[i] = (uint8_t)__builtin_popcount(a_._u8[i]); return r;
+#endif
+}
+
+/* xswd: doubleword d = sign extension of word 2d+1 */
+static inline u128 spu__v_xswd(u128 a_) {
+    const spu__v4u A = spu__vi(a_);
+    const spu__v4u odd = __builtin_shufflevector(A, A, 1, 1, 3, 3);
+    const spu__v4u sign = SPU__U4(SPU__S4(odd) >> 31);
+    return spu__vo(__builtin_shufflevector(sign, odd, 0, 5, 2, 7));
+}
+
+/* orx: OR of the four words into the preferred word, the rest zero */
+static inline u128 spu__v_orx(u128 a_) {
+    const spu__v4u A = spu__vi(a_);
+    const spu__v4u h = A | __builtin_shufflevector(A, A, 2, 3, 0, 1);
+    const uint32_t v = (h | __builtin_shufflevector(h, h, 1, 0, 3, 2))[0];
+    return spu__vo((spu__v4u){ v, 0, 0, 0 });
+}
+
+/* gather bits: the low bit of each word / SPU halfword / SPU byte into the preferred word, first lane
+ * in the highest bit. SPU halfword H is host halfword H^1 and SPU byte B is host byte B^3. */
+static inline u128 spu__v_gb(u128 a_) {
+    const spu__v4u w = (spu__vi(a_) & 1u) << (spu__v4u){ 3, 2, 1, 0 };
+    return spu__vo((spu__v4u){ w[0] | w[1] | w[2] | w[3], 0, 0, 0 });
+}
+static inline u128 spu__v_gbh(u128 a_) {
+    const spu__v8u h = (SPU__U8(spu__vi(a_)) & 1) << (spu__v8u){ 6, 7, 4, 5, 2, 3, 0, 1 };
+#if defined(__aarch64__)
+    uint16x8_t x; memcpy(&x, &h, 16); const uint32_t v = vaddvq_u16(x);
+#else
+    uint32_t v = 0; for (int i = 0; i < 8; i++) v |= h[i];
+#endif
+    return spu__vo((spu__v4u){ v, 0, 0, 0 });
+}
+static inline u128 spu__v_gbb(u128 a_) {
+    const spu__v16u b = (SPU__U16(spu__vi(a_)) & 1) << (spu__v16u){ 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3 };
+#if defined(__aarch64__)
+    uint8x16_t x; memcpy(&x, &b, 16);
+    const uint32_t v = ((uint32_t)vaddv_u8(vget_low_u8(x)) << 8) | vaddv_u8(vget_high_u8(x));
+#else
+    uint32_t v = 0; for (int i = 0; i < 16; i++) v |= (uint32_t)b[i] << (i < 8 ? 8 : 0);
+#endif
+    return spu__vo((spu__v4u){ v, 0, 0, 0 });
+}
+
 #define spu_splat_u32 spu__v_splat_u32
 #define spu_il     spu__v_il
 #define spu_ila    spu__v_ila
@@ -237,6 +305,28 @@ static inline u128 spu__v_fsm(u128 a_) {
 #define spu_mpyi   spu__v_mpyi
 #define spu_mpyui  spu__v_mpyui
 #define spu_fsm    spu__v_fsm
+#undef spu_cgtb
+#define spu_cgtb spu__v_cgtb
+#undef spu_clgtb
+#define spu_clgtb spu__v_clgtb
+#undef spu_cgth
+#define spu_cgth spu__v_cgth
+#undef spu_mpyhhu
+#define spu_mpyhhu spu__v_mpyhhu
+#undef spu_clz
+#define spu_clz spu__v_clz
+#undef spu_cntb
+#define spu_cntb spu__v_cntb
+#undef spu_xswd
+#define spu_xswd spu__v_xswd
+#undef spu_orx
+#define spu_orx spu__v_orx
+#undef spu_gb
+#define spu_gb spu__v_gb
+#undef spu_gbh
+#define spu_gbh spu__v_gbh
+#undef spu_gbb
+#define spu_gbb spu__v_gbb
 
 /* Local-store access without the diagnostic hooks, as in spu_helpers_vec.h:
  * a 16-byte load or store with each word byte-swapped (one rev32 on ARM64). */

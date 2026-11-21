@@ -10,13 +10,16 @@ both next to spu_helpers.h's lane-by-lane references with clang and compares
 them on random and edge-case inputs (at -O0 and -O2; floats in round-to-nearest
 and round-toward-zero). Exit status 0 = every result bit-identical.
 """
-import pathlib, subprocess, sys, tempfile
+import pathlib, shutil, subprocess, sys, tempfile
+
+# When qemu-aarch64 is installed, every test also runs as an ARM64 build (the NEON paths).
+QEMU = shutil.which("qemu-aarch64")
 
 HERE = pathlib.Path(__file__).resolve().parent.parent / "runtime-integration"
 
-V1 = "xsbh xshw fsm".split()
+V1 = "xsbh xshw fsm clz cntb xswd orx gb gbh gbb".split()
 V2 = ("a sf ah sfh cg bg and or xor andc orc nor nand eqv ceq ceqh ceqb cgt clgt clgth "
-      "shl rotm rotma rot mpy mpyu mpyh mpyhh mpys").split()
+      "shl rotm rotma rot mpy mpyu mpyh mpyhh mpys cgtb clgtb cgth mpyhhu").split()
 V3 = "addx sfx selb mpya".split()
 VI = ("ai sfi ahi sfhi andi ori xori andhi orhi xorhi andbi orbi xorbi ceqi ceqhi ceqbi cgti "
       "cgthi cgtbi clgti clgthi clgtbi mpyi mpyui shli shlhi rotmi rotmai rothmi rotmhi rotmahi roti").split()
@@ -120,10 +123,12 @@ def main() -> int:
             c = pathlib.Path(td) / f"{name}.c"
             c.write_text(src)
             for opt in ("-O0", "-O2"):
-                exe = pathlib.Path(td) / f"{name}{opt}"
-                subprocess.run(["clang", opt, "-ffp-contract=off", *inc, str(c), "-o", str(exe), *extra], check=True)
-                r = subprocess.run([str(exe)], capture_output=True, text=True)
-                print(f"{name} {opt}: {r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.returncode}")
+              for arm in ((False, True) if QEMU else (False,)):
+                exe = pathlib.Path(td) / f"{name}{opt}{'a' if arm else ''}"
+                tgt = ["--target=aarch64-linux-gnu", "-fuse-ld=lld", "-static"] if arm else []
+                subprocess.run(["clang", *tgt, opt, "-ffp-contract=off", *inc, str(c), "-o", str(exe), *extra], check=True)
+                r = subprocess.run(([QEMU] if arm else []) + [str(exe)], capture_output=True, text=True)
+                print(f"{name} {opt}{' arm64' if arm else ''}: {r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.returncode}")
                 if r.returncode:
                     print(r.stdout)
                     ok = False
