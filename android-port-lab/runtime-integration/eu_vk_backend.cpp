@@ -40,6 +40,7 @@
 #include <SPIRV/GlslangToSpv.h>
 #endif
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -120,6 +121,49 @@ PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
 
 bool load_global()
 {
+    /* EU_VK_DRIVER=turnip: the Mesa Turnip driver shipped in the APK (libvulkan_freedreno.so), used directly
+     * through its driver entry point instead of the phone's own driver. Any failure falls back to the system
+     * Vulkan library and says so. */
+    const char* drv = getenv("EU_VK_DRIVER");
+    if (drv && !strcmp(drv, "turnip")) {
+        void* t = dlopen("libvulkan_freedreno.so", RTLD_NOW | RTLD_LOCAL);
+        if (!t) {
+            fprintf(stderr, "[RSX vulkan] Turnip: cannot load libvulkan_freedreno.so (%s); using the system driver\n", dlerror());
+        } else {
+            typedef VkResult (*PFN_negotiate)(uint32_t*);
+            PFN_negotiate neg = (PFN_negotiate)dlsym(t, "vk_icdNegotiateLoaderICDInterfaceVersion");
+            uint32_t ver = 5;
+            if (neg) neg(&ver);
+            vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(t, "vk_icdGetInstanceProcAddr");
+            if (!vkGetInstanceProcAddr) {
+                /* An Android build of the driver exports only its HAL module ("HMI"): open device "vk0" and take
+                 * its GetInstanceProcAddr (hardware/hwvulkan.h layout, 64-bit). */
+                struct HwModule;
+                struct HwDevice { uint32_t tag, version; HwModule* module; uint64_t reserved[12]; int (*close)(HwDevice*); };
+                struct HwMethods { int (*open)(const HwModule*, const char*, HwDevice**); };
+                struct HwModule { uint32_t tag; uint16_t mver, hver; const char *id, *name, *author; HwMethods* methods;
+                                  void* dso; uint64_t reserved[25]; };
+                struct HwVulkanDevice { HwDevice common; void* enum_ext; PFN_vkCreateInstance create;
+                                        PFN_vkGetInstanceProcAddr gipa; };
+                HwModule* hmi = (HwModule*)dlsym(t, "HMI");
+                HwDevice* dev = nullptr;
+                if (hmi && hmi->methods && hmi->methods->open && hmi->methods->open(hmi, "vk0", &dev) == 0 && dev) {
+                    vkGetInstanceProcAddr = ((HwVulkanDevice*)dev)->gipa;
+                    ver = 0;
+                }
+            }
+            if (vkGetInstanceProcAddr) {
+#define EU_VK_LOAD_T(f) f = (PFN_##f)vkGetInstanceProcAddr(nullptr, #f);
+                EU_VK_GLOBAL(EU_VK_LOAD_T)
+                if (vkCreateInstance) {
+                    fprintf(stderr, "[RSX vulkan] Turnip: driver loaded from the APK (%s)\n", ver ? "driver interface" : "HAL module");
+                    return true;
+                }
+            }
+            fprintf(stderr, "[RSX vulkan] Turnip: driver entry points missing; using the system driver\n");
+            vkGetInstanceProcAddr = nullptr;
+        }
+    }
     void* lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
     if (!lib) {
         fprintf(stderr, "[RSX vulkan] cannot load libvulkan.so: %s\n", dlerror());
@@ -296,7 +340,9 @@ struct Obj {
     VkImageView att = VK_NULL_HANDLE;    /* attachment view (identity)          */
     VkFormat fmt = VK_FORMAT_UNDEFINED;
     rsx_be_format bfmt = RSX_BE_FMT_NONE;
-    u32 w = 0, h = 0, mips = 1, layers = 1;
+    u32 w = 0, h = 0, mips = 1, layers = 1;   /* the guest's size of the surface                */
+    u32 pw = 0, ph = 0;                       /* the image's real size (smaller on a scaled target) */
+    u8 sclass = 0;                            /* 0 full size, 1 screen-size (EU_RES_SCALE), 2 shadow (EU_SHADOW_SCALE) */
     u32 parent = 0;                      /* surface_view: the owning surface    */
     uint64_t memsz = 0;                  /* device memory it owns (memory readout) */
     bool initialised = false;            /* moved out of UNDEFINED              */
@@ -541,12 +587,56 @@ bool image_create(Obj& o, VkFormat fmt, u32 w, u32 h, u32 mips, u32 layers, bool
     o.memsz = mr.size;
     g_mem_img += mr.size;
     o.fmt = fmt;
-    o.w = w;
-    o.h = h;
+    o.w = o.pw = w;
+    o.h = o.ph = h;
     o.mips = mips;
     o.layers = layers;
     o.cube = cube;
     return true;
+}
+
+/* Render-target scaling (EU_RES_SCALE, EU_SHADOW_SCALE; 0.25..1, default 1 = the PS3's size). Targets of the
+ * guest's screen size (1280x720) and its shadow maps (square targets of 512 and up, and the 1280x1024 depth under
+ * them) are allocated smaller; viewports and scissors of draws into them are scaled, copies map their rectangles,
+ * fragment programs that read the pixel position get it back in guest pixels (specialisation constants), and
+ * everything that samples them uses normalised coordinates. Reads back to the CPU are resampled to guest size. */
+float g_scale[3] = {1.0f, 1.0f, 1.0f};
+void scales_init()
+{
+    static bool done;
+    if (done) return;
+    done = true;
+    const char* names[2] = {"EU_RES_SCALE", "EU_SHADOW_SCALE"};
+    for (int k = 0; k < 2; k++) {
+        const char* e = getenv(names[k]);
+        float v = e && *e ? (float)atof(e) : 1.0f;
+        if (!(v >= 0.25f)) v = 0.25f;
+        if (v > 1.0f) v = 1.0f;
+        g_scale[k + 1] = v;
+    }
+    fprintf(stderr, "[RSX vulkan] render scale: screen-size targets %.2f, shadow maps %.2f\n", g_scale[1], g_scale[2]);
+}
+u8 scale_class(u32 w, u32 h)
+{
+    scales_init();
+    if ((w == h && w >= 512) || (w == 1280 && h == 1024)) return g_scale[2] < 1.0f ? 2 : 0;
+    if (w == 1280 && h == 720) return g_scale[1] < 1.0f ? 1 : 0;
+    return 0;
+}
+u32 scaled_dim(u32 v, u8 sclass)
+{
+    if (!sclass) return v;
+    const u32 r = (u32)((float)v * g_scale[sclass] + 0.5f);
+    return r ? r : 1u;
+}
+/* Nearest-pixel resample of rows (bpp bytes a pixel) between sizes. */
+void resample_rows(const u8* src, u32 sw, u32 sh, u32 src_pitch, u8* dst, u32 dw, u32 dh, u32 dst_pitch, u32 bpp)
+{
+    for (u32 y = 0; y < dh; y++) {
+        const u8* row = src + (size_t)((u64)y * sh / dh) * src_pitch;
+        u8* out = dst + (size_t)y * dst_pitch;
+        for (u32 x = 0; x < dw; x++) memcpy(out + (size_t)x * bpp, row + (size_t)((u64)x * sw / dw) * bpp, bpp);
+    }
 }
 
 VkImageView make_view(VkImage img, VkFormat fmt, VkImageViewType type, VkImageAspectFlags aspect,
@@ -1023,6 +1113,10 @@ struct Pipe {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline variant[3][2] = {};   /* [point/line/triangle][with colour / depth-only] */
     bool failed[3][2] = {};
+    /* fragment programs that read the pixel position: variants for scaled targets [screen/shadow - 1] */
+    bool wpos = false;
+    VkPipeline wvariant[2][3][2] = {};
+    bool wfailed[2][3][2] = {};
     std::vector<ResBinding> bindings;
     VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
     rsx_be_render_state rs{};
@@ -1113,7 +1207,7 @@ VkPrimitiveTopology vk_topo(rsx_topology t)
     }
 }
 
-VkPipeline build_variant(Pipe& p, int cls, bool depth_only)
+VkPipeline build_variant(Pipe& p, int cls, bool depth_only, const float* wscale = nullptr)
 {
     const u32 ncol = depth_only ? 0u : p.rt_count;
     std::vector<VkVertexInputAttributeDescription> attrs;
@@ -1204,6 +1298,9 @@ VkPipeline build_variant(Pipe& p, int cls, bool depth_only)
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, p.vs, "main", nullptr},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, p.fs, "main", nullptr},
     };
+    const VkSpecializationMapEntry wmap[2] = {{70, 0, 4}, {71, 4, 4}};
+    VkSpecializationInfo wspec{2, wmap, 8, wscale};
+    if (wscale) stages[1].pSpecializationInfo = &wspec;
     VkGraphicsPipelineCreateInfo gi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     gi.pNext = &ri;
     gi.stageCount = 2;
@@ -1544,12 +1641,13 @@ bool targets_are(const Rec& r, const u32* rt, u32 nrt)
     return true;
 }
 
-void bind_draw(VkCommandBuffer cb, const Rec& r, Pipe& p, VkPipeline pl, u32 rw, u32 rh)
+void bind_draw(VkCommandBuffer cb, const Rec& r, Pipe& p, VkPipeline pl, u32 rw, u32 rh, float fx = 1.0f, float fy = 1.0f)
 {
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
     vkCmdSetPrimitiveTopology(cb, vk_topo(r.topo));
-    /* D3D/Metal convention through a negative-height viewport (Vulkan 1.1). */
-    float vx = r.vp[0], vy = r.vp[1], vw = r.vp[2], vh = r.vp[3];
+    /* D3D/Metal convention through a negative-height viewport (Vulkan 1.1). rw x rh is the attachments' real
+     * size; fx, fy scale the guest's pixel rectangles onto it (a scaled target). */
+    float vx = r.vp[0] * fx, vy = r.vp[1] * fy, vw = r.vp[2] * fx, vh = r.vp[3] * fy;
     if (vw <= 0.0f || vh <= 0.0f) {
         vx = 0;
         vy = 0;
@@ -1559,7 +1657,19 @@ void bind_draw(VkCommandBuffer cb, const Rec& r, Pipe& p, VkPipeline pl, u32 rw,
     VkViewport v{vx, vy + vh, vw, -vh, 0.0f, 1.0f};
     vkCmdSetViewport(cb, 0, 1, &v);
     VkRect2D sc{{0, 0}, {rw, rh}};
-    if (r.sc[2] && r.sc[3]) sc = {{(int32_t)r.sc[0], (int32_t)r.sc[1]}, {r.sc[2], r.sc[3]}};
+    if (r.sc[2] && r.sc[3]) {
+        if (fx == 1.0f && fy == 1.0f) {
+            sc = {{(int32_t)r.sc[0], (int32_t)r.sc[1]}, {r.sc[2], r.sc[3]}};
+        } else {
+            u32 x0 = (u32)((float)r.sc[0] * fx), y0 = (u32)((float)r.sc[1] * fy);
+            u32 x1 = (u32)ceilf((float)(r.sc[0] + r.sc[2]) * fx), y1 = (u32)ceilf((float)(r.sc[1] + r.sc[3]) * fy);
+            if (x1 > rw) x1 = rw;
+            if (y1 > rh) y1 = rh;
+            if (x0 >= x1) x0 = x1 ? x1 - 1 : 0;
+            if (y0 >= y1) y0 = y1 ? y1 - 1 : 0;
+            sc = {{(int32_t)x0, (int32_t)y0}, {x1 - x0 ? x1 - x0 : 1u, y1 - y0 ? y1 - y0 : 1u}};
+        }
+    }
     vkCmdSetScissor(cb, 0, 1, &sc);
     vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, r.stencil_ref & 0xFFu);
 
@@ -1779,7 +1889,9 @@ std::string obj_desc(u32 h)
     const char* fn = fmt_name(o->fmt);
     char fbuf[24];
     if (!fn) { snprintf(fbuf, sizeof fbuf, "vk%d", (int)o->fmt); fn = fbuf; }
-    snprintf(b, sizeof b, "h%u %ux%u %s%s%s(rsx fmt %d)", h, o->w, o->h, fn, o->cube ? " cube" : "",
+    char real[32] = "";
+    if (o->pw != o->w || o->ph != o->h) snprintf(real, sizeof real, " (drawn %ux%u)", o->pw, o->ph);
+    snprintf(b, sizeof b, "h%u %ux%u%s %s%s%s(rsx fmt %d)", h, o->w, o->h, real, fn, o->cube ? " cube" : "",
              o->bc_decode ? " cpu-decoded " : " ", (int)o->bfmt);
     if (o->parent) {
         const size_t n = strlen(b);
@@ -2114,7 +2226,7 @@ void encode_records(VkCommandBuffer cb)
             Obj* dst = obj(r.resolve_dst);
             if (!src || !dst || !src->view || !dst->att || !g_depthpack_pipe) continue;
             barrier_all(cb);
-            helper_pass(cb, g_depthpack_pipe, src->view, g_point_sampler, dst->att, dst->w, dst->h);
+            helper_pass(cb, g_depthpack_pipe, src->view, g_point_sampler, dst->att, dst->pw, dst->ph);
             if (g_cap.active) {
                 char b[64];
                 snprintf(b, sizeof b, "pass %u: depth packed as colour ", g_cap.passes++);
@@ -2136,7 +2248,19 @@ void encode_records(VkCommandBuffer cb)
             Obj* src = obj(r.depth);
             Obj* dst = obj(r.resolve_dst);
             if (!src || !dst || !src->img || !dst->img) continue;
-            const u32* c = r.copy_rect;
+            u32 c[8];
+            memcpy(c, r.copy_rect, sizeof c);
+            if (src->pw != src->w || src->ph != src->h || dst->pw != dst->w || dst->ph != dst->h) {
+                /* guest rectangles onto the images' real sizes */
+                const float sx = (float)src->pw / (float)src->w, sy = (float)src->ph / (float)src->h;
+                const float dx = (float)dst->pw / (float)dst->w, dy = (float)dst->ph / (float)dst->h;
+                const u32 s0 = (u32)((float)c[0] * sx), s1 = (u32)((float)c[1] * sy);
+                const u32 s2 = (u32)((float)(c[0] + c[2]) * sx + 0.5f), s3 = (u32)((float)(c[1] + c[3]) * sy + 0.5f);
+                const u32 d0 = (u32)((float)c[4] * dx), d1 = (u32)((float)c[5] * dy);
+                const u32 d2 = (u32)((float)(c[4] + c[6]) * dx + 0.5f), d3 = (u32)((float)(c[5] + c[7]) * dy + 0.5f);
+                c[0] = s0; c[1] = s1; c[2] = s2 > s0 ? s2 - s0 : 1; c[3] = s3 > s1 ? s3 - s1 : 1;
+                c[4] = d0; c[5] = d1; c[6] = d2 > d0 ? d2 - d0 : 1; c[7] = d3 > d1 ? d3 - d1 : 1;
+            }
             VkImageBlit b{};
             b.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             b.dstSubresource = b.srcSubresource;
@@ -2166,7 +2290,7 @@ void encode_records(VkCommandBuffer cb)
             /* The zeta may have been an attachment a moment ago, even in the
              * same guest pass (a game sampling its bound depth buffer). */
             barrier_all(cb);
-            helper_pass(cb, g_depth_pipe, src->view, g_point_sampler, dst->att, dst->w, dst->h);
+            helper_pass(cb, g_depth_pipe, src->view, g_point_sampler, dst->att, dst->pw, dst->ph);
             if (g_cap.active) {
                 int tile = -1;
                 if (g_cap.pass_tiles < CAP_PASS_TILES) {
@@ -2239,11 +2363,15 @@ void encode_records(VkCommandBuffer cb)
             if (i < g_rec_count && g_rec[i].kind == REC_DRAW) i++;
             continue;
         }
-        const u32 rw = attach ? tex[0]->w : z->w, rh = attach ? tex[0]->h : z->h;
+        /* rw x rh: the attachments' real size; lw x lh: the guest's size of the pass */
+        const Obj* lead = attach ? tex[0] : z;
+        const u32 rw = lead->pw, rh = lead->ph, lw = lead->w, lh = lead->h;
+        const u8 pass_class = lead->sclass;
+        const float pfx = (float)rw / (float)lw, pfy = (float)rh / (float)lh;
         /* Pipelines always declare a depth attachment, so a draw pass needs one. */
         bool fallback_z = false;
-        if (attach && (!z || z->w < rw || z->h < rh)) {
-            z = obj(fallback_depth(rw, rh));
+        if (attach && (!z || z->pw < rw || z->ph < rh)) {
+            z = obj(fallback_depth(lw, lh));
             fallback_z = true;
         }
         init_layouts(cb);   /* the fallback depth may be brand new */
@@ -2312,7 +2440,18 @@ void encode_records(VkCommandBuffer cb)
                 p.failed[cls][donly] = !p.variant[cls][donly];
             }
             if (!p.variant[cls][donly]) continue;
-            bind_draw(cb, r, p, p.variant[cls][donly], rw, rh);
+            VkPipeline use = p.variant[cls][donly];
+            if (p.wpos && pass_class) {
+                /* the program reads the pixel position: a variant that scales it back to guest pixels */
+                const int k = pass_class - 1;
+                if (!p.wvariant[k][cls][donly] && !p.wfailed[k][cls][donly]) {
+                    const float ws[2] = {(float)lw / (float)rw, (float)lh / (float)rh};
+                    p.wvariant[k][cls][donly] = build_variant(p, cls, donly, ws);
+                    p.wfailed[k][cls][donly] = !p.wvariant[k][cls][donly];
+                }
+                if (p.wvariant[k][cls][donly]) use = p.wvariant[k][cls][donly];
+            }
+            bind_draw(cb, r, p, use, rw, rh, pfx, pfy);
             drawn++;
         }
         vkCmdEndRendering(cb);
@@ -2541,8 +2680,8 @@ void encode_and_submit_inner(u32 present_surface, uint64_t serial)
 
     u32 pw = 0, ph = 0;
     if (publish) {
-        pw = src->w < PRESENT_MAX_W ? src->w : PRESENT_MAX_W;
-        ph = src->h < PRESENT_MAX_H ? src->h : PRESENT_MAX_H;
+        pw = src->pw < PRESENT_MAX_W ? src->pw : PRESENT_MAX_W;
+        ph = src->ph < PRESENT_MAX_H ? src->ph : PRESENT_MAX_H;
         helper_pass(g_cb, g_blit_pipe, src->view, g_default_sampler, g_present.att, pw, ph);
         barrier_all(g_cb);
         VkBufferImageCopy c{};
@@ -2641,9 +2780,13 @@ u32 be_color_target_create(void*, rsx_be_format fmt, u32 w, u32 h, const void* s
     if (!w || !h) return 0;
     Obj o;
     o.bfmt = fmt;
-    if (!image_create(o, vk_format(fmt), w, h, 1, 1, false,
+    const u8 sc = scale_class(w, h);
+    if (!image_create(o, vk_format(fmt), scaled_dim(w, sc), scaled_dim(h, sc), 1, 1, false,
                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return 0;
+    o.w = w;
+    o.h = h;
+    o.sclass = sc;
     o.view = make_view(o.img, o.fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, IDENTITY);
     o.att = make_view(o.img, o.fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, IDENTITY);
     const u32 hnd = obj_add(o);
@@ -2651,7 +2794,17 @@ u32 be_color_target_create(void*, rsx_be_format fmt, u32 w, u32 h, const void* s
         obj_destroy_now(o);
         return 0;
     }
-    if (seed && seed_row_bytes) upload_now(g_obj[hnd - 1], 0, 0, w, h, seed, seed_row_bytes, h);
+    if (seed && seed_row_bytes) {
+        Obj& t = g_obj[hnd - 1];
+        if (t.pw == w && t.ph == h) {
+            upload_now(t, 0, 0, w, h, seed, seed_row_bytes, h);
+        } else {   /* a scaled target: the guest's bytes resampled to the image's size */
+            const u32 bpp = bytes_per_pixel(t.fmt);
+            std::vector<u8> small((size_t)t.pw * t.ph * bpp);
+            resample_rows((const u8*)seed, w, h, seed_row_bytes, small.data(), t.pw, t.ph, t.pw * bpp, bpp);
+            upload_now(t, 0, 0, t.pw, t.ph, small.data(), t.pw * bpp, t.ph);
+        }
+    }
     return hnd;
 }
 
@@ -2670,6 +2823,9 @@ u32 be_surface_view(void*, u32 surface, u32 remap, u32 rsx_format)
     v.bfmt = s->bfmt;
     v.w = s->w;
     v.h = s->h;
+    v.pw = s->pw;
+    v.ph = s->ph;
+    v.sclass = s->sclass;
     v.parent = surface;
     v.initialised = true;
     v.view = make_view(s->img, s->fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
@@ -2688,8 +2844,12 @@ u32 depth_create(u32 w, u32 h)
     if (!w || !h) return 0;
     Obj o;
     o.depth = true;
-    if (!image_create(o, g_depth_fmt, w, h, 1, 1, false,
+    const u8 sc = scale_class(w, h);
+    if (!image_create(o, g_depth_fmt, scaled_dim(w, sc), scaled_dim(h, sc), 1, 1, false,
                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) return 0;
+    o.w = w;
+    o.h = h;
+    o.sclass = sc;
     o.att = make_view(o.img, o.fmt, VK_IMAGE_VIEW_TYPE_2D, full_aspect(o), 1, 1, IDENTITY);
     o.view = make_view(o.img, o.fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, 1, 1, IDENTITY);
     const u32 hnd = obj_add(o);
@@ -2774,10 +2934,28 @@ u32 be_pipeline_create(void*, const char* vs_hlsl, const char* ps_hlsl, const rs
         if (pull) g_pull_pipe_failures++;
         return 0;
     }
+    /* A program reading the pixel position gets it through two specialisation constants (1 by default), so
+     * the same program can scale it back to guest pixels on a scaled target (EU_RES_SCALE, EU_SHADOW_SCALE). */
+    std::string wps;
+    const bool wpos = strstr(ps_hlsl, "input.position") != nullptr;
+    if (wpos) {
+        scales_init();
+        if (g_scale[1] < 1.0f || g_scale[2] < 1.0f) {
+            wps = "[[vk::constant_id(70)]] const float eu_wsx = 1.0;\n[[vk::constant_id(71)]] const float eu_wsy = 1.0;\n";
+            wps += ps_hlsl;
+            for (size_t at = 0; (at = wps.find("input.position", at)) != std::string::npos;) {
+                const char* with = "(input .position * float4(eu_wsx, eu_wsy, 1.0, 1.0))";
+                wps.replace(at, 14, with);
+                at += strlen(with);
+            }
+            ps_hlsl = wps.c_str();
+        }
+    }
     const Func* fs = function_for(ps_hlsl, false);
     if (!fs) return 0;
 
     Pipe p;
+    p.wpos = !wps.empty();
     p.live = true;
     p.vs = vs->mod;
     p.fs = fs->mod;
@@ -2896,6 +3074,9 @@ void be_pipeline_release(void*, u32 pipeline)
     if (g_rec_count) encode_and_submit(0);   /* records may still name it */
     for (auto& row : p.variant)
         for (VkPipeline& v : row) if (v) vkDestroyPipeline(g_dev, v, nullptr);
+    for (auto& k : p.wvariant)
+        for (auto& row : k)
+            for (VkPipeline& v : row) if (v) vkDestroyPipeline(g_dev, v, nullptr);
     if (p.layout) vkDestroyPipelineLayout(g_dev, p.layout, nullptr);
     if (p.dsl) vkDestroyDescriptorSetLayout(g_dev, p.dsl, nullptr);
     p = Pipe{};
@@ -3494,17 +3675,30 @@ void be_readback(void*, u32 surface, u32 x, u32 y, u32 w, u32 h, void* out, u32 
     std::lock_guard<std::recursive_mutex> vk_lk(g_vk_mu);
     wait_all_slots();
     const u32 bpp = bytes_per_pixel(o->fmt);
-    if (!buffer_ensure(g_upload_buf, (VkDeviceSize)w * h * bpp, VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                                                                   VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return;
+    /* a scaled target: read its real pixels for the rectangle, then resample to the guest's size */
+    const bool scaled = o->pw != o->w || o->ph != o->h;
+    const u32 rx = scaled ? (u32)((u64)x * o->pw / o->w) : x, ry = scaled ? (u32)((u64)y * o->ph / o->h) : y;
+    u32 rwid = scaled ? (u32)(((u64)(x + w) * o->pw + o->w - 1) / o->w) - rx : w;
+    u32 rhei = scaled ? (u32)(((u64)(y + h) * o->ph + o->h - 1) / o->h) - ry : h;
+    if (!rwid) rwid = 1;
+    if (!rhei) rhei = 1;
+    if (rx + rwid > o->pw) rwid = o->pw - rx;
+    if (ry + rhei > o->ph) rhei = o->ph - ry;
+    if (!buffer_ensure(g_upload_buf, (VkDeviceSize)rwid * rhei * bpp, VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                                                         VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return;
     VkCommandBuffer cb = imm_begin();
     VkBufferImageCopy c{};
     c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    c.imageOffset = {(int32_t)x, (int32_t)y, 0};
-    c.imageExtent = {w, h, 1};
+    c.imageOffset = {(int32_t)rx, (int32_t)ry, 0};
+    c.imageExtent = {rwid, rhei, 1};
     barrier_all(cb);
     vkCmdCopyImageToBuffer(cb, o->img, VK_IMAGE_LAYOUT_GENERAL, g_upload_buf.buf, 1, &c);
     barrier_all(cb);
     imm_end();
+    if (scaled) {
+        resample_rows((const u8*)g_upload_buf.map, rwid, rhei, rwid * bpp, (u8*)out, w, h, out_pitch, bpp);
+        return;
+    }
     for (u32 row = 0; row < h; row++)
         memcpy((u8*)out + (size_t)row * out_pitch, (u8*)g_upload_buf.map + (size_t)row * w * bpp, (size_t)w * bpp);
 }
