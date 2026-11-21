@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - experimental/infamous-arm64-probe
+      - feature/infamous-eu-game-boot
     paths:
       - 'android-port-lab/**'
       - '.github/workflows/infamous-android-probe.yml'
@@ -29,6 +30,14 @@ jobs:
           test -x "$SDKMANAGER"
           yes | "$SDKMANAGER" --licenses > /dev/null || true
           "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+      - name: Check private EU PPU/SPU build scripts without game files
+        run: |
+          python3 -m py_compile \
+            android-port-lab/tools/prepare_eu_game_lift.py \
+            android-port-lab/tools/prepare_eu_spu_lift.py
+          bash -n android-port-lab/tools/build_private_eu_apk.sh
+          # No user EBOOT and no game-derived code enters public CI.
+          ! test -e android-port-lab/app/src/main/jniLibs/arm64-v8a/libps3eu.so
       - name: Checkout official game port source (no proprietary game files)
         run: git clone --depth 1 https://github.com/whompay/inFAMOUSreborn.git android-port-lab/upstream
       - name: Fetch SDL2 headers for Android input and audio compatibility
@@ -57,6 +66,18 @@ jobs:
             --output android-port-lab/generated \
             --functions android-port-lab/generated/functions.json \
             --jobs 1 --single-file
+      - name: Assert upstream lifter implements the previous unsupported PPC SRW
+        run: |
+          # The old custom interpreter stopped on this exact instruction word.
+          # Upstream is expected to lift it into actual host arithmetic.
+          python3 - <<'PY'
+          from pathlib import Path
+          src = "\n".join(p.read_text() for p in Path("android-port-lab/generated").glob("ppu_recomp*.c"))
+          assert "ctx->gpr[9]" in src, "Upstream lift missed the srw destination"
+          assert "ctx->gpr[4]" in src and "ctx->gpr[10]" in src, "Upstream lift missed srw sources"
+          assert ">>" in src and "& 0x20" in src, "Upstream lift lacks PPC 32-bit shift semantics"
+          print("UPSTREAM_SRW_LIFT_PASS: real srw compiled as host C++")
+          PY
       - name: Compile and execute lifted PPU smoke on Linux
         run: |
           c++ -std=c++20 -O0 -DPPU_SMOKE_HOST \
@@ -77,6 +98,26 @@ jobs:
             -o /tmp/ppu-elf-smoke
           /tmp/ppu-elf-smoke android-port-lab/generated/smoke.elf
           /tmp/ppu-elf-smoke android-port-lab/generated/smoke.elf --reject-mutated
+      - name: Verify direct European PPU engine without bundling the game
+        run: |
+          # Synthetic ELF only: real EU ELF remains entirely on user's phone.
+          c++ -std=c++17 -O2 -Wall -Wextra -DREAL_PPU_PROBE_HOST \
+            android-port-lab/app/src/main/cpp/real_ppu_probe.cpp \
+            -o /tmp/infamous-eu-ppu-engine
+          /tmp/infamous-eu-ppu-engine android-port-lab/generated/smoke.elf \
+            | tee /tmp/infamous-eu-engine.log
+          grep -q "REAL PS3 EBOOT STARTUP TRACE" /tmp/infamous-eu-engine.log
+          /tmp/infamous-eu-ppu-engine --test-time-hle | tee /tmp/eu-time-hle.log
+          grep -q "TIME_HLE_REGRESSION_PASS" /tmp/eu-time-hle.log
+          /tmp/infamous-eu-ppu-engine --test-lv2-time | tee /tmp/eu-lv2-time.log
+          grep -q "LV2_TIME_SERVICES_PASS" /tmp/eu-lv2-time.log
+          /tmp/infamous-eu-ppu-engine --test-division | tee /tmp/eu-division.log
+          grep -q "PPC_DIVISION_REGRESSION_PASS" /tmp/eu-division.log
+          /tmp/infamous-eu-ppu-engine --test-thread-id | tee /tmp/eu-thread-id.log
+          grep -q "PPU_THREAD_ID_REGRESSION_PASS" /tmp/eu-thread-id.log
+          /tmp/infamous-eu-ppu-engine --test-cr-transfer | tee /tmp/eu-cr-transfer.log
+          grep -q "PPC_CR_TRANSFER_PASS" /tmp/eu-cr-transfer.log
+          ! grep -q "Status: GAME BOOT SUCCESS" /tmp/infamous-eu-engine.log
       - name: Cross-compile upstream PPU, LV2, SPU, RSX, input and audio for Android ARM64
         run: |
           python3 android-port-lab/tools/audit_runtime_android.py \
@@ -100,6 +141,43 @@ jobs:
         id: integrated-runtime
         continue-on-error: true
         run: bash android-port-lab/tools/build_android_runtime.sh
+      - name: Validate private game boot target with synthetic lift ONLY
+        run: |
+          # Public CI must never receive real EBOOT.elf or generated title code.
+          # Reuse the existing synthetic PPU lift to verify the optional target.
+          test -f android-port-lab/generated/ppu_recomp.h
+          test -f android-port-lab/generated/ppu_recomp.c
+          ! test -e android-port-lab/app/src/main/jniLibs/arm64-v8a/libps3eu.so
+          cmake -S android-port-lab/runtime-integration \
+            -B android-port-lab/build/integrated \
+            -DINFAMOUS_PRIVATE_RECOMP="$PWD/android-port-lab/generated"
+          cmake --build android-port-lab/build/integrated \
+            --target infamous_eu_private_boot --parallel 3
+          test -s android-port-lab/build/integrated/libps3eu.so
+          readelf -h android-port-lab/build/integrated/libps3eu.so | grep -q AArch64
+          echo "PRIVATE_GAME_TARGET_LINK_CHECK=PASS (SYNTHETIC ONLY)"
+          # Never package this synthetic alternate as the user's real game.
+          ! test -e android-port-lab/app/src/main/jniLibs/arm64-v8a/libps3eu.so
+      - name: Probe actual inFAMOUSreborn title runner on Android ARM64 (synthetic functions only)
+        id: title-runner-probe
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -eo pipefail
+          # Public build never receives the copyrighted game ELF or lifted code.
+          # This probes REAL inFAMOUSreborn main.cpp/stubs.cpp/trainer.cpp
+          # against synthetic function-table interfaces to expose ARM64 errors.
+          mkdir -p android-port-lab/build/integrated-logs
+          cmake -S android-port-lab/runtime-integration \
+            -B android-port-lab/build/integrated \
+            -DINFAMOUS_PRIVATE_RECOMP="$PWD/android-port-lab/generated" \
+            -DINFAMOUS_EU_UPSTREAM_TITLE=ON \
+            -DINFAMOUS_EU_SPU_DIR="" \
+            2>&1 | tee android-port-lab/build/integrated-logs/eu-title-configure.log
+          cmake --build android-port-lab/build/integrated \
+            --target infamous_eu_upstream_title --parallel 3 \
+            2>&1 | tee android-port-lab/build/integrated-logs/eu-title-compile.log
+          echo "UPSTREAM_TITLE_RUNNER_ARM64_SYNTHETIC_PROBE=PASS"
       - name: Package actual upstream Android ARM64 boot executable and test ELF
         run: |
           set -e

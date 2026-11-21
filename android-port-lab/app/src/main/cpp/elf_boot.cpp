@@ -69,13 +69,22 @@ std::string run_elf(const uint8_t* bytes, size_t count) {
     }
     const uint32_t pc = be32(guest.data() + opd);
     const uint32_t toc = be32(guest.data() + opd + 4);
-    if (!within(pc, 16, guestEnd)) return fail("OPD points outside guest memory");
+    constexpr size_t smokeBytes = 7 * sizeof(uint32_t);
+    if (!within(pc, smokeBytes, guestEnd))
+        return fail("OPD points outside guest memory");
 
     // The recompilation is ahead-of-time. Reject a different program: never
     // pretend an arbitrary EBOOT can be run by this particular lifted code.
-    constexpr uint32_t expected[] = { 0x38630007, 0x1C630006,
-                                       0x3863FFFF, 0x4E800020 };
-    for (unsigned i = 0; i < 4; ++i) {
+    constexpr uint32_t expected[] = {
+        0x38630007, // addi r3,r3,7
+        0x1C630006, // mulli r3,r3,6
+        0x3863FFFF, // addi r3,r3,-1
+        (14u << 26) | (4u << 21) | 64u, // li r4,64
+        (14u << 26) | (10u << 21) | 2u, // li r10,2
+        0x7C895430u, // srw r9,r4,r10, now lifted by upstream
+        0x4E800020 // blr
+    };
+    for (unsigned i = 0; i < sizeof(expected)/sizeof(expected[0]); ++i) {
         if (be32(guest.data() + pc + i * 4) != expected[i])
             return fail("ELF code does not match compiled lifted function");
     }

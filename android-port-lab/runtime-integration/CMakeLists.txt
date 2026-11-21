@@ -59,9 +59,284 @@ add_subdirectory("${UP_SOURCE}" "${CMAKE_BINARY_DIR}/ps3recomp")
 target_include_directories(ps3recomp_runtime PRIVATE
     "${UCTX_ROOT}/include" "${UCTX_ROOT}/arch/aarch64/include")
 target_link_libraries(ps3recomp_runtime PUBLIC ps3recomp_ucontext)
+# Link-time optimisation (ThinLTO) for the runtime and the SPU job code, so calls from translated SPU code
+# into the runtime (channels, transfers, dispatch) can be inlined. The huge translated PPU sources stay
+# out of it: they would not fit the build machine's memory. EU_LTO=OFF builds as before.
+option(EU_LTO "ThinLTO for the runtime and the SPU code" ON)
+if(EU_LTO)
+    target_compile_options(ps3recomp_runtime PRIVATE -flto=thin)
+endif()
+# Profile-guided optimisation of the same code: EU_PGO=generate builds a counting (slower) runner that writes
+# eu_profile.profraw into the game folder; EU_PGO=<path to a merged .profdata> builds from that profile.
+set(EU_PGO "" CACHE STRING "empty, generate, or the path of a .profdata file")
+set(EU_PGO_FLAGS "")
+if(EU_PGO STREQUAL "generate")
+    set(EU_PGO_FLAGS "-fprofile-generate")
+elseif(EU_PGO)
+    set(EU_PGO_FLAGS "-fprofile-use=${EU_PGO};-Wno-profile-instr-out-of-date;-Wno-profile-instr-unprofiled;-Wno-backend-plugin")
+endif()
+if(EU_PGO_FLAGS)
+    target_compile_options(ps3recomp_runtime PRIVATE ${EU_PGO_FLAGS})
+    message(STATUS "Profile-guided optimisation: ${EU_PGO}")
+endif()
 # The upstream boot-smoke executable intentionally omits the title's own host
 # runner. Supply only the runner-owned services and explicitly disabled
 # optional title-specific plugin hooks, never impersonate full gameplay.
 target_sources(ps3recomp_boot_smoke PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/smoke_host_services.cpp")
 message(STATUS "Android PS3 runtime integration targets are configured")
+
+
+# PRIVATE BCES00220 game-boot target. This is disabled in PUBLIC CI and requires
+# game-derived source generated locally using prepare_eu_game_lift.py.
+set(INFAMOUS_PRIVATE_RECOMP "" CACHE PATH "Private BCES00220 PPU C++ lift")
+if(INFAMOUS_PRIVATE_RECOMP)
+    get_filename_component(INFAMOUS_PRIVATE_RECOMP "${INFAMOUS_PRIVATE_RECOMP}" ABSOLUTE)
+    if(NOT EXISTS "${INFAMOUS_PRIVATE_RECOMP}/ppu_recomp.h")
+        message(FATAL_ERROR "Private PPU lift missing ppu_recomp.h")
+    endif()
+    file(GLOB PRIVATE_PPU_SOURCES CONFIGURE_DEPENDS
+        "${INFAMOUS_PRIVATE_RECOMP}/ppu_recomp*.cpp"
+        "${INFAMOUS_PRIVATE_RECOMP}/ppu_recomp*.c")
+    if(NOT PRIVATE_PPU_SOURCES)
+        message(FATAL_ERROR "Private lift has no generated source")
+    endif()
+    # ps3recomp emits C++ (extern "C", inline templates) even when named .c.
+    # Without this, Android NDK clang compiles the generated code as plain C.
+    set_source_files_properties(${PRIVATE_PPU_SOURCES} PROPERTIES LANGUAGE CXX)
+    # Same flags as upstream infamous-recomp/CMakeLists.txt off Windows.
+    # -ffp-contract=off is a CORRECTNESS flag on arm64: clang otherwise fuses
+    # a*b+c into one fmadd, so lifted PPC float maths would round differently
+    # from the console (a PPC fmadd is emitted as an explicit fma() call).
+    # -g0: the NDK toolchain file adds -g to everything. For these four 40 MB machine-generated files
+    # the debug information is of no use (the crash handler and the samplers name functions from the
+    # symbol table), and producing it took the compiler past 6 GB per file once the accesses below
+    # were inlined.
+    set_source_files_properties(${PRIVATE_PPU_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-w;-ffp-contract=off;-g0")
+    # Inline guest-memory accesses in the translated game code. Upstream's CMakeLists defines
+    # PPU_INLINE_LOADS for these files only in its MSVC branch, so off Windows every load and store
+    # was a call into vm_read* / vm_write* (about 30% of the main thread's samples on the phone were
+    # inside those functions). The inline paths are the ones the PC build has always used; anything
+    # special (bounds, null page, SPU reservations, raw-SPU window, GCM put/ref words) still goes out
+    # of line. PPU_NO_PRESERVE_MOST: plain calls for that fallback. -DINFAMOUS_PPU_INLINE=OFF = as before.
+    option(INFAMOUS_PPU_INLINE "Inline guest-memory accesses in the translated PPU code" ON)
+    if(INFAMOUS_PPU_INLINE)
+        set_source_files_properties(${PRIVATE_PPU_SOURCES} PROPERTIES
+            COMPILE_DEFINITIONS "PPU_INLINE_LOADS;PPU_NO_PRESERVE_MOST")
+    endif()
+    if(EXISTS "${INFAMOUS_PRIVATE_RECOMP}/ppu_hle_nids.cpp")
+        set(PRIVATE_HLE_NID_TABLE "${INFAMOUS_PRIVATE_RECOMP}/ppu_hle_nids.cpp")
+    else()
+        find_package(Python3 COMPONENTS Interpreter REQUIRED)
+        set(PRIVATE_HLE_NID_TABLE "${CMAKE_CURRENT_BINARY_DIR}/eu/ppu_hle_nids.cpp")
+        add_custom_command(
+            OUTPUT "${PRIVATE_HLE_NID_TABLE}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory
+                "${CMAKE_CURRENT_BINARY_DIR}/eu"
+            COMMAND "${Python3_EXECUTABLE}"
+                "${UP_SOURCE}/tools/gen_hle_nids.py"
+                --out "${PRIVATE_HLE_NID_TABLE}" --all
+            DEPENDS "${UP_SOURCE}/tools/gen_hle_nids.py"
+            COMMENT "Generate firmware import NID table for private game boot")
+    endif()
+    add_executable(infamous_eu_private_boot
+        "${UP_SOURCE}/runtime/ppu/tests/boot_main.cpp"
+        "${UP_SOURCE}/runtime/ppu/ppu_loader.cpp"
+        "${UP_SOURCE}/runtime/ppu/ppu_hle.cpp"
+        "${UP_SOURCE}/runtime/ppu/ppu_fs.cpp"
+        "${UP_SOURCE}/runtime/ppu/ppu_sysprx.cpp"
+        "${PRIVATE_HLE_NID_TABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/smoke_host_services.cpp"
+        ${PRIVATE_PPU_SOURCES})
+    target_include_directories(infamous_eu_private_boot PRIVATE
+        "${INFAMOUS_PRIVATE_RECOMP}"
+        "${UP_SOURCE}/include"
+        "${UP_SOURCE}/runtime/ppu"
+        "${UP_SOURCE}/runtime/spu"
+        "${UP_SOURCE}/runtime/memory"
+        "${UP_SOURCE}/runtime/syscalls"
+        "${UP_SOURCE}/runtime/platform"
+        "${UP_SOURCE}/libs/video")
+    target_link_libraries(infamous_eu_private_boot PRIVATE
+        ps3recomp_runtime ps3recomp_ucontext)
+    set_target_properties(infamous_eu_private_boot PROPERTIES
+        OUTPUT_NAME "libps3eu" SUFFIX ".so" LINKER_LANGUAGE CXX)
+    target_link_options(infamous_eu_private_boot PRIVATE
+        "-Wl,-z,max-page-size=16384")
+    list(LENGTH PRIVATE_PPU_SOURCES PRIVATE_PPU_COUNT)
+    message(STATUS "Private BCES00220 boot: ${PRIVATE_PPU_COUNT} game PPU translation units")
+endif()
+
+
+# Upstream-FIRST European game title target. This deliberately uses the REAL
+# inFAMOUSreborn game runner (main.cpp, stubs.cpp, trainer.cpp), NOT the SDK's
+# synthetic boot_main.cpp or our instruction-by-instruction Android tracer.
+# Off by default: public CI has only a synthetic ELF; enable only in a
+# private workspace with locally generated code from the verified BCES00220.
+option(INFAMOUS_EU_UPSTREAM_TITLE
+       "Compile actual inFAMOUSreborn title runner with private lifted sources" OFF)
+set(INFAMOUS_EU_SPU_DIR "" CACHE PATH
+    "Private path to SPU and WWS job modules generated by the upstream manifest")
+if(INFAMOUS_EU_UPSTREAM_TITLE)
+    if(NOT INFAMOUS_PRIVATE_RECOMP)
+        message(FATAL_ERROR "Upstream inFAMOUS title requires INFAMOUS_PRIVATE_RECOMP")
+    endif()
+    set(EU_TITLE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../upstream/infamous-recomp")
+    foreach(_f IN ITEMS main.cpp stubs.cpp trainer.cpp)
+        if(NOT EXISTS "${EU_TITLE_DIR}/${_f}")
+            message(FATAL_ERROR "Missing upstream game-specific source: ${_f}")
+        endif()
+    endforeach()
+    # SPU is optional during first PPU-linked boot; the runner's missing
+    # workloads are a logged blocker, not something we pretend to emulate.
+    # Mirrors upstream infamous-recomp/CMakeLists.txt (PORT_ENABLE_SPU,
+    # PORT_SPU_REGCACHE=ON): every <dir>/spu_recomp.c, its register-cached
+    # twin where present, the generated registration TUs and the musttail
+    # dispatcher. INFAMOUS_EU_SPU_DIR is the private, lock-verified
+    # <copy>/infamous-recomp/spu produced by run_upstream_pipeline.py.
+    set(EU_SPU_SOURCES "")
+    if(INFAMOUS_EU_SPU_DIR)
+        file(GLOB _eu_spu_plain CONFIGURE_DEPENDS
+            "${INFAMOUS_EU_SPU_DIR}/*/spu_recomp.c")
+        set(_eu_spu_rc "")
+        foreach(_f IN LISTS _eu_spu_plain)
+            get_filename_component(_d "${_f}" DIRECTORY)
+            if(EXISTS "${_d}/spu_recomp_rc.c")
+                list(APPEND _eu_spu_rc "${_d}/spu_recomp_rc.c")
+            endif()
+        endforeach()
+        # Hand-written native replacements for parts of a job module. The private build puts them next to
+        # the module's generated sources as eu_native_*.c (none in a plain build).
+        file(GLOB _eu_spu_native CONFIGURE_DEPENDS
+            "${INFAMOUS_EU_SPU_DIR}/*/eu_native_*.c")
+        set(EU_SPU_SOURCES ${_eu_spu_plain} ${_eu_spu_rc} ${_eu_spu_native})
+        if(EU_SPU_SOURCES)
+            list(LENGTH _eu_spu_plain _eu_spu_n)
+            list(LENGTH _eu_spu_rc _eu_spu_rc_n)
+            list(LENGTH _eu_spu_native _eu_spu_native_n)
+            message(STATUS "European game: ${_eu_spu_n} lifted SPU image(s) + ${_eu_spu_rc_n} register-cached twin(s) + ${_eu_spu_native_n} native job source(s)")
+            # The real title's many lifted SPU functions need the upstream
+            # musttail indirect dispatch trampoline (not the stubbed runner).
+            list(APPEND EU_SPU_SOURCES
+                "${UP_SOURCE}/runtime/spu/spu_dispatch_mt.c")
+            foreach(_registration IN ITEMS
+                spu_workloads.c jobmods_register.c taskset_policy_bytes.c)
+                if(EXISTS "${INFAMOUS_EU_SPU_DIR}/${_registration}")
+                    list(APPEND EU_SPU_SOURCES "${INFAMOUS_EU_SPU_DIR}/${_registration}")
+                else()
+                    message(STATUS "  (no ${_registration} -- not registered)")
+                endif()
+            endforeach()
+            # Upstream scopes these to the SPU TUs only; a target-wide define
+            # would change (and rebuild) every huge lifted PPU TU. The x86
+            # -msse4.1/-mavx2 flags have no ARM64 equivalent and are dropped;
+            # -w as upstream does for job modules keeps CI logs readable.
+            # The lifted WWS plugin code (and upstream patches to it) calls
+            # Win32 helpers -- Interlocked*, GetTickCount64 -- that upstream's
+            # MSVC/clang-cl build gets from <windows.h>. Off Windows, the
+            # runtime's own win32_compat.h provides them (C11 _Generic in C),
+            # exactly as it already does for the title's main.cpp.
+            set_source_files_properties(${EU_SPU_SOURCES} PROPERTIES
+                INCLUDE_DIRECTORIES "${UP_SOURCE}/runtime/spu"
+                COMPILE_DEFINITIONS SPU_USE_DISPATCH_MT
+                COMPILE_OPTIONS "-O2;-w;-ferror-limit=0;-include;${UP_SOURCE}/runtime/platform/win32_compat.h")
+            if(EU_LTO)
+                set_property(SOURCE ${EU_SPU_SOURCES} APPEND PROPERTY COMPILE_OPTIONS "-flto=thin")
+            endif()
+            if(EU_PGO_FLAGS)
+                set_property(SOURCE ${EU_SPU_SOURCES} APPEND PROPERTY COMPILE_OPTIONS "${EU_PGO_FLAGS}")
+            endif()
+        endif()
+    endif()
+    add_executable(infamous_eu_upstream_title
+        # Android-owned host services needed by the actual title runner.
+        # Weak fallbacks do NOT implement real RSX, overlay or SPU backends.
+        "${CMAKE_CURRENT_SOURCE_DIR}/eu_android_host_bridge.c"
+        # Shared-memory screen + controller channel to the Android app.
+        "${CMAKE_CURRENT_SOURCE_DIR}/eu_android_bridge.c"
+        # Which game code issued each draw (store observer on the GCM IO window).
+        "${CMAKE_CURRENT_SOURCE_DIR}/eu_fifo_tag.cpp"
+        "${EU_TITLE_DIR}/main.cpp"
+        "${EU_TITLE_DIR}/stubs.cpp"
+        "${EU_TITLE_DIR}/trainer.cpp"
+        "${UP_SOURCE}/runtime/ppu/ppu_loader.cpp"
+        "${UP_SOURCE}/runtime/ppu/ppu_hle.cpp"
+        "${UP_SOURCE}/runtime/ppu/ppu_fs.cpp"
+        "${UP_SOURCE}/runtime/ppu/ppu_sysprx.cpp"
+        "${PRIVATE_HLE_NID_TABLE}"
+        ${PRIVATE_PPU_SOURCES}
+        ${EU_SPU_SOURCES}
+    )
+    # Game-provided hooks take the place of smoke_host_services.cpp.
+    target_include_directories(infamous_eu_upstream_title PRIVATE
+        "${INFAMOUS_PRIVATE_RECOMP}"
+        "${EU_TITLE_DIR}"
+        "${UP_SOURCE}/include"
+        "${UP_SOURCE}/runtime/ppu"
+        "${UP_SOURCE}/runtime/spu"
+        "${UP_SOURCE}/runtime/memory"
+        "${UP_SOURCE}/runtime/syscalls"
+        "${UP_SOURCE}/runtime/platform"
+        "${UP_SOURCE}/libs/video")
+    if(EU_SPU_SOURCES)
+        message(STATUS "European game: generated real SPU workloads enabled")
+    else()
+        message(WARNING "European game: no SPU workloads available; game boot cannot complete")
+    endif()
+    target_link_libraries(infamous_eu_upstream_title PRIVATE
+        ps3recomp_runtime ps3recomp_ucontext)
+
+    # GPU renderer: Vulkan 1.3 backend for the toolkit's register-file draw
+    # engine, compiling the decompiled HLSL with glslang (+ SPIRV-Tools for the
+    # HLSL legalization passes). Entry points are loaded at run time, so no
+    # libvulkan link. Without a glslang checkout the CPU preview stays.
+    set(EU_GLSLANG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/glslang")
+    if(EXISTS "${EU_GLSLANG_DIR}/CMakeLists.txt")
+        set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+        set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+        set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+        set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+        set(ENABLE_HLSL ON CACHE BOOL "" FORCE)
+        set(ENABLE_OPT ON CACHE BOOL "" FORCE)
+        set(ENABLE_CTEST OFF CACHE BOOL "" FORCE)
+        set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
+        set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
+        set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
+        set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
+        set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+        add_subdirectory("${EU_GLSLANG_DIR}" "${CMAKE_BINARY_DIR}/glslang" EXCLUDE_FROM_ALL)
+        target_sources(infamous_eu_upstream_title PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/eu_vk_backend.cpp")
+        set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/eu_vk_backend.cpp" PROPERTIES
+            INCLUDE_DIRECTORIES "${EU_GLSLANG_DIR}"
+            COMPILE_OPTIONS "-std=c++17")
+        target_link_libraries(infamous_eu_upstream_title PRIVATE
+            glslang glslang-default-resource-limits dl z)
+        if(TARGET SPIRV)
+            target_link_libraries(infamous_eu_upstream_title PRIVATE SPIRV)
+        endif()
+        message(STATUS "European game: Vulkan GPU renderer enabled (glslang ${EU_GLSLANG_DIR})")
+        # Crash reports (eu_android_bridge.c) name functions via dladdr, which
+        # only sees exported symbols; Gradle strips .symtab but keeps .dynsym.
+        target_link_options(infamous_eu_upstream_title PRIVATE "-Wl,--export-dynamic")
+    else()
+        message(WARNING "European game: no glslang checkout -- CPU software preview only")
+    endif()
+    target_link_options(infamous_eu_upstream_title PRIVATE
+        "-Wl,-z,max-page-size=16384")
+    if(EU_LTO)
+        target_link_options(infamous_eu_upstream_title PRIVATE "-flto=thin" "-Wl,--thinlto-jobs=2"
+            "-Wl,--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache")
+    endif()
+    if(EU_PGO STREQUAL "generate")
+        target_sources(infamous_eu_upstream_title PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/eu_pgo.c)
+        target_link_options(infamous_eu_upstream_title PRIVATE "-fprofile-generate")
+    elseif(EU_PGO_FLAGS)
+        target_link_options(infamous_eu_upstream_title PRIVATE ${EU_PGO_FLAGS})
+    endif()
+    set_target_properties(infamous_eu_upstream_title PROPERTIES
+        OUTPUT_NAME "libps3eu_title" SUFFIX ".so" LINKER_LANGUAGE CXX)
+    message(STATUS "Upstream European game-specific ARM64 runner enabled")
+    message(STATUS "No title data in public CI; title backend and SPU require validation")
+endif()
