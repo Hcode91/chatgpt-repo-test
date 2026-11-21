@@ -66,6 +66,19 @@ option(EU_LTO "ThinLTO for the runtime and the SPU code" ON)
 if(EU_LTO)
     target_compile_options(ps3recomp_runtime PRIVATE -flto=thin)
 endif()
+# Profile-guided optimisation of the same code: EU_PGO=generate builds a counting (slower) runner that writes
+# eu_profile.profraw into the game folder; EU_PGO=<path to a merged .profdata> builds from that profile.
+set(EU_PGO "" CACHE STRING "empty, generate, or the path of a .profdata file")
+set(EU_PGO_FLAGS "")
+if(EU_PGO STREQUAL "generate")
+    set(EU_PGO_FLAGS "-fprofile-generate")
+elseif(EU_PGO)
+    set(EU_PGO_FLAGS "-fprofile-use=${EU_PGO};-Wno-profile-instr-out-of-date;-Wno-profile-instr-unprofiled;-Wno-backend-plugin")
+endif()
+if(EU_PGO_FLAGS)
+    target_compile_options(ps3recomp_runtime PRIVATE ${EU_PGO_FLAGS})
+    message(STATUS "Profile-guided optimisation: ${EU_PGO}")
+endif()
 # The upstream boot-smoke executable intentionally omits the title's own host
 # runner. Supply only the runner-owned services and explicitly disabled
 # optional title-specific plugin hooks, never impersonate full gameplay.
@@ -231,6 +244,9 @@ if(INFAMOUS_EU_UPSTREAM_TITLE)
             if(EU_LTO)
                 set_property(SOURCE ${EU_SPU_SOURCES} APPEND PROPERTY COMPILE_OPTIONS "-flto=thin")
             endif()
+            if(EU_PGO_FLAGS)
+                set_property(SOURCE ${EU_SPU_SOURCES} APPEND PROPERTY COMPILE_OPTIONS "${EU_PGO_FLAGS}")
+            endif()
         endif()
     endif()
     add_executable(infamous_eu_upstream_title
@@ -312,6 +328,12 @@ if(INFAMOUS_EU_UPSTREAM_TITLE)
     if(EU_LTO)
         target_link_options(infamous_eu_upstream_title PRIVATE "-flto=thin" "-Wl,--thinlto-jobs=2"
             "-Wl,--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache")
+    endif()
+    if(EU_PGO STREQUAL "generate")
+        target_sources(infamous_eu_upstream_title PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/eu_pgo.c)
+        target_link_options(infamous_eu_upstream_title PRIVATE "-fprofile-generate")
+    elseif(EU_PGO_FLAGS)
+        target_link_options(infamous_eu_upstream_title PRIVATE ${EU_PGO_FLAGS})
     endif()
     set_target_properties(infamous_eu_upstream_title PROPERTIES
         OUTPUT_NAME "libps3eu_title" SUFFIX ".so" LINKER_LANGUAGE CXX)
