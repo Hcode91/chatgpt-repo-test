@@ -126,9 +126,13 @@ bool load_global()
      * Vulkan library and says so. */
     const char* drv = getenv("EU_VK_DRIVER");
     if (drv && !strcmp(drv, "turnip")) {
-        void* t = dlopen("libvulkan_freedreno.so", RTLD_NOW | RTLD_LOCAL);
+        /* EU_VK_DRIVER_PATH: a driver the user imported in the app; otherwise the one inside the APK */
+        const char* path = getenv("EU_VK_DRIVER_PATH");
+        if (!path || !*path) path = "libvulkan_freedreno.so";
+        void* t = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (t) fprintf(stderr, "[RSX vulkan] Turnip: loaded %s\n", path);
         if (!t) {
-            fprintf(stderr, "[RSX vulkan] Turnip: cannot load libvulkan_freedreno.so (%s); using the system driver\n", dlerror());
+            fprintf(stderr, "[RSX vulkan] Turnip: cannot load %s (%s); using the system driver\n", path, dlerror());
         } else {
             typedef VkResult (*PFN_negotiate)(uint32_t*);
             PFN_negotiate neg = (PFN_negotiate)dlsym(t, "vk_icdNegotiateLoaderICDInterfaceVersion");

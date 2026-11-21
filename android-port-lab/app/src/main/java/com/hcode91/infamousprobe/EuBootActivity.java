@@ -1,6 +1,7 @@
 package com.hcode91.infamousprobe;
 
 import android.Manifest;
+import android.app.AlertDialog;
 import android.app.Activity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
@@ -44,7 +45,11 @@ import java.util.ArrayDeque;
 import java.util.Date;
 import java.util.Iterator;
 import java.util.Locale;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 /**
  * On-device boot test for the PRIVATE recompiled BCES00220 runner (libps3eu.so).
@@ -66,6 +71,7 @@ public final class EuBootActivity extends Activity {
     private static final int REQ_TREE = 202;
     private static final int REQ_EXPORT = 203;
     private static final int REQ_LEGACY_PERMS = 204;
+    private static final int REQ_DRIVER = 205;
     private static final long LOG_FILE_CAP = 64L * 1024 * 1024;
     private static final int TAIL_LINES = 400;
 
@@ -108,6 +114,7 @@ public final class EuBootActivity extends Activity {
     private EditText pathEdit, extraEnv;
     private CheckBox verbose, upstreamEnv, lean, lowCpu, skipMovies, openScreen;
     private Button rendererButton;
+    private Button driverButton;
     private int renderer;
     private Button bootButton, stopButton;
     private volatile Process child;
@@ -203,6 +210,10 @@ public final class EuBootActivity extends Activity {
         openScreen.setTextColor(Color.WHITE);
         openScreen.setChecked(true);
         root.addView(openScreen);
+        driverButton = button("");
+        driverButton.setOnClickListener(v -> chooseDriver());
+        root.addView(driverButton);
+        updateDriverButton();
         extraEnv = new EditText(this);
         extraEnv.setHint("Extra settings (optional), e.g. EU_GP=speed,light EU_FOV=1.2");
         extraEnv.setTextColor(Color.WHITE);
@@ -318,6 +329,145 @@ public final class EuBootActivity extends Activity {
         b.setText(s);
         b.setAllCaps(false);
         return b;
+    }
+
+    /* ---- graphics driver: the phone's own, the Turnip build inside the APK, or an imported driver zip
+     * (the zip format emulators use: meta.json naming the .so in "libraryName", or simply one .so). */
+    private File driversDir() {
+        File d = new File(getFilesDir(), "drivers");
+        d.mkdirs();
+        return d;
+    }
+
+    private String driverLabel(String v) {
+        if (v.isEmpty()) return "phone's own";
+        if (v.equals("builtin")) return "Turnip (built in)";
+        File f = new File(v);
+        File meta = new File(f.getParentFile(), "name.txt");
+        String name = f.getParentFile().getName();
+        try (FileInputStream in = new FileInputStream(meta)) {
+            byte[] b = new byte[256];
+            int n = in.read(b);
+            if (n > 0) name = new String(b, 0, n, StandardCharsets.UTF_8).trim();
+        } catch (IOException ignored) {
+        }
+        return name;
+    }
+
+    private void updateDriverButton() {
+        String v = prefs.getString("vk_driver", "");
+        if (!v.isEmpty() && !v.equals("builtin") && !new File(v).isFile()) {
+            v = "";
+            prefs.edit().putString("vk_driver", "").apply();
+        }
+        driverButton.setText("Graphics driver: " + driverLabel(v));
+    }
+
+    private void chooseDriver() {
+        final List<String> values = new ArrayList<>();
+        final List<String> labels = new ArrayList<>();
+        values.add("");
+        labels.add("Phone's own driver");
+        values.add("builtin");
+        labels.add("Turnip (built in)");
+        File[] dirs = driversDir().listFiles();
+        if (dirs != null) {
+            for (File d : dirs) {
+                File[] libs = d.listFiles((dir, n) -> n.endsWith(".so"));
+                if (libs != null && libs.length > 0) {
+                    values.add(libs[0].getAbsolutePath());
+                    labels.add(driverLabel(libs[0].getAbsolutePath()));
+                }
+            }
+        }
+        values.add("import");
+        labels.add("Import a driver zip…");
+        if (dirs != null && dirs.length > 0) {
+            values.add("delete");
+            labels.add("Remove imported drivers");
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Graphics driver")
+                .setItems(labels.toArray(new String[0]), (dlg, which) -> {
+                    String v = values.get(which);
+                    if (v.equals("import")) {
+                        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                        i.addCategory(Intent.CATEGORY_OPENABLE);
+                        i.setType("*/*");
+                        startActivityForResult(i, REQ_DRIVER);
+                        return;
+                    }
+                    if (v.equals("delete")) {
+                        File[] ds = driversDir().listFiles();
+                        if (ds != null) for (File d : ds) deleteTree(d);
+                        prefs.edit().putString("vk_driver", "").apply();
+                    } else {
+                        prefs.edit().putString("vk_driver", v).apply();
+                    }
+                    updateDriverButton();
+                })
+                .show();
+    }
+
+    private static void deleteTree(File f) {
+        File[] kids = f.listFiles();
+        if (kids != null) for (File k : kids) deleteTree(k);
+        f.delete();
+    }
+
+    private void importDriver(Uri uri) {
+        String base = "driver";
+        try (android.database.Cursor c = getContentResolver().query(uri, null, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                int col = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+                if (col >= 0 && c.getString(col) != null) base = c.getString(col).replaceAll("\\.zip$", "");
+            }
+        } catch (Exception ignored) {
+        }
+        File dir = new File(driversDir(), base.replaceAll("[^A-Za-z0-9._-]", "_"));
+        deleteTree(dir);
+        dir.mkdirs();
+        String wanted = null, name = base;
+        File lib = null;
+        try {
+            // pass 1: meta.json (name and library), pass 2: the library
+            byte[] buf = new byte[1 << 16];
+            try (ZipInputStream z = new ZipInputStream(getContentResolver().openInputStream(uri))) {
+                for (ZipEntry e; (e = z.getNextEntry()) != null; ) {
+                    if (!e.getName().endsWith("meta.json")) continue;
+                    java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+                    for (int n; (n = z.read(buf)) > 0; ) bo.write(buf, 0, n);
+                    JSONObject m = new JSONObject(bo.toString("UTF-8"));
+                    wanted = m.optString("libraryName", null);
+                    String nm = m.optString("name", "");
+                    String ver = m.optString("driverVersion", "");
+                    if (!nm.isEmpty()) name = nm + (ver.isEmpty() ? "" : " " + ver);
+                }
+            }
+            try (ZipInputStream z = new ZipInputStream(getContentResolver().openInputStream(uri))) {
+                for (ZipEntry e; (e = z.getNextEntry()) != null; ) {
+                    String n = new File(e.getName()).getName();
+                    if (e.isDirectory() || !n.endsWith(".so")) continue;
+                    if (wanted != null && !n.equals(wanted)) continue;
+                    File out = new File(dir, n);
+                    try (OutputStream o = new FileOutputStream(out)) {
+                        for (int k; (k = z.read(buf)) > 0; ) o.write(buf, 0, k);
+                    }
+                    lib = out;
+                    break;
+                }
+            }
+            if (lib == null) throw new IOException("no driver library (.so) in that zip");
+            try (OutputStream o = new FileOutputStream(new File(dir, "name.txt"))) {
+                o.write(name.getBytes(StandardCharsets.UTF_8));
+            }
+            prefs.edit().putString("vk_driver", lib.getAbsolutePath()).apply();
+            toast("Driver imported: " + name);
+        } catch (Exception ex) {
+            deleteTree(dir);
+            toast("Could not import that driver: " + ex.getMessage());
+        }
+        updateDriverButton();
     }
 
     private void toast(String s) {
@@ -577,7 +727,9 @@ public final class EuBootActivity extends Activity {
         super.onActivityResult(req, res, data);
         if (res != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
-        if (req == REQ_ELF) {
+        if (req == REQ_DRIVER) {
+            importDriver(uri);
+        } else if (req == REQ_ELF) {
             importElf(uri);
         } else if (req == REQ_TREE) {
             try {
@@ -698,6 +850,13 @@ public final class EuBootActivity extends Activity {
         // with < 17 CPU threads; off Windows its auto mode is always off.
         if (lean.isChecked()) env.put("V241A_LEAN", "1");
         if (lowCpu.isChecked()) env.put("LOW_CPU", "1");
+        // Graphics driver (EU_VK_DRIVER in the extra settings still overrides this)
+        String drv = prefs.getString("vk_driver", "");
+        if (!drv.isEmpty()) {
+            env.put("EU_VK_DRIVER", "turnip");
+            if (!drv.equals("builtin")) env.put("EU_VK_DRIVER_PATH", drv);
+        }
+        header.append("# graphics driver: ").append(driverLabel(drv)).append('\n');
         if (skipMovies.isChecked()) env.put("EU_SKIP_MOVIES", "1");
         // inFamous' immediate-mode movie quad carries its UVs in attribute 1
         // (upstream rsx_null_backend.c note) -- for the software preview.
